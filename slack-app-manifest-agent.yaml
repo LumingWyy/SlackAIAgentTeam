@@ -1,0 +1,71 @@
+# Multi-agent Slack App Manifest template (full)
+# When creating an App per agent, change three places: display_information.name / features.agent_view.agent_description / bot_user.display_name
+# After updating an existing App with this manifest, Reinstall to Workspace is required
+# https://api.slack.com/apps -> Create New App -> From a manifest — paste here
+display_information:
+  name: Agent (dev)
+  description: ローカル Claude Code を操作するマルチエージェント
+  background_color: "#d97757"
+features:
+  # Slack Agent messaging experience (AI app sidebar entry + suggested prompts)
+  agent_view:
+    agent_description: ローカルの Claude Code を操作するエージェントです。実装・調査・レビューの依頼に日本語で対応します。チャンネルではメンションで起動します。
+    suggested_prompts:
+      - title: 実装を依頼する
+        message: このプロジェクトの構成を確認して、改善点を1つ提案して実装してください。
+      - title: コードを調査する
+        message: ワークスペースの主要ファイルを読んで、アーキテクチャを要約してください。
+      - title: レビューを依頼する
+        message: 直近の変更内容を確認して、問題点があれば指摘してください。
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  bot_user:
+    display_name: dev
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      # --- Core: receive / reply to conversations ---
+      - app_mentions:read
+      - chat:write
+      - channels:history
+      - groups:history
+      - im:history
+      - mpim:history
+      # --- Agent / AI app experience ---
+      - assistant:write
+      # --- Channel membership / user lookup ---
+      # channels/groups/mpim read are required by conversations.members roster filtering
+      - channels:read
+      - groups:read
+      - im:read
+      - im:write
+      - mpim:read
+      - mpim:write
+      - users:read
+      # --- Reactions (planned: task claim / progress display) ---
+      - reactions:read
+      - reactions:write
+      # --- File sharing (receive user files / share artifacts) ---
+      - files:read
+      - files:write
+      # --- Custom username (Phase 2: dynamic persona; safe to remove if unused) ---
+      - chat:write.customize
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+      - assistant_thread_started
+      - assistant_thread_context_changed
+      - app_home_opened
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false

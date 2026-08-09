@@ -1,0 +1,83 @@
+# Copy this same credential-free roster to every host.
+# Each host sets AGENT_NODE_ID and only its two agents' Slack tokens in .env.
+node:
+  max_concurrency: 2
+  max_queue: 10
+
+access:
+  # Top-level control/Slack admins. A project admin below has the same
+  # destructive authority, but only for agents in that explicit project.
+  admins: [U01ALICE]
+
+security:
+  # Distributed mode rejects legacy-localhost and fails startup unless every
+  # local owner bearer is present and unique. Admin bearers are optional per
+  # node and grant that admin access only where explicitly installed.
+  control_auth: required
+
+budget:
+  max_agent_rounds: 8
+
+# Legacy team fallback. An agent can override with github_repo, or use "" to
+# disable GitHub. Every writable workspace origin must match its effective repo.
+github:
+  repo: acme/product-x
+  patrol_channel: C01PRODUCT
+
+projects:
+  - id: product-x
+    channels: [C01PRODUCT]
+    members: [U01ALICE, U02BOB]
+    admins: [U01ALICE]
+    agents:
+      - alice/dev
+      - alice/reviewer
+      - bob/dev
+      - bob/reviewer
+
+defaults:
+  allowed_tools: [Read, Glob, Grep, Edit, Write, Bash]
+  max_turns: 25
+  context_rollover_tokens: 60000
+
+agents:
+  - name: alice/dev
+    node_id: alice-mac
+    owner: U01ALICE
+    slack_user_id: U01ALICEDEV
+    slack_bot_id: B01ALICEDEV
+    workspace: ~/workspace/product-x-alice-dev
+    card: Implements Alice-owned tasks and hands pushed PRs to one reviewer.
+    persona: You are Alice's local implementation agent.
+
+  - name: alice/reviewer
+    node_id: alice-mac
+    owner: U01ALICE
+    slack_user_id: U01ALICEREVIEW
+    slack_bot_id: B01ALICEREVIEW
+    workspace: ~/workspace/product-x-alice-review
+    card: Reviews one pushed PR and returns evidence-backed blockers.
+    persona: You are Alice's local independent review agent.
+
+  - name: bob/dev
+    node_id: bob-mac
+    owner: U02BOB
+    slack_user_id: U02BOBDEV
+    slack_bot_id: B02BOBDEV
+    workspace: ~/workspace/product-x-bob-dev
+    github_repo: bob/product-x-fork
+    card: Implements Bob-owned tasks and hands pushed PRs to one reviewer.
+    persona: You are Bob's local implementation agent.
+
+  - name: bob/reviewer
+    node_id: bob-mac
+    owner: U02BOB
+    slack_user_id: U02BOBREVIEW
+    slack_bot_id: B02BOBREVIEW
+    runtime: openai
+    openai_model: gpt-5.6-sol
+    openai_api_key_env: BOB_OPENAI_API_KEY
+    workspace: ~/workspace/product-x-bob-review
+    github_repo: ""  # OpenAI-only reviewer has no local GitHub/tool access.
+    card: Reviews Slack-provided specs and PR evidence, then returns blockers or hands local inspection to a code agent.
+    persona: You are Bob's independent OpenAI API review agent. Never claim local repository access.

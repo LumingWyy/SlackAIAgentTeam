@@ -1,0 +1,81 @@
+x-agent-node: &agent-node
+  build: .
+  image: slack-agent-team
+  init: true
+  restart: unless-stopped
+  user: "1000:1000"
+  environment: &agent-environment
+    ADMIN_BIND: 0.0.0.0
+    ADMIN_PORT: "8766"
+    ROSTER_CONFIG: /app/config/roster.yaml
+    STATE_DB: /app/data/state.db
+    WORKTREE_ROOT: /app/worktrees
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/healthz', timeout=3)"
+    interval: 30s
+    timeout: 5s
+    retries: 3
+    start_period: 20s
+
+services:
+  alice:
+    <<: *agent-node
+    profiles: [alice]
+    env_file:
+      - path: ./.env.alice
+        required: false
+    environment:
+      <<: *agent-environment
+      AGENTS_CONFIG: /app/config/agents.alice.yaml
+      AGENT_NODE_ID: alice-node
+    ports:
+      - "127.0.0.1:8766:8766"
+    volumes:
+      - ./roster.yaml:/app/config/roster.yaml:ro
+      - ./agents.alice.yaml:/app/config/agents.alice.yaml:ro
+      - alice-state:/app/data
+      - alice-worktrees:/app/worktrees
+      - alice-workspace:/home/agent/workspace
+      - alice-codex:/home/agent/.codex
+      - alice-claude:/home/agent/.claude
+      - alice-gh:/home/agent/.config/gh
+
+  bob:
+    <<: *agent-node
+    profiles: [bob]
+    env_file:
+      - path: ./.env.bob
+        required: false
+    environment:
+      <<: *agent-environment
+      AGENTS_CONFIG: /app/config/agents.bob.yaml
+      AGENT_NODE_ID: bob-node
+    ports:
+      - "127.0.0.1:8767:8766"
+    volumes:
+      - ./roster.yaml:/app/config/roster.yaml:ro
+      - ./agents.bob.yaml:/app/config/agents.bob.yaml:ro
+      - bob-state:/app/data
+      - bob-worktrees:/app/worktrees
+      - bob-workspace:/home/agent/workspace
+      - bob-codex:/home/agent/.codex
+      - bob-claude:/home/agent/.claude
+      - bob-gh:/home/agent/.config/gh
+
+volumes:
+  alice-state:
+  alice-worktrees:
+  alice-workspace:
+  alice-codex:
+  alice-claude:
+  alice-gh:
+  bob-state:
+  bob-worktrees:
+  bob-workspace:
+  bob-codex:
+  bob-claude:
+  bob-gh:

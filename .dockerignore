@@ -1,0 +1,16 @@
+# Never bake credentials or local runtime artifacts into the image
+.env
+.env.bak
+*.bak
+.venv/
+.git/
+.idea/
+.jbeval/
+.claude/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.log
+*.pid
+.DS_Store
+REVIEW-*.md

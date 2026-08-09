@@ -1,0 +1,29 @@
+roster: roster.yaml
+
+node:
+  id: alice-node
+  max_concurrency: 2
+  max_queue: 10
+
+security:
+  control_auth: required
+
+budget:
+  max_agent_rounds: 8
+
+defaults:
+  workspace: /home/agent/workspace
+  allowed_tools: [Read, Glob, Grep, Edit, Write, Bash]
+  max_turns: 25
+
+# Only Alice's local runtimes belong here. Identity comes from roster.yaml.
+agents:
+  - name: alice/dev
+    runtime: codex
+    workspace: /home/agent/workspace/dev
+    persona: You are Alice's local implementation agent.
+
+  - name: alice/reviewer
+    runtime: claude
+    workspace: /home/agent/workspace/reviewer
+    persona: You are Alice's local independent review agent.

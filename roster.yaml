@@ -1,0 +1,55 @@
+version: 1
+
+access:
+  admins: [U00ADMIN]
+
+# Optional owner-wide UTC daily limits shared by all of that person's local
+# agents. reservation_tokens is the atomic per-turn admission reservation.
+quotas:
+  daily_total_tokens:
+    U01ALICE: 250000
+    U02BOB: 250000
+  reservation_tokens:
+    U01ALICE: 20000
+    U02BOB: 20000
+
+projects:
+  - id: product-x
+    channels: [C01PRODUCT]
+    members: [U01ALICE, U02BOB]
+    admins: [U00ADMIN]
+    agents:
+      - alice/dev
+      - alice/reviewer
+      - bob/dev
+      - bob/reviewer
+
+# Credential-free identity and routing truth, shared read-only by every node.
+agents:
+  - name: alice/dev
+    slack_user_id: U01ALICEDEV
+    slack_bot_id: B01ALICEDEV
+    owner: U01ALICE
+    node_id: alice-node
+    card: Implements Alice-owned tasks and hands work to a reviewer.
+
+  - name: alice/reviewer
+    slack_user_id: U01ALICEREVIEW
+    slack_bot_id: B01ALICEREVIEW
+    owner: U01ALICE
+    node_id: alice-node
+    card: Reviews Alice's changes and reports evidence-backed blockers.
+
+  - name: bob/dev
+    slack_user_id: U02BOBDEV
+    slack_bot_id: B02BOBDEV
+    owner: U02BOB
+    node_id: bob-node
+    card: Implements Bob-owned tasks and hands work to a reviewer.
+
+  - name: bob/reviewer
+    slack_user_id: U02BOBREVIEW
+    slack_bot_id: B02BOBREVIEW
+    owner: U02BOB
+    node_id: bob-node
+    card: Reviews Bob's changes and reports evidence-backed blockers.
