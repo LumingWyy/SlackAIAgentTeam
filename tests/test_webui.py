@@ -1827,3 +1827,34 @@ def test_workspace_editor_is_localised():
                 "ws.nogit", "ws.branch", "ws.mismatch", "ws.useorigin"):
         assert script.count(f"'{key}':") >= 3, key
     assert "/workspace'" in script and "dry_run" in script
+
+
+def test_manifest_json_feeds_slacks_prefilled_create_link(tmp_path, monkeypatch):
+    _workspace_app(tmp_path, monkeypatch, "agents:\n- name: a\n  persona: Builds things\n")
+
+    async def _run():
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async with TestClient(TestServer(webui.make_app())) as client:
+            text = await (await client.get("/api/manifest/a")).text()
+            data = await (await client.get("/api/manifest/a?format=json")).json()
+            return text, data
+
+    text, data = asyncio.run(_run())
+    assert data["manifest"] == yaml.safe_load(text)
+    assert data["manifest"]["settings"]["socket_mode_enabled"] is True
+    script = _main_script(webui.INDEX_HTML)
+    assert "https://api.slack.com/apps?new_app=1&manifest_json='" in script
+    assert "encodeURIComponent(JSON.stringify(m.manifest))" in script
+
+
+def test_guide_links_straight_to_slack_apps_and_the_setup_skill():
+    html = webui.INDEX_HTML
+    assert (
+        '<a class="btn line" href="https://api.slack.com/apps" target="_blank" '
+        'rel="noopener noreferrer">'
+    ) in html
+    script = _main_script(html)
+    for key in ("guide.open.slack", "guide.slack.do5", "wz.create"):
+        assert script.count(f"'{key}':") >= 3, key
+    assert "/slack-app-setup" in script

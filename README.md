@@ -194,6 +194,7 @@ Four tabs:
 **Guide** (the first-visit start page)
 
 - Five ordered stages: assign roles → create Slack Apps → connect private local accounts → write role prompts → run the first task/handoff
+- Slack Apps: the guide links straight to api.slack.com/apps, and each agent's setup wizard has a **Create in Slack from this manifest** link that opens Slack's create-from-manifest flow already filled in. Or run `/slack-app-setup` in Claude Code (`.claude/skills/slack-app-setup`): with Claude in Chrome connected, an agent drives the browser through create → install → App-Level Token → invite → restart, asks before every step with an effect, and never touches token values — you paste `xoxb-` / `xapp-` into the console yourself
 - Browser-local progress checklist; no setup state is sent to the server
 - Copy-ready Slack channel rules, human task kickoff, structured `HANDOFF`, and dev/reviewer/planner persona templates
 - Agent responsibility matrix makes local-tool and OpenAI no-tool boundaries explicit

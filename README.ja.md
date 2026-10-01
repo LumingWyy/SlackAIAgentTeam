@@ -193,7 +193,7 @@ make webui        # → http://127.0.0.1:8765
 
 **監視**タブ：稼働中 multi_app の管理 API から状態・モデル・予算・issue 一覧を表示。モデル / runtime / 返信言語 / reasoning effort のホットスワップ、セッション再起動、UI 言語（中/日/EN）。
 
-**設定**タブ：agents.yaml / .env 編集（保存すると稼働中 multi_app へ自動反映；agent の追加/削除は再起動が必要）、Slack App セットアップウィザード（manifest 生成 → token 検証 → .env 保存）、persona 編集・agent 追加。
+**設定**タブ：agents.yaml / .env 編集（保存すると稼働中 multi_app へ自動反映；agent の追加/削除は再起動が必要）、Slack App セットアップウィザード（manifest 生成 → token 検証 → .env 保存）、persona 編集・agent 追加。ウィザードの「この manifest で Slack に作成」リンクは、manifest を事前入力した Slack の作成画面を開きます。Claude Code で `/slack-app-setup`（`.claude/skills/slack-app-setup`）を実行すると、Claude in Chrome 接続時に agent がブラウザで作成 → インストール → App-Level Token → チャンネル招待 → 再起動を進め、効果のある操作は毎回確認を求め、token には触れません（`xoxb-` / `xapp-` は自分でコンソールに貼り付けます）。
 
 **認証**タブ：agent が実際に動く環境（Docker 優先、なければ host）で
 Claude、Codex、GitHub のログインを検証します。各 owner は自分のアカウント

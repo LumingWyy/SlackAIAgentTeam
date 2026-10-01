@@ -182,6 +182,7 @@ make webui        # = .venv/bin/python webui.py → http://127.0.0.1:8765
 **指引**（首次访问默认页）
 
 - 五个有顺序的阶段：分配角色 → 创建 Slack Apps → 连接本机私有账号 → 编写职责 Prompt → 跑通第一次任务/交接
+- Slack App：指引里直接链接到 api.slack.com/apps；每个 agent 的设置向导里有「用此 manifest 在 Slack 创建」链接，打开就是已预填 manifest 的创建页面。也可以在 Claude Code 里运行 `/slack-app-setup`（`.claude/skills/slack-app-setup`）：连上 Claude in Chrome 后，agent 操作浏览器依次完成创建 → 安装 → App-Level Token → 邀请进频道 → 重启，每个会产生实际效果的步骤都先请你确认，且不经手 token——`xoxb-` / `xapp-` 由你自己粘贴到控制台
 - 上手勾选进度只保存在当前浏览器，不上传服务器
 - 可直接复制频道规则、人类任务、结构化 `HANDOFF` 与 dev/reviewer/planner persona 模板
 - Agent 职责表明确区分本地工具 Agent 与没有本地文件工具的 OpenAI Agent

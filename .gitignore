@@ -8,7 +8,11 @@ __pycache__/
 nohup.out
 .idea/
 .jbeval/
-.claude/
+# local Claude Code state stays private; only shared project skills are tracked
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/slack-app-setup/
 .DS_Store
 multi_app.pid
 .env.bak

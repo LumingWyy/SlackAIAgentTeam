@@ -556,9 +556,12 @@ async def h_manifest(request: web.Request) -> web.Response:
             persona = (entry.get("persona") or "").strip().splitlines()
             persona = persona[0] if persona else ""
             break
-    return web.Response(
-        text=build_manifest(name, persona), content_type="text/plain"
-    )
+    manifest = build_manifest(name, persona)
+    if request.query.get("format") == "json":
+        # For Slack's prefilled create link:
+        # https://api.slack.com/apps?new_app=1&manifest_json=<url-encoded>
+        return web.json_response({"manifest": yaml.safe_load(manifest)})
+    return web.Response(text=manifest, content_type="text/plain")
 
 
 async def h_validate(request: web.Request) -> web.Response:
@@ -2910,8 +2913,10 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
               <ul><li><span data-i18n="guide.slack.do1">在「团队构成」为本机每个 agent 复制 manifest</span></li>
                 <li><span data-i18n="guide.slack.do2">Install to Workspace，粘贴并验证 Bot/App Token</span></li>
                 <li><span data-i18n="guide.slack.do3">邀请全部本地与远端 bot 进入共享项目频道</span></li>
+                <li><span data-i18n="guide.slack.do5">也可以在 Claude Code 里运行 /slack-app-setup，由 agent 操作浏览器完成，只在关键步骤请你确认</span></li>
                 <li><span data-i18n="guide.slack.do4">把频道规则贴到 topic/说明：一任务一线程、一次只叫一个 agent</span></li></ul></div>
-            <div class="guide-actions"><button class="btn line" onclick="showTab('cfg')" data-i18n="guide.goto.slack">去设置 Slack App</button></div>
+            <div class="guide-actions"><a class="btn line" href="https://api.slack.com/apps" target="_blank" rel="noopener noreferrer"><span data-i18n="guide.open.slack">打开 api.slack.com/apps</span> ↗</a>
+              <button class="btn line" onclick="showTab('cfg')" data-i18n="guide.goto.slack">去设置 Slack App</button></div>
           </div>
           <div class="prompt-stack">
             <details class="prompt-row"><summary><span data-i18n="guide.prompt.channel">Slack 频道规则模板</span>
@@ -3225,7 +3230,7 @@ const I18N={
    'guide.progress':'本浏览器的上手进度','guide.map.slack':'共享 Slack 线程','guide.map.local':'每人独立本地节点','guide.map.artifact':'GitHub PR / Issue',
    'guide.done':'标记完成','guide.evidence':'完成证据','guide.do':'按这个顺序','guide.copy':'复制','guide.copied':'模板已复制','guide.copyselect':'浏览器禁止复制；模板已全选，请按系统复制键','guide.copyfail':'复制失败',
    'guide.next':'下一步：{n}','guide.complete':'上手完成。现在按“一任务一线程”开始协作。','guide.next.roles':'确定角色与 owner/node','guide.next.slack':'创建并邀请 Slack Apps','guide.next.local':'连接本机账号与仓库','guide.next.prompts':'为每个 agent 写职责 Prompt','guide.next.first-task':'跑通第一次任务与交接',
-   'guide.goto.cfg':'去团队构成','guide.goto.slack':'去设置 Slack App','guide.goto.auth':'去认证','guide.goto.prompt':'去编辑 Prompt','guide.goto.mon':'去监视运行',
+   'guide.goto.cfg':'去团队构成','guide.goto.slack':'去设置 Slack App','guide.open.slack':'打开 api.slack.com/apps','guide.slack.do5':'也可以在 Claude Code 里运行 /slack-app-setup，由 agent 操作浏览器完成，只在关键步骤请你确认','guide.goto.auth':'去认证','guide.goto.prompt':'去编辑 Prompt','guide.goto.mon':'去监视运行',
    'guide.roles.eye':'团队契约','guide.roles.title':'先分清谁负责什么','guide.roles.body':'每人保留 2–3 个 agent。developer 写代码，reviewer 独立审查，planner/pm 只拆任务；OpenAI agent 默认没有本地文件工具。',
    'guide.agent.role':'角色','guide.agent.must':'必须做到','guide.agent.never':'不要做',
    'guide.dev.must':'确认完成标准；实现并测试；commit、push、贴 PR；只交给一个 reviewer。','guide.dev.never':'不要在别人的节点登录；不要把未 push 的本地路径当成交付物。',
@@ -3268,8 +3273,8 @@ const I18N={
    'cfg.newagent':'新增 agent','cfg.name':'name','cfg.workspace':'workspace','cfg.persona':'persona（自己的行为约束）',
    'cfg.card':'card（队友接口卡）','cfg.cardhint':'给队友看的接口卡：何时找我 / handoff 带什么 / 我交付什么 / 什么别找我。留空则用 persona 首行','cfg.cardlong':'建议 ≤400 字符 / 6 行（仅警告，不阻止保存）',
    'cfg.save':'保存','cfg.setup':'设置','cfg.retoken':'重设 token','cfg.required':'必需','cfg.optional':'可选',
-   'wz.s1':'1. 打开 api.slack.com/apps →「From a manifest」贴入下方 → Install to Workspace',
-   'wz.copy':'复制 manifest','wz.s2':'2. 粘贴 Bot Token (xoxb-) 与 App-Level Token (xapp-, connections:write)：',
+   'wz.s1':'1. 点「用此 manifest 在 Slack 创建」（或打开 api.slack.com/apps →「From a manifest」贴入下方）→ 选择 workspace → Create → Install to Workspace',
+   'wz.copy':'复制 manifest','wz.create':'用此 manifest 在 Slack 创建','wz.s2':'2. 粘贴 Bot Token (xoxb-) 与 App-Level Token (xapp-, connections:write)：',
    'wz.save':'验证并写入 .env','tok.copied':'manifest 已复制','saved':'✓ 已保存','savefail':'保存失败','unlock.title':'需要控制令牌','unlock.hint':'这个节点启用了控制认证。输入 .env 里为你（owner）配置的控制 Bearer 令牌；只保存在本标签页的会话里。','unlock.save':'解锁','unlock.bad':'令牌不正确，请重新输入。','ws.title':'本地 workspace','ws.edit':'修改','ws.path':'目录（绝对路径或 ~/…）','ws.repo':'GitHub 仓库（OWNER/REPO，留空沿用默认）','ws.check':'检查','ws.unset':'未设置（使用 CLAUDE_WORKSPACE 或启动目录）','ws.nogit':'不是 git 仓库，GitHub 协作不可用','ws.branch':'分支','ws.mismatch':'origin 与 GitHub 仓库不一致，GitHub 协作会被禁用','ws.useorigin':'改用 {r}','cfg.editpersona':'编辑内容','cfg.restarthint':'重启 multi_app 生效','cfg.worktreerootrestart':'worktree root 仅在重启后生效；重启前请先用旧 root clean remove 仍存活的映射',
       'nav.auth':'认证','auth.title':'认证','auth.sub':'智能体实际运行环境（优先 Docker 容器，否则本机）的登录凭据。',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
@@ -3294,7 +3299,7 @@ const I18N={
    'guide.progress':'このブラウザのセットアップ進捗','guide.map.slack':'共有 Slack スレッド','guide.map.local':'各自の独立ローカルノード','guide.map.artifact':'GitHub PR / Issue',
    'guide.done':'完了にする','guide.evidence':'完了の証拠','guide.do':'この順で実施','guide.copy':'コピー','guide.copied':'テンプレートをコピーしました','guide.copyselect':'browser がコピーを拒否しました。テンプレートを全選択したのでコピーキーを押してください','guide.copyfail':'コピーできませんでした',
    'guide.next':'次：{n}','guide.complete':'準備完了です。「1タスク・1スレッド」で運用を始めてください。','guide.next.roles':'role と owner/node を決める','guide.next.slack':'Slack App を作成して招待する','guide.next.local':'このノードの認証と repo を接続する','guide.next.prompts':'agent ごとの責務 Prompt を書く','guide.next.first-task':'最初のタスクと引き継ぎを完走する',
-   'guide.goto.cfg':'チーム構成へ','guide.goto.slack':'Slack App 設定へ','guide.goto.auth':'認証へ','guide.goto.prompt':'Prompt 編集へ','guide.goto.mon':'運用監視へ',
+   'guide.goto.cfg':'チーム構成へ','guide.goto.slack':'Slack App 設定へ','guide.open.slack':'api.slack.com/apps を開く','guide.slack.do5':'Claude Code で /slack-app-setup を実行すると、agent がブラウザを操作して設定し、要所だけ確認を求めます','guide.goto.auth':'認証へ','guide.goto.prompt':'Prompt 編集へ','guide.goto.mon':'運用監視へ',
    'guide.roles.eye':'チーム契約','guide.roles.title':'最初に責務を分ける','guide.roles.body':'各自 2〜3 agent を持ちます。developer は実装、reviewer は独立レビュー、planner/pm は分解のみ。OpenAI agent は既定でローカルファイルを扱いません。',
    'guide.agent.role':'role','guide.agent.must':'必須','guide.agent.never':'しないこと',
    'guide.dev.must':'完了条件を確認し、実装・テスト・commit・push・PR を行い、1人の reviewer に渡す。','guide.dev.never':'他人のノードへログインしない。未 push のローカルパスを成果物にしない。',
@@ -3337,8 +3342,8 @@ const I18N={
    'cfg.newagent':'新しいエージェント','cfg.name':'name','cfg.workspace':'workspace','cfg.persona':'persona（自分向けの行動制約）',
    'cfg.card':'card（仲間向けカード）','cfg.cardhint':'仲間向けの窓口：いつ呼ぶか / handoff に何を含めるか / 何を返すか / 何は扱わないか。空なら persona 1行目','cfg.cardlong':'目安 ≤400 文字 / 6 行（警告のみ、保存は可）',
    'cfg.save':'保存','cfg.setup':'セットアップ','cfg.retoken':'token 再設定','cfg.required':'必須','cfg.optional':'任意',
-   'wz.s1':'1. api.slack.com/apps →「From a manifest」に下記を貼付 → Install to Workspace',
-   'wz.copy':'manifest をコピー','wz.s2':'2. Bot Token (xoxb-) と App-Level Token (xapp-, connections:write) を貼付:',
+   'wz.s1':'1.「この manifest で Slack に作成」を押す（または api.slack.com/apps →「From a manifest」に下記を貼付）→ workspace を選択 → Create → Install to Workspace',
+   'wz.copy':'manifest をコピー','wz.create':'この manifest で Slack に作成','wz.s2':'2. Bot Token (xoxb-) と App-Level Token (xapp-, connections:write) を貼付:',
    'wz.save':'検証して .env に保存','tok.copied':'manifest コピー','saved':'✓ 保存','savefail':'保存に失敗しました','unlock.title':'コントロールトークンが必要です','unlock.hint':'このノードはコントロール認証が有効です。.env に自分（owner）用に設定したコントロール Bearer トークンを入力してください。このタブのセッションにだけ保存されます。','unlock.save':'ロック解除','unlock.bad':'トークンが正しくありません。もう一度入力してください。','ws.title':'ローカル workspace','ws.edit':'変更','ws.path':'ディレクトリ（絶対パスまたは ~/…）','ws.repo':'GitHub リポジトリ（OWNER/REPO、空欄なら既定を使用）','ws.check':'確認','ws.unset':'未設定（CLAUDE_WORKSPACE または起動ディレクトリ）','ws.nogit':'git リポジトリではないため GitHub 連携は使えません','ws.branch':'ブランチ','ws.mismatch':'origin と GitHub リポジトリが一致しないため GitHub 連携は無効になります','ws.useorigin':'{r} を使う','cfg.editpersona':'内容を編集','cfg.restarthint':'multi_app 再起動で反映','cfg.worktreerootrestart':'worktree root は再起動時だけ反映されます。稼働中の mapping は先に旧 root 設定で clean remove してください',
       'nav.auth':'認証','auth.title':'認証','auth.sub':'エージェントが実際に動く環境（優先：Docker コンテナ／なければこのホスト）のログイン情報です。',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
@@ -3363,7 +3368,7 @@ const I18N={
    'guide.progress':'Setup progress in this browser','guide.map.slack':'Shared Slack thread','guide.map.local':'One private node per person','guide.map.artifact':'GitHub PR / Issue',
    'guide.done':'Mark complete','guide.evidence':'Completion evidence','guide.do':'Do this in order','guide.copy':'Copy','guide.copied':'template copied','guide.copyselect':'Browser copy is blocked; the template is selected—use the system copy shortcut','guide.copyfail':'copy failed',
    'guide.next':'Next: {n}','guide.complete':'Setup complete. Start collaborating with one task per thread.','guide.next.roles':'assign roles and owner/node','guide.next.slack':'create and invite Slack Apps','guide.next.local':'connect this node’s accounts and repository','guide.next.prompts':'write a responsibility prompt for each agent','guide.next.first-task':'complete the first task and handoff',
-   'guide.goto.cfg':'Open Team setup','guide.goto.slack':'Set up Slack Apps','guide.goto.auth':'Open Auth','guide.goto.prompt':'Edit prompts','guide.goto.mon':'Monitor the run',
+   'guide.goto.cfg':'Open Team setup','guide.goto.slack':'Set up Slack Apps','guide.open.slack':'Open api.slack.com/apps','guide.slack.do5':'Or run /slack-app-setup in Claude Code: an agent drives the browser and asks you to confirm only the key steps','guide.goto.auth':'Open Auth','guide.goto.prompt':'Edit prompts','guide.goto.mon':'Monitor the run',
    'guide.roles.eye':'TEAM CONTRACT','guide.roles.title':'Assign responsibility first','guide.roles.body':'Keep two or three agents per person. developer writes code, reviewer verifies independently, and planner/pm only scopes work. OpenAI agents have no local file tools by default.',
    'guide.agent.role':'role','guide.agent.must':'must do','guide.agent.never':'do not',
    'guide.dev.must':'Confirm done criteria; implement and test; commit, push, link a PR; hand off to one reviewer.','guide.dev.never':'Never sign in on someone else’s node or treat an unpushed local path as a deliverable.',
@@ -3406,8 +3411,8 @@ const I18N={
    'cfg.newagent':'New agent','cfg.name':'name','cfg.workspace':'workspace','cfg.persona':'persona (self-facing behaviour constraints)',
    'cfg.card':'card (teammate interface)','cfg.cardhint':'For teammates: when to call me / what to hand off / what I deliver / what not to ask. Empty = persona first line','cfg.cardlong':'Prefer ≤400 chars / 6 lines (warning only; save still works)',
    'cfg.save':'Save','cfg.setup':'Set up','cfg.retoken':'Reset tokens','cfg.required':'required','cfg.optional':'optional',
-   'wz.s1':'1. Open api.slack.com/apps → "From a manifest", paste below → Install to Workspace',
-   'wz.copy':'Copy manifest','wz.s2':'2. Paste Bot Token (xoxb-) and App-Level Token (xapp-, connections:write):',
+   'wz.s1':'1. Click "Create in Slack from this manifest" (or open api.slack.com/apps → "From a manifest" and paste below) → pick the workspace → Create → Install to Workspace',
+   'wz.copy':'Copy manifest','wz.create':'Create in Slack from this manifest','wz.s2':'2. Paste Bot Token (xoxb-) and App-Level Token (xapp-, connections:write):',
    'wz.save':'Verify & save to .env','tok.copied':'manifest copied','saved':'✓ Saved','savefail':'save failed','unlock.title':'Control token required','unlock.hint':'This node requires control authentication. Enter the control bearer token configured for you (the owner) in .env; it is kept in this tab session only.','unlock.save':'Unlock','unlock.bad':'That token was rejected. Try again.','ws.title':'Local workspace','ws.edit':'Change','ws.path':'Directory (absolute path or ~/…)','ws.repo':'GitHub repo (OWNER/REPO; empty inherits the default)','ws.check':'Check','ws.unset':'not set (falls back to CLAUDE_WORKSPACE or the launch directory)','ws.nogit':'not a git repo; GitHub collaboration is unavailable','ws.branch':'branch','ws.mismatch':'origin differs from the GitHub repo; GitHub collaboration will be disabled','ws.useorigin':'Use {r}','cfg.editpersona':'Edit content','cfg.restarthint':'restart multi_app to apply','cfg.worktreerootrestart':'worktree root applies only after restart; clean-remove live mappings with the old root first',
       'nav.auth':'Auth','auth.title':'Authentication','auth.sub':'Sign-in for the runtime agents actually use (Docker when up, otherwise this host).',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
@@ -4074,7 +4079,10 @@ async function loadCfg(){loadRules();const st=await j('/api/state');
     <div class="wiz">
       <p>${t('wz.s1')}</p>
       <pre class="manifest">…</pre>
-      <button class="btn text" data-action="copy-manifest">${t('wz.copy')}</button>
+      <div class="rowbtns">
+        <a class="btn solid create-app" href="https://api.slack.com/apps?new_app=1" target="_blank" rel="noopener noreferrer">${t('wz.create')} ↗</a>
+        <button class="btn text" data-action="copy-manifest">${t('wz.copy')}</button>
+      </div>
       <p>${t('wz.s2')}</p>
       <span class="lbl">Bot User OAuth Token</span><input class="bot-token" placeholder="xoxb-...">
       <span class="lbl">App-Level Token</span><input class="app-token" placeholder="xapp-...">
@@ -4139,7 +4147,13 @@ async function saveP(n,card){const m=card.querySelector('.persona-msg');m.textCo
   if(r.ok){m.className='msg '+(savedLiveOk(r,n)?'ok':'ng');m.textContent=savedMsg(r,n);loadCfg();}
   else{m.className='msg ng';m.textContent='✕ '+(r.error||t('savefail'));}}
 async function toggle(n,card){const el=card.querySelector('.wiz');el.classList.toggle('on');
-  if(el.classList.contains('on'))card.querySelector('.manifest').textContent=await apiFetch('/api/manifest/'+encodeURIComponent(n)).then(r=>r.text());}
+  if(!el.classList.contains('on'))return;
+  card.querySelector('.manifest').textContent=await apiFetch('/api/manifest/'+encodeURIComponent(n)).then(r=>r.text());
+  // Slack opens "create from manifest" already filled in with this agent's manifest
+  try{const m=await j('/api/manifest/'+encodeURIComponent(n)+'?format=json');
+    if(m&&m.manifest)card.querySelector('.create-app').href='https://api.slack.com/apps?new_app=1&manifest_json='
+      +encodeURIComponent(JSON.stringify(m.manifest));}catch(e){}
+}
 function copyMf(card){navigator.clipboard.writeText(card.querySelector('.manifest').textContent);toast(t('tok.copied'));}
 async function saveTokens(n,card){const m=card.querySelector('.token-msg');m.textContent='…';m.className='msg token-msg';
   const r=await j('/api/tokens',{method:'POST',headers:{'Content-Type':'application/json'},
