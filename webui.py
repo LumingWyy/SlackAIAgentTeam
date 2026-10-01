@@ -2194,6 +2194,9 @@ INDEX_HTML = """<!doctype html>
   --mono:"Geist Mono",ui-monospace,"SFMono-Regular",Menlo,monospace;
   --body:var(--sans);--data:var(--mono);--disp:var(--display);
   --out:cubic-bezier(.22,1,.36,1);--out-quart:cubic-bezier(.25,1,.5,1);
+  /* damped springs (bounce .18 / .28, as rare-ui's motion springs) */
+  --spring:linear(0, 0.0241, 0.0847, 0.1674, 0.2614, 0.3589, 0.4544, 0.5441, 0.6259, 0.6985, 0.7617, 0.8155, 0.8605, 0.8975, 0.9273, 0.9509, 0.9692, 0.9831, 0.9933, 1.0006, 1.0055, 1.0086, 1.0103, 1.011, 1.011, 1.0105, 1.0097, 1.0087, 1.0076, 1.0065, 1.0055, 1.0046, 1.0037, 1.003, 1.0023, 1.0018, 1);
+  --spring-pop:linear(0, 0.0312, 0.1093, 0.2147, 0.3325, 0.452, 0.5655, 0.6683, 0.7578, 0.833, 0.894, 0.9417, 0.9777, 1.0035, 1.0209, 1.0315, 1.0369, 1.0384, 1.0372, 1.0342, 1.0301, 1.0256, 1.021, 1.0166, 1.0127, 1.0093, 1.0064, 1.004, 1.0022, 1.0008, 0.9999, 0.9992, 0.9988, 0.9986, 0.9985, 0.9986, 1);
 }
 :root[data-theme="dark"]{
   color-scheme:dark;
@@ -2241,19 +2244,23 @@ body{font-family:var(--sans);background:var(--bg);color:var(--ink);font-size:15p
 .brand .mk::after{content:"";width:7px;height:7px;border-radius:50%;background:var(--accent);
   box-shadow:0 0 0 3px oklch(0.662 0.2215 36.9 / 0.22)}
 .nav{margin-left:auto;display:flex;align-items:center;gap:10px}
-.tabs{position:relative;display:flex;align-items:center;gap:2px;padding:3px;border-radius:var(--pill);
-  background:var(--tile);box-shadow:var(--apple)}
-.nav-pill{position:absolute;top:3px;bottom:3px;left:0;width:0;border-radius:var(--pill);
-  background:var(--bg);box-shadow:var(--shadow-sm),var(--apple);pointer-events:none;
-  transition:transform .42s var(--out),width .42s var(--out),opacity .2s;opacity:0}
-.nav-pill.ready{opacity:1}
-:root[data-theme="dark"] .nav-pill{background:var(--tile-2)}
-@media(prefers-color-scheme:dark){:root:not([data-theme="light"]) .nav-pill{background:var(--tile-2)}}
-.tabs button{position:relative;z-index:1;appearance:none;border:0;background:transparent;font-family:var(--sans);
-  font-size:.86rem;font-weight:500;color:var(--muted);cursor:pointer;padding:6px 14px;border-radius:var(--pill);
-  transition:color .2s var(--out)}
+/* gooey tabs: the selected tab lifts out of the bar, the rest close up */
+.tabs{display:flex;align-items:center}
+.tabs button{position:relative;appearance:none;border:0;background:var(--tile);font-family:var(--sans);font-size:.86rem;
+  font-weight:500;color:var(--muted);cursor:pointer;padding:7px 14px;border-radius:0;margin:0;box-shadow:var(--apple);
+  transition:margin .55s var(--spring),border-radius .55s var(--spring),background .25s var(--out),color .2s var(--out)}
+.tabs button:first-of-type{border-radius:var(--pill) 0 0 var(--pill)}
+.tabs button:last-of-type{border-radius:0 var(--pill) var(--pill) 0}
 .tabs button:hover{color:var(--ink)}
-.tabs button.on{color:var(--ink)}
+.tabs button.on{margin:0 6px;border-radius:var(--pill);background:var(--ink);color:var(--on-ink);box-shadow:var(--shadow-sm)}
+.tabs button.on:first-of-type{margin-left:0}.tabs button.on:last-of-type{margin-right:0}
+.tabs button:has(+ button.on){border-top-right-radius:var(--pill);border-bottom-right-radius:var(--pill)}
+.tabs button.on+button{border-top-left-radius:var(--pill);border-bottom-left-radius:var(--pill)}
+.tabs button.on::before,.tabs button.on::after{content:"";position:absolute;top:22%;bottom:22%;width:8px;background:var(--tile);
+  border-radius:var(--pill);animation:neck .5s var(--out) both;pointer-events:none}
+.tabs button.on::before{right:100%}.tabs button.on::after{left:100%}
+.tabs button.on:first-of-type::before,.tabs button.on:last-of-type::after{display:none}
+@keyframes neck{from{transform:scaleY(1);opacity:1}to{transform:scaleY(0);opacity:0}}
 .lang{display:inline-flex;gap:1px;padding:2px;border-radius:var(--r);border:1px solid var(--line-2)}
 .lang button{appearance:none;border:0;background:transparent;font-family:var(--mono);font-size:.72rem;
   color:var(--muted);cursor:pointer;padding:4px 7px;border-radius:var(--r-sm);line-height:1.2;transition:.18s}
@@ -2309,7 +2316,7 @@ a:hover{text-decoration-color:var(--accent)}
 .sw input{appearance:none;width:30px;height:18px;padding:0;border:0;border-radius:var(--pill);background:var(--tile-2);
   position:relative;cursor:pointer;transition:background .25s var(--out);flex:none;box-shadow:var(--apple)}
 .sw input::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;
-  background:var(--bg);box-shadow:var(--shadow-sm);transition:transform .3s var(--out)}
+  background:var(--bg);box-shadow:var(--shadow-sm);transition:transform .45s var(--spring-pop)}
 .sw input:checked{background:var(--accent)}
 .sw input:checked::after{transform:translateX(12px);background:oklch(0.99 0.002 70)}
 .linkbtn{appearance:none;background:transparent;border:0;font-family:var(--sans);font-size:.8rem;font-weight:500;
@@ -2321,12 +2328,20 @@ a:hover{text-decoration-color:var(--accent)}
   border-radius:var(--r-lg);overflow:hidden;background:var(--surface)}
 .fig{padding:16px 18px 14px;border-left:1px solid var(--line)}
 .fig:first-child{border-left:0}
-.fig .n{font-family:var(--display);font-size:clamp(1.7rem,3.4vw,2.2rem);line-height:1.05;letter-spacing:-.02em;
-  font-variant-numeric:tabular-nums;display:flex;overflow:hidden;height:1.12em}
+.fig .n{font-family:var(--display);font-size:clamp(1.7rem,3.4vw,2.2rem);line-height:1.2;letter-spacing:-.02em;
+  font-variant-numeric:tabular-nums;display:flex}
 .fig .n.hi{color:var(--accent-ink)}
 .fig .l{font-family:var(--mono);font-size:.68rem;color:var(--muted);margin-top:8px;letter-spacing:.06em;text-transform:uppercase}
-.roll{display:inline-block;animation:roll .5s var(--out) both}
-@keyframes roll{from{transform:translateY(60%);opacity:0;filter:blur(2px)}to{transform:none;opacity:1;filter:none}}
+/* odometer: one wheel of faces per digit, faded at the window's edges */
+.odo{display:inline-flex;align-items:flex-start}
+.odo-col{display:inline-block;height:1.2em;line-height:1.2em;overflow:hidden;
+  -webkit-mask-image:linear-gradient(to bottom,transparent 0,rgb(0 0 0 / .5) 9%,#000 20%,#000 80%,rgb(0 0 0 / .5) 91%,transparent 100%);
+  mask-image:linear-gradient(to bottom,transparent 0,rgb(0 0 0 / .5) 9%,#000 20%,#000 80%,rgb(0 0 0 / .5) 91%,transparent 100%)}
+.odo-wheel{display:flex;flex-direction:column;transition:transform .8s var(--spring)}
+.odo-wheel span{display:block;height:1.2em;text-align:center}
+.odo-mark{display:inline-block;line-height:1.2em;white-space:pre}
+.odo-col.enter,.odo-mark.enter{animation:odoIn .45s var(--out) both}
+@keyframes odoIn{from{opacity:0;transform:translateY(30%)}to{opacity:1;transform:none}}
 .transcript-health{display:flex;gap:6px;flex-wrap:wrap;padding:14px 0;color:var(--muted);font-size:.74rem}
 .transcript-health .metric{font-family:var(--mono);padding:3px 8px;border-radius:var(--r-sm);background:var(--surface);
   border:1px solid var(--line)}
@@ -2419,7 +2434,26 @@ textarea{line-height:1.55;resize:vertical}
 .rt:hover{color:var(--ink)}
 .rt.on{color:var(--ink);background:var(--bg);box-shadow:var(--shadow-sm),var(--apple)}
 .confirm{grid-column:1/-1;display:none;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 14px;
-  border-radius:var(--r);background:var(--accent-wash);animation:rise .3s var(--out) both}
+  border-radius:var(--r);background:var(--accent-wash)}
+.confirm.fresh{animation:armIn .5s var(--spring) both}
+@keyframes armIn{from{opacity:0;transform:translateX(14px) scaleX(.97)}to{opacity:1;transform:none}}
+/* in-place confirm (rare-ui delete-button): no dialog, Escape backs out */
+.arm-slot{grid-column:1/-1;min-width:0}
+.arm-slot:empty{display:none}
+.confirm.arm{background:oklch(0.59 0.2 27 / 0.08);border:1px solid oklch(0.59 0.2 27 / 0.22);transform-origin:right center}
+.confirm.arm.leaving{animation:armOut .2s var(--out) both}
+@keyframes armOut{to{opacity:0;transform:translateX(10px)}}
+.arm-btn{appearance:none;width:32px;height:32px;padding:0;border-radius:var(--r);display:grid;place-items:center;cursor:pointer;
+  border:1px solid var(--line-2);background:var(--bg);color:var(--ink);transition:transform .45s var(--spring-pop),background .2s}
+.arm-btn:hover{transform:scale(1.06)}.arm-btn:active{transform:scale(.9)}
+.arm-btn svg{width:15px;height:15px}
+.arm-btn.yes{background:var(--crit);border-color:var(--crit);color:oklch(0.99 0.002 70)}
+.arm-btn.yes path{stroke-dasharray:1;stroke-dashoffset:0}
+.confirm.arm.confirmed .arm-btn.yes{transform:scale(1.12)}
+.confirm.arm.confirmed .arm-btn.yes path{animation:draw .38s var(--out) both}
+.confirm.arm.confirmed .arm-btn.no{opacity:.35}
+@keyframes draw{from{stroke-dashoffset:1}to{stroke-dashoffset:0}}
+.worktree-row .arm-slot{grid-column:1/-1}
 .confirm.on{display:flex}
 .confirm .q{color:var(--ink);font-size:.9rem}
 .confirm .q b{font-weight:600;color:var(--accent-ink)}
@@ -2531,6 +2565,8 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
   font-size:.78rem;font-weight:500;color:var(--ink-2);background:var(--tile);box-shadow:var(--apple);
   transition:background .3s var(--out),color .3s}
 .guide-step.done .index{background:var(--ink);color:var(--on-ink)}
+.guide-step.ticking.done .index{animation:pop .55s var(--spring-pop) both}
+@keyframes pop{from{transform:scale(.78)}to{transform:none}}
 .guide-step-head{display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap}
 .guide-step h2{font-family:var(--display);font-weight:600;font-size:clamp(1.4rem,2.6vw,1.75rem);line-height:1.12;letter-spacing:-.02em}
 .guide-step .eyebrow{display:block;font-family:var(--mono);color:var(--accent-ink);font-size:.66rem;letter-spacing:.1em;
@@ -2541,21 +2577,33 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
   background:var(--bg);transition:border-color .2s,background .2s}
 .guide-done:hover{background:var(--surface)}
 .guide-done input{appearance:none;width:18px;height:18px;padding:0;margin:0;border:1.5px solid var(--line-2);border-radius:50%;
-  display:grid;place-items:center;cursor:pointer;transition:background .25s var(--out),border-color .25s}
-.guide-done input::after{content:"";width:8px;height:4px;border:2px solid var(--on-ink);border-top:0;border-right:0;
-  transform:translateY(-1px) rotate(-45deg) scale(0);transition:transform .35s var(--out)}
+  display:grid;place-items:center;cursor:pointer;
+  transition:background .3s var(--out),border-color .25s,transform .5s var(--spring-pop)}
+.guide-done input:active{transform:scale(.86)}
+.guide-done input::after{content:"";width:9px;height:4.5px;border:2px solid oklch(0.99 0.002 70);border-top:0;border-right:0;
+  transform:translate(.5px,-1px) rotate(-45deg);clip-path:inset(0 100% 0 0);transition:clip-path .34s var(--out) .06s}
 .guide-done input:checked{background:var(--accent);border-color:var(--accent)}
-.guide-done input:checked::after{transform:translateY(-1px) rotate(-45deg) scale(1);border-color:oklch(0.99 0.002 70)}
+.guide-done input:checked::after{clip-path:inset(0 0 0 0)}
 .guide-step.done .guide-done{border-color:color-mix(in oklch,var(--accent) 40%,var(--line-2));color:var(--accent-ink)}
 .guide-evidence{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:16px 28px;margin-top:20px;padding:16px 18px;
   border-radius:var(--r-lg);background:var(--surface);border:1px solid var(--line);align-items:start}
 .guide-evidence h3{font-family:var(--mono);font-size:.66rem;color:var(--muted);font-weight:500;letter-spacing:.08em;
   text-transform:uppercase;margin-bottom:8px}
 .guide-evidence ul{list-style:none;padding:0;color:var(--ink-2);font-size:.88rem}
-.guide-evidence li{position:relative;padding-left:18px}
+/* task-list: tick, then strike, then a small nudge; staggered per item */
+.guide-evidence li{position:relative;padding-left:18px;--i:0}
+.guide-evidence li:nth-child(2){--i:1}.guide-evidence li:nth-child(3){--i:2}.guide-evidence li:nth-child(4){--i:3}
 .guide-evidence li::before{content:"";position:absolute;left:2px;top:.62em;width:6px;height:6px;border-radius:2px;
-  border:1.5px solid var(--faint)}
+  border:1.5px solid var(--faint);transition:background .2s,border-color .2s,transform .45s var(--spring-pop);
+  transition-delay:calc(var(--i) * 70ms)}
 .guide-step.done .guide-evidence li::before{background:var(--accent);border-color:var(--accent)}
+.guide-step.ticking.done .guide-evidence li::before{transform:scale(1.35)}
+.guide-evidence li>span{background:linear-gradient(currentColor,currentColor) 0 58%/0 1px no-repeat;
+  -webkit-box-decoration-break:clone;box-decoration-break:clone;
+  transition:background-size .42s var(--out),color .3s var(--out);transition-delay:calc(var(--i) * 70ms + 120ms)}
+.guide-step.done .guide-evidence li>span{background-size:100% 1px;color:var(--muted)}
+.guide-step.ticking.done .guide-evidence li{animation:nudge .55s var(--spring-pop) both;animation-delay:calc(var(--i) * 70ms + 420ms)}
+@keyframes nudge{0%{transform:none}35%{transform:translateX(3px)}100%{transform:none}}
 .guide-evidence li+li{margin-top:5px}
 .guide-actions{display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap;justify-content:flex-end}
 .prompt-stack{margin-top:18px;display:grid;gap:8px}
@@ -2569,6 +2617,15 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
 .prompt-row summary .btn{margin-left:auto;font-family:var(--mono);font-size:.72rem;padding:5px 10px;border:1px solid var(--line-2);
   background:var(--bg)}
 .prompt-row summary .btn.copied{color:var(--good);border-color:color-mix(in oklch,var(--good) 45%,var(--line-2))}
+/* copy springs into a check (rare-ui code-block) */
+.copy-btn .ic-wrap{display:grid;width:13px;height:13px;flex:none}
+.copy-btn .ic-wrap svg{grid-area:1/1;width:13px;height:13px;transition:transform .5s var(--spring-pop),opacity .18s}
+.copy-btn .ic-check{opacity:0;transform:scale(.3) rotate(-20deg)}
+.copy-btn .ic-check path{stroke-dasharray:1;stroke-dashoffset:1;transition:stroke-dashoffset .36s var(--out) .1s}
+.copy-btn.copied .ic-copy{opacity:0;transform:scale(.3)}
+.copy-btn.copied .ic-check{opacity:1;transform:none}
+.copy-btn.copied .ic-check path{stroke-dashoffset:0}
+.copy-btn.copied{color:var(--good)}
 .prompt-row pre{max-height:none;margin:0;border:0;border-top:1px solid var(--line);border-radius:0;background:var(--bg);
   white-space:pre-wrap}
 .agent-guide{width:100%;border-collapse:separate;border-spacing:0;margin-top:20px;font-size:.86rem;border:1px solid var(--line);
@@ -2612,13 +2669,15 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
     color:var(--faint);font-family:var(--mono);font-size:.62rem;letter-spacing:.05em;text-transform:uppercase}
   .agent-guide .runtime{white-space:normal}
 }
+/* first paint shows saved state without replaying state-change motion */
+.booting *,.booting *::before,.booting *::after{transition:none!important}
+.booting .tabs button::before,.booting .tabs button::after{animation:none!important}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 </style></head><body>
 <header class="top"><div class="wrap">
   <div class="brand"><span class="mk"></span>SlackAgentTeam</div>
   <nav class="nav">
     <div class="tabs" id="tabs">
-    <span class="nav-pill" id="nav-pill" aria-hidden="true"></span>
     <button id="tab-guide" class="on" onclick="showTab('guide')" data-i18n="nav.guide">指引</button>
     <button id="tab-mon" onclick="showTab('mon')" data-i18n="nav.mon">監視</button>
     <button id="tab-cfg" onclick="showTab('cfg')" data-i18n="nav.cfg">構成</button>
@@ -2700,8 +2759,8 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
           </table>
           <div class="guide-evidence">
             <div><h3 data-i18n="guide.evidence">完成证据</h3>
-              <ul><li data-i18n="guide.roles.ev1">roster.yaml 中每个 agent 都有唯一 owner 与 node_id</li>
-                <li data-i18n="guide.roles.ev2">每个人的本地配置只列自己的 2–3 个 runtime</li></ul></div>
+              <ul><li><span data-i18n="guide.roles.ev1">roster.yaml 中每个 agent 都有唯一 owner 与 node_id</span></li>
+                <li><span data-i18n="guide.roles.ev2">每个人的本地配置只列自己的 2–3 个 runtime</span></li></ul></div>
             <div class="guide-actions"><button class="btn line" onclick="showTab('cfg')" data-i18n="guide.goto.cfg">去团队构成</button></div>
           </div>
         </div>
@@ -2719,15 +2778,15 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
           <p class="body" data-i18n="guide.slack.body">从 manifest 创建 App，安装到 workspace，保存 xoxb/xapp，并把所有 bot 邀请进项目频道。scope 变化后必须重新安装。</p>
           <div class="guide-evidence">
             <div><h3 data-i18n="guide.do">按这个顺序</h3>
-              <ul><li data-i18n="guide.slack.do1">在「团队构成」为本机每个 agent 复制 manifest</li>
-                <li data-i18n="guide.slack.do2">Install to Workspace，粘贴并验证 Bot/App Token</li>
-                <li data-i18n="guide.slack.do3">邀请全部本地与远端 bot 进入共享项目频道</li>
-                <li data-i18n="guide.slack.do4">把频道规则贴到 topic/说明：一任务一线程、一次只叫一个 agent</li></ul></div>
+              <ul><li><span data-i18n="guide.slack.do1">在「团队构成」为本机每个 agent 复制 manifest</span></li>
+                <li><span data-i18n="guide.slack.do2">Install to Workspace，粘贴并验证 Bot/App Token</span></li>
+                <li><span data-i18n="guide.slack.do3">邀请全部本地与远端 bot 进入共享项目频道</span></li>
+                <li><span data-i18n="guide.slack.do4">把频道规则贴到 topic/说明：一任务一线程、一次只叫一个 agent</span></li></ul></div>
             <div class="guide-actions"><button class="btn line" onclick="showTab('cfg')" data-i18n="guide.goto.slack">去设置 Slack App</button></div>
           </div>
           <div class="prompt-stack">
             <details class="prompt-row"><summary><span data-i18n="guide.prompt.channel">Slack 频道规则模板</span>
-              <button class="btn text" onclick="event.preventDefault();copyGuidePrompt('channel')" data-i18n="guide.copy">复制</button></summary>
+              <button class="btn text copy-btn" onclick="event.preventDefault();copyGuidePrompt('channel')"><span class="ic-wrap" aria-hidden="true"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><span data-i18n="guide.copy">复制</span></button></summary>
               <pre data-guide-prompt="channel"></pre></details>
           </div>
         </div>
@@ -2745,9 +2804,9 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
           <p class="body" data-i18n="guide.local.body">登录本人 Claude/Codex/GitHub，OpenAI Key 只放本机 env；创建独立 workspace、state 和 worktree volume。绝不挂载另一位 owner 的认证目录。</p>
           <div class="guide-evidence">
             <div><h3 data-i18n="guide.evidence">完成证据</h3>
-              <ul><li data-i18n="guide.local.ev1">「认证」显示所选 runtime 与 GitHub 已验证</li>
-                <li data-i18n="guide.local.ev2">本机 env 只含本人 Slack Token、控制 Bearer 和 AI Key</li>
-                <li data-i18n="guide.local.ev3">仓库 origin 与 agent 的 canonical OWNER/REPO 一致</li></ul></div>
+              <ul><li><span data-i18n="guide.local.ev1">「认证」显示所选 runtime 与 GitHub 已验证</span></li>
+                <li><span data-i18n="guide.local.ev2">本机 env 只含本人 Slack Token、控制 Bearer 和 AI Key</span></li>
+                <li><span data-i18n="guide.local.ev3">仓库 origin 与 agent 的 canonical OWNER/REPO 一致</span></li></ul></div>
             <div class="guide-actions"><button class="btn solid" onclick="showTab('auth')" data-i18n="guide.goto.auth">去认证</button>
               <button class="btn line" onclick="showTab('cfg')" data-i18n="guide.goto.cfg">去团队构成</button></div>
           </div>
@@ -2766,19 +2825,19 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
           <p class="body" data-i18n="guide.prompts.body">card 让队友知道何时找它、交什么、拿回什么；persona 约束它如何工作。推荐模板可复制后按项目改写。</p>
           <div class="prompt-stack">
             <details class="prompt-row"><summary><span data-i18n="guide.prompt.dev">dev persona 推荐</span>
-              <button class="btn text" onclick="event.preventDefault();copyGuidePrompt('dev')" data-i18n="guide.copy">复制</button></summary>
+              <button class="btn text copy-btn" onclick="event.preventDefault();copyGuidePrompt('dev')"><span class="ic-wrap" aria-hidden="true"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><span data-i18n="guide.copy">复制</span></button></summary>
               <pre data-guide-prompt="dev"></pre></details>
             <details class="prompt-row"><summary><span data-i18n="guide.prompt.reviewer">reviewer persona 推荐</span>
-              <button class="btn text" onclick="event.preventDefault();copyGuidePrompt('reviewer')" data-i18n="guide.copy">复制</button></summary>
+              <button class="btn text copy-btn" onclick="event.preventDefault();copyGuidePrompt('reviewer')"><span class="ic-wrap" aria-hidden="true"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><span data-i18n="guide.copy">复制</span></button></summary>
               <pre data-guide-prompt="reviewer"></pre></details>
             <details class="prompt-row"><summary><span data-i18n="guide.prompt.planner">planner / pm persona 推荐</span>
-              <button class="btn text" onclick="event.preventDefault();copyGuidePrompt('planner')" data-i18n="guide.copy">复制</button></summary>
+              <button class="btn text copy-btn" onclick="event.preventDefault();copyGuidePrompt('planner')"><span class="ic-wrap" aria-hidden="true"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><span data-i18n="guide.copy">复制</span></button></summary>
               <pre data-guide-prompt="planner"></pre></details>
           </div>
           <div class="guide-evidence">
             <div><h3 data-i18n="guide.evidence">完成证据</h3>
-              <ul><li data-i18n="guide.prompts.ev1">每个 card 能在 6 行内说清输入、输出和禁区</li>
-                <li data-i18n="guide.prompts.ev2">reviewer 与 dev 使用独立验证标准，OpenAI persona 明示无本地工具</li></ul></div>
+              <ul><li><span data-i18n="guide.prompts.ev1">每个 card 能在 6 行内说清输入、输出和禁区</span></li>
+                <li><span data-i18n="guide.prompts.ev2">reviewer 与 dev 使用独立验证标准，OpenAI persona 明示无本地工具</span></li></ul></div>
             <div class="guide-actions"><button class="btn line" onclick="showTab('cfg')" data-i18n="guide.goto.prompt">去编辑 Prompt</button></div>
           </div>
         </div>
@@ -2796,16 +2855,16 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
           <p class="body" data-i18n="guide.task.body">人类给一个明确任务；dev 在本地 worktree 实现并产出 PR；reviewer 独立验证。跨机器只传 Slack 上下文和 durable artifact。</p>
           <div class="prompt-stack">
             <details class="prompt-row" open><summary><span data-i18n="guide.prompt.task">人类启动任务模板</span>
-              <button class="btn text" onclick="event.preventDefault();copyGuidePrompt('task')" data-i18n="guide.copy">复制</button></summary>
+              <button class="btn text copy-btn" onclick="event.preventDefault();copyGuidePrompt('task')"><span class="ic-wrap" aria-hidden="true"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><span data-i18n="guide.copy">复制</span></button></summary>
               <pre data-guide-prompt="task"></pre></details>
             <details class="prompt-row"><summary><span data-i18n="guide.prompt.handoff">结构化 HANDOFF 模板</span>
-              <button class="btn text" onclick="event.preventDefault();copyGuidePrompt('handoff')" data-i18n="guide.copy">复制</button></summary>
+              <button class="btn text copy-btn" onclick="event.preventDefault();copyGuidePrompt('handoff')"><span class="ic-wrap" aria-hidden="true"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><span data-i18n="guide.copy">复制</span></button></summary>
               <pre data-guide-prompt="handoff"></pre></details>
           </div>
           <div class="guide-evidence">
             <div><h3 data-i18n="guide.evidence">完成证据</h3>
-              <ul><li data-i18n="guide.task.ev1">同一个根线程里能看到目标、测试结果、PR URL 和单目标 handoff</li>
-                <li data-i18n="guide.task.ev2">reviewer 给出明确通过，或带严重度与文件行号的退回意见</li></ul></div>
+              <ul><li><span data-i18n="guide.task.ev1">同一个根线程里能看到目标、测试结果、PR URL 和单目标 handoff</span></li>
+                <li><span data-i18n="guide.task.ev2">reviewer 给出明确通过，或带严重度与文件行号的退回意见</span></li></ul></div>
             <div class="guide-actions"><button class="btn solid" onclick="showTab('mon')" data-i18n="guide.goto.mon">去监视运行</button></div>
           </div>
         </div>
@@ -2857,7 +2916,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
     <div class="card">
       <div class="head"><span class="nm" data-i18n="rules.title">共通チャンネルのルール（テンプレート）</span>
         <span style="flex:1"></span>
-        <button class="btn text" onclick="copyRules()" data-i18n="rules.copy">コピー</button></div>
+        <button class="btn text copy-btn" id="rules-copy" onclick="copyRules()"><span class="ic-wrap" aria-hidden="true"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><span data-i18n="rules.copy">コピー</span></button></div>
       <div class="sub" data-i18n="rules.sub" style="margin:6px 0 10px">Slack 共通チャンネルの topic/説明に貼ると、各 agent がこのルールに従います。</div>
       <pre id="rules-pre" style="max-height:320px">…</pre>
     </div>
@@ -2986,6 +3045,9 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
 
 <script>
 const $=s=>document.querySelector(s);
+document.documentElement.classList.add('booting');
+window.addEventListener('load',()=>requestAnimationFrame(()=>requestAnimationFrame(()=>
+  document.documentElement.classList.remove('booting'))));
 const CONTROL_TOKEN_KEY='slackagent.control_token';
 function controlToken(){try{return sessionStorage.getItem(CONTROL_TOKEN_KEY)||''}catch(e){return ''}}
 function saveControlToken(value){try{sessionStorage.setItem(CONTROL_TOKEN_KEY,String(value||''))}catch(e){}}
@@ -3355,31 +3417,63 @@ function applyI18n(){
   document.querySelectorAll('[data-i18n]').forEach(el=>el.textContent=t(el.getAttribute('data-i18n')));
   document.querySelectorAll('#lang button').forEach(b=>b.classList.toggle('on',b.dataset.lang===LANG));
   document.documentElement.lang=LANG;
-  placeNavPill();
 }
 function setLang(l){if(!Object.hasOwn(I18N,l))return;LANG=l;try{localStorage.setItem('deck-lang',l)}catch(e){}
   applyI18n();showTab(TABS.find(k=>$('#panel-'+k).classList.contains('on'))||'mon');}
 
 function toast(m,err){const t2=$('#toast');t2.textContent=m;t2.className='toast on'+(err?' err':'');
   clearTimeout(t2._h);t2._h=setTimeout(()=>t2.className='toast',2600);}
-// counters roll only when their value changes, so 5s refreshes stay still
-function rollText(el,value){
+// odometer (rare-ui animated-counter): every digit is a wheel of faces;
+// columns are matched from the right, so gaining a place adds one on the left
+function reducedMotion(){return matchMedia('(prefers-reduced-motion: reduce)').matches;}
+function odoColumn(){
+  const col=document.createElement('span');col.className='odo-col';
+  const wheel=document.createElement('span');wheel.className='odo-wheel';
+  for(let d=0;d<=10;d++){const face=document.createElement('span');face.textContent=String(d%10);wheel.appendChild(face);}
+  col.appendChild(wheel);return col;
+}
+function turnWheel(col,digit,instant){
+  const wheel=col.firstChild, cur=col.dataset.d===undefined?digit:Number(col.dataset.d);
+  col.dataset.d=String(digit);
+  const place=face=>{wheel.style.transform='translateY('+(-1.2*face)+'em)';};
+  if(instant){wheel.style.transition='none';place(digit);void wheel.offsetHeight;wheel.style.transition='';return;}
+  if(cur===9&&digit===0){
+    // roll forward onto the trailing 0, then settle on the first one
+    place(10);
+    wheel.addEventListener('transitionend',()=>{if(col.dataset.d!=='0')return;
+      wheel.style.transition='none';place(0);void wheel.offsetHeight;wheel.style.transition='';},{once:true});
+    return;
+  }
+  if(cur===0&&digit===9){wheel.style.transition='none';place(10);void wheel.offsetHeight;wheel.style.transition='';}
+  place(digit);
+}
+function odometer(el,value){
   if(!el)return;value=String(value);
   if(el.dataset.v===value)return;
-  const first=el.dataset.v===undefined;el.dataset.v=value;
-  const span=document.createElement('span');span.textContent=value;
-  if(!first)span.className='roll';
-  el.replaceChildren(span);
+  const first=el.dataset.v===undefined, instant=first||reducedMotion();
+  el.dataset.v=value;el.classList.add('odo');
+  const old=[...el.children], chars=[...value], next=[];
+  chars.forEach((ch,i)=>{
+    const prev=old[old.length-(chars.length-i)];
+    if(ch>='0'&&ch<='9'){
+      const col=prev&&prev.classList.contains('odo-col')?prev:odoColumn();
+      if(col!==prev&&!instant)col.classList.add('enter');
+      next.push([col,Number(ch)]);
+    }else{
+      const mark=prev&&prev.classList.contains('odo-mark')&&prev.textContent===ch?prev:document.createElement('span');
+      if(mark!==prev){mark.className='odo-mark'+(instant?'':' enter');mark.textContent=ch;}
+      next.push([mark,null]);
+    }
+  });
+  el.replaceChildren(...next.map(([node])=>node));
+  next.forEach(([node,digit])=>{if(digit!==null)turnWheel(node,digit,instant||node.dataset.d===undefined);});
 }
-function placeNavPill(){
-  const pill=$('#nav-pill'), on=document.querySelector('#tabs button.on');
-  if(!pill||!on)return;
-  pill.style.width=on.offsetWidth+'px';
-  pill.style.transform='translateX('+on.offsetLeft+'px)';
-  requestAnimationFrame(()=>pill.classList.add('ready'));
+function rollText(el,value){odometer(el,value);}
+function flashCopied(btn){
+  if(!btn)return;
+  btn.classList.add('copied');clearTimeout(btn._copied);
+  btn._copied=setTimeout(()=>btn.classList.remove('copied'),1600);
 }
-window.addEventListener('resize',placeNavPill);
-if(document.fonts&&document.fonts.ready)document.fonts.ready.then(placeNavPill);
 function toggleTheme(){const r=document.documentElement;
   const cur=r.getAttribute('data-theme')||(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light');
   const nx=cur==='dark'?'light':'dark';r.setAttribute('data-theme',nx);try{localStorage.setItem('deck-theme',nx)}catch(e){}}
@@ -3450,10 +3544,7 @@ async function copyGuideText(value){
 function markCopied(name){
   const block=[...document.querySelectorAll('[data-guide-prompt]')]
     .find(el=>el.dataset.guidePrompt===name);
-  const btn=block&&block.closest('details')&&block.closest('details').querySelector('summary .btn');
-  if(!btn)return;
-  btn.classList.add('copied');clearTimeout(btn._copied);
-  btn._copied=setTimeout(()=>btn.classList.remove('copied'),1600);
+  flashCopied(block&&block.closest('details')&&block.closest('details').querySelector('summary .btn'));
 }
 function selectGuidePrompt(name){
   const block=[...document.querySelectorAll('[data-guide-prompt]')]
@@ -3466,7 +3557,12 @@ function selectGuidePrompt(name){
 }
 document.addEventListener('change',event=>{
   const box=event.target.closest&&event.target.closest('[data-guide-check]');
-  if(box)setGuideStep(box.dataset.guideCheck,box.checked);
+  if(!box)return;
+  // only a user's own toggle plays the tick / strike / nudge sequence
+  const row=box.closest('[data-guide-step]');
+  if(row){row.classList.add('ticking');clearTimeout(row._tick);
+    row._tick=setTimeout(()=>row.classList.remove('ticking'),1500);}
+  setGuideStep(box.dataset.guideCheck,box.checked);
 });
 const TABS=['guide','mon','cfg','auth'];
 async function ensureModels(){
@@ -3484,7 +3580,6 @@ async function loadProtectedTab(tab){
 function showTab(tab){if(!TABS.includes(tab))tab='guide';
   for(const k of TABS){$('#tab-'+k).classList.toggle('on',k===tab);
   $('#panel-'+k).classList.toggle('on',k===tab);}
-  placeNavPill();
   if(tab==='guide'){renderGuide();return;}
   ensureControlToken();try{localStorage.setItem(GUIDE_SEEN_KEY,'1')}catch(e){}
   loadProtectedTab(tab);}
@@ -3540,6 +3635,52 @@ function renderOwnerQuotas(raw){
   }).join('');
 }
 
+// in-place confirm (rare-ui delete-button): survives the 5s re-render, no dialog
+const ARMED=Object.create(null);
+const ICON_CHECK='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg>';
+const ICON_CROSS='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M7 7l10 10M17 7L7 17"/></svg>';
+function armQuestion(a){
+  if(a.kind==='runtime')return t('rt.confirm',{n:a.agent,r:a.value});
+  if(a.kind==='restart')return t('rs.confirm',{n:a.agent});
+  return t('worktree.confirm');
+}
+function armBar(key){
+  const a=ARMED[key];if(!a)return '';
+  const fresh=a.fresh;a.fresh=false;const q=armQuestion(a);
+  return `<div class="confirm arm on${fresh?' fresh':''}" data-arm-key="${esc(key)}" role="group" aria-label="${esc(q)}">
+    <span class="q">${esc(q)}</span><span class="spacer"></span>
+    <button class="arm-btn yes" data-arm="yes" aria-label="${esc(t('btn.apply'))}">${ICON_CHECK}</button>
+    <button class="arm-btn no" data-arm="no" aria-label="${esc(t('btn.cancel'))}">${ICON_CROSS}</button></div>`;
+}
+function arm(key,action,slot){
+  ARMED[key]=Object.assign({},action,{fresh:true});
+  if(!slot)return;
+  slot.innerHTML=armBar(key);
+  const no=slot.querySelector('[data-arm="no"]');if(no)no.focus();
+}
+function disarm(key,bar){
+  delete ARMED[key];if(!bar)return;
+  if(reducedMotion()){bar.remove();return;}
+  bar.classList.add('leaving');setTimeout(()=>bar.remove(),200);
+}
+async function fireArmed(key,bar){
+  const a=ARMED[key];if(!a)return;delete ARMED[key];
+  bar.classList.add('confirmed');
+  await new Promise(done=>setTimeout(done,reducedMotion()?0:420));
+  if(a.kind==='runtime')await switchRuntime(a.agent,a.value);
+  else if(a.kind==='restart')await restartSessions(a.agent);
+  else if(a.kind==='worktree')await doRemoveWorktree(a.digest);
+}
+document.addEventListener('click',event=>{
+  const btn=event.target.closest&&event.target.closest('[data-arm]');
+  const bar=btn&&btn.closest('[data-arm-key]');
+  if(!bar)return;
+  if(btn.dataset.arm==='yes')fireArmed(bar.dataset.armKey,bar);else disarm(bar.dataset.armKey,bar);
+});
+document.addEventListener('keydown',event=>{
+  if(event.key!=='Escape')return;
+  document.querySelectorAll('[data-arm-key]').forEach(bar=>disarm(bar.dataset.armKey,bar));
+});
 function renderWorktrees(items){
   const root=$('#worktrees'), rows=Array.isArray(items)?items:[];
   const valid=rows.filter(w=>/^[0-9a-f]{64}$/.test(String(w.identity_digest||'')));
@@ -3552,7 +3693,7 @@ function renderWorktrees(items){
     const status=String(w.status||'unknown'), removable=status==='ready'&&!active;
     const identity=[w.team_id,w.channel_id,w.root_thread_ts].filter(Boolean).join(' · ');
     const detail=[identity,w.path].filter(Boolean).join(' · ');
-    return `<article class="worktree-row">
+    return `<article class="worktree-row" data-digest="${d}">
       <div class="worktree-main">
         <div class="worktree-branch" title="${esc(w.branch||'')}">${esc(w.branch||d.slice(0,16))}</div>
         <div class="worktree-meta" title="${esc(detail)}">${esc(detail||d)}</div>
@@ -3561,12 +3702,17 @@ function renderWorktrees(items){
         <span class="state ${active?'work':(status==='ready'?'idle':'off')}">${active?t('worktree.active'):esc(status)}</span>
         ${status==='removed'?'':`<button class="btn text" ${removable?'':'disabled'} onclick="removeWorktree('${d}')">${t('worktree.remove')}</button>`}
       </div>
+      <div class="arm-slot">${armBar('wt:'+d)}</div>
     </article>`;
   }).join('');
 }
-async function removeWorktree(identityDigest){
+function removeWorktree(identityDigest){
   if(!/^[0-9a-f]{64}$/.test(String(identityDigest||'')))return;
-  if(!confirm(t('worktree.confirm')))return;
+  arm('wt:'+identityDigest,{kind:'worktree',digest:identityDigest},
+    document.querySelector('.worktree-row[data-digest="'+identityDigest+'"] .arm-slot'));
+}
+async function doRemoveWorktree(identityDigest){
+  if(!/^[0-9a-f]{64}$/.test(String(identityDigest||'')))return;
   try{
     const r=await j('/api/live/worktrees/'+identityDigest+'/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
     if(r.ok){toast(t('worktree.removed'));loadLive();}
@@ -3615,7 +3761,8 @@ async function loadIssues(){
       <span class="iasg">${esc(asg)}</span></div>`;
   }).join('');
 }
-async function copyRules(){const p=$('#rules-pre');navigator.clipboard.writeText(p.textContent);toast(t('rules.copied'));}
+async function copyRules(){const p=$('#rules-pre');navigator.clipboard.writeText(p.textContent);toast(t('rules.copied'));
+  flashCopied($('#rules-copy'));}
 async function loadRules(){try{const d=await j('/api/channel-rules');$('#rules-pre').textContent=d.template||d.error||'';}catch(e){}}
 async function loadLive(){
   loadIssues();
@@ -3691,6 +3838,7 @@ async function loadLive(){
         <div class="field">
           <select data-action="reply-language">${langOpts(a.reply_language||'')}</select>
         </div><span></span>
+        <div class="arm-slot">${armBar('agent:'+a.name)}</div>
         <div class="confirm ${pend!==undefined?'on':''}">
           <span class="q">${esc(t('confirm.q',{n:a.name,m:pend!==undefined?(pend||t('def.plain')):''}))}</span>
           <span class="spacer"></span>
@@ -3702,16 +3850,18 @@ async function loadLive(){
     </div>`;}).join('');
 }
 function stageModel(n,m,root){PENDING[n]=m;const cf=root.querySelector('.confirm');
-  cf.querySelector('.q').textContent=t('confirm.q',{n:n,m:m||t('def.plain')});cf.classList.add('on');}
+  cf.querySelector('.q').textContent=t('confirm.q',{n:n,m:m||t('def.plain')});cf.classList.add('on','fresh');}
 function cancelModel(n,root){delete PENDING[n];root.querySelector('.confirm').classList.remove('on');loadLive();}
 async function applyModel(n){const m=PENDING[n]||'';
   const r=await j('/api/live/'+encodeURIComponent(n)+'/model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:m})});
   if(r.ok){delete PENDING[n];toast(t('toast.sw',{n:n,m:m||t('def.plain')}));loadLive();}else toast('✕ '+(r.error||t('toast.swf')),1);}
-async function askRuntime(n,rt,cur){if(rt===cur)return;
-  if(!confirm(t('rt.confirm',{n:n,r:rt})))return;
+function askRuntime(n,rt,cur,root){if(rt===cur)return;
+  arm('agent:'+n,{kind:'runtime',agent:n,value:rt},root&&root.querySelector('.arm-slot'));}
+function askRestart(n,root){arm('agent:'+n,{kind:'restart',agent:n},root&&root.querySelector('.arm-slot'));}
+async function switchRuntime(n,rt){
   const r=await j('/api/live/'+encodeURIComponent(n)+'/runtime',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runtime:rt})});
   if(r.ok){toast(t('toast.rt',{n:n,r:r.runtime}));loadLive();}else toast('✕ '+(r.error||t('toast.fail')),1);}
-async function askRestart(n){if(!confirm(t('rs.confirm',{n:n})))return;
+async function restartSessions(n){
   const r=await j('/api/live/'+encodeURIComponent(n)+'/restart',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
   if(r.ok){toast(t('toast.rs',{n:n,c:r.cleared_sessions}));loadLive();}else toast('✕ '+(r.error||t('toast.fail')),1);}
 
@@ -3806,8 +3956,8 @@ document.addEventListener('click',event=>{
   const root=control&&control.closest('[data-agent]');
   if(!control||!root)return;
   const n=root.dataset.agent, action=control.dataset.action;
-  if(action==='runtime')askRuntime(n,control.dataset.value,root.dataset.runtime);
-  else if(action==='restart')askRestart(n);
+  if(action==='runtime')askRuntime(n,control.dataset.value,root.dataset.runtime,root);
+  else if(action==='restart')askRestart(n,root);
   else if(action==='model-apply')applyModel(n);
   else if(action==='model-cancel')cancelModel(n,root);
   else if(action==='setup')toggle(n,root);
