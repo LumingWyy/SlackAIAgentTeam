@@ -5247,7 +5247,7 @@ def test_patrol_loop_queues_even_when_a_slack_thread_is_busy(
     assert runs[0][1] == "C-PATROL"
 
 
-def test_patrol_prompt_requires_v2_cas_and_full_claim_verification(
+def test_patrol_loop_runs_host_claim_patrol(
     tmp_path, monkeypatch
 ):
     import asyncio
@@ -5278,38 +5278,38 @@ def test_patrol_prompt_requires_v2_cas_and_full_claim_verification(
     with pytest.raises(StopPatrol):
         asyncio.run(agent.patrol_loop())
 
-    assert len(prompts) == 1
-    prompt = prompts[0]
-    assert "claim POST" not in prompt
-    assert "absent-ref `--force-with-lease`" in prompt
-    assert "known exit 0" in prompt
-    assert "ref・metadata commit・issue comment" in prompt
-    assert "全量再読" in prompt
-    assert "fail-closed" in prompt
+    # The host claims an issue with the claim tool before any provider
+    # turn; the model is never handed the lease protocol to run by hand.
+    assert prompts == [None]
 
 
 def test_github_system_prompt_uses_agent_distinct_atomic_claim_ref(
     tmp_path, monkeypatch
 ):
+    import multi_app
+
     agent = _collaboration_agent(tmp_path, monkeypatch)
     agent.github_repo = "acme/widgets"
     agent.cfg.node_id = "alice-node"
 
     prompt = agent._system_prompt()
 
-    assert "refs/heads/slack-agent-claims/issue-<number>" in prompt
-    assert "repos/acme/widgets/git/ref/heads/slack-agent-claims" in prompt
-    assert "agent=local" in prompt
-    assert "node=alice-node" in prompt
+    tool = multi_app.ISSUE_CLAIM_TOOL_PREFIX
+    claim = (
+        f"{tool} claim --repo acme/widgets --issue <number> "
+        "--agent local --node alice-node"
+    )
+    assert claim in prompt
+    assert f"{tool} renew --repo acme/widgets" in prompt
+    assert f"{tool} release --repo acme/widgets" in prompt
+    assert '"status": "claimed"' in prompt
+    assert "never claim by hand" in prompt
     assert "@me" not in prompt
     assert "CLAIM_LEASE_SECONDS=1800" in prompt
     assert "CLAIM_STALE_GRACE_SECONDS=300" in prompt
-    assert "claimed_at=<github-rfc3339>" in prompt
-    assert "lease_until=<github-rfc3339>" in prompt
-    assert "GitHub `Date`" in prompt
-    assert "--force-with-lease=" in prompt
-    assert "exact expected ref SHA" in prompt
-    assert "owner mismatch" in prompt
+    assert "stop work" in prompt
+    # The hand-run protocol (and its unsafe variants) is gone.
+    assert "--force-with-lease=" not in prompt
     assert "--method DELETE" not in prompt
     assert "--method PATCH" not in prompt
 
@@ -5344,9 +5344,9 @@ def test_github_prompt_and_patrol_are_isolated_per_agent_repo(
 
     prompt_a = agents[0]._system_prompt()
     prompt_b = agents[1]._system_prompt()
-    assert "repos/acme/repo-a/" in prompt_a
+    assert "claim --repo acme/repo-a " in prompt_a
     assert "acme/repo-b" not in prompt_a
-    assert "repos/acme/repo-b/" in prompt_b
+    assert "claim --repo acme/repo-b " in prompt_b
     assert "acme/repo-a" not in prompt_b
 
     patrol_prompts: dict[str, str] = {}
@@ -5377,10 +5377,11 @@ def test_github_prompt_and_patrol_are_isolated_per_agent_repo(
                 await agent.patrol_loop()
 
     asyncio.run(scenario())
-    assert "--repo acme/repo-a" in patrol_prompts["a"]
-    assert "acme/repo-b" not in patrol_prompts["a"]
-    assert "--repo acme/repo-b" in patrol_prompts["b"]
-    assert "acme/repo-a" not in patrol_prompts["b"]
+    # Both run the host-claim patrol against their own verified repo.
+    assert patrol_prompts == {"a": None, "b": None}
+    assert agents[0]._claim_command(
+        "claim", repo=agents[0].github_repo, issue="7", config=agents[0].cfg
+    ).count("acme/repo-a") == 1
 
 
 def test_context_rollover_tokens_three_levels(tmp_path, monkeypatch):

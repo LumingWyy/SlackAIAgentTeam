@@ -10,11 +10,14 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import json
 import logging
 import math
 import os
 import re
+import shlex
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -65,8 +68,11 @@ from multi_core import (
     TurnSignals,
     build_activation_prompt,
     build_batched_instruction,
+    build_patrol_work_prompt,
     build_freshness_recheck_prompt,
+    CLAIM_RENEW_SECONDS,
     canonical_github_repo,
+    claim_tool_command,
     classify_runtime_failure,
     codex_usage_delta,
     classify_sender,
@@ -147,6 +153,14 @@ EMPTY_REPLY_PLACEHOLDERS = frozenset(
 CODEX_USAGE_BASELINE_LIMIT = 4096
 # A provider cooldown wait at least this long is announced in the thread.
 COOLDOWN_NOTICE_SECONDS = 30.0
+# Host-side issue claim tool (slack-agent-claim v2 lease protocol).
+ISSUE_CLAIM_TOOL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "issue_claim.py"
+)
+ISSUE_CLAIM_TOOL_PREFIX = shlex.join([sys.executable, ISSUE_CLAIM_TOOL])
+CLAIM_TOOL_TIMEOUT_SECONDS = 300.0
+# Todo issues one patrol round tries to claim before giving up as idle.
+PATROL_CLAIM_ATTEMPTS = 5
 # Restart reconciliation reports at most this many recent cut-off
 # activations per agent; older or excess rows are dropped silently.
 INTERRUPTED_ACTIVATION_MAX_AGE_SECONDS = 24 * 3600.0
@@ -243,6 +257,55 @@ def _provider_error_retry_after(exc: BaseException) -> float | None:
     except (TypeError, ValueError):
         return None
     return value if value >= 0 else None
+
+
+class ClaimLeaseLostError(RuntimeError):
+    """The host could not renew an issue lease; the turn was cancelled."""
+
+    def __init__(self, issue: int, status: str) -> None:
+        super().__init__(f"issue #{issue} lease renewal {status}")
+        self.issue = issue
+        self.status = status
+
+
+async def run_host_command(
+    cmd: list[str], *, cwd: str, timeout: float
+) -> tuple[int, str, str]:
+    """Run one host command; a timeout or cancellation kills and reaps it.
+
+    A timeout returns ``(-1, "", "timed out")`` so callers treat the outcome
+    as unknown instead of crashing the patrol loop.
+    """
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GH_PROMPT_DISABLED="1")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=cwd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        return 127, "", str(exc)
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout
+        )
+    except BaseException as exc:
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        await asyncio.shield(proc.wait())
+        if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+            return -1, "", "timed out"
+        raise
+    return (
+        proc.returncode if proc.returncode is not None else -1,
+        stdout.decode(errors="replace"),
+        stderr.decode(errors="replace"),
+    )
 
 
 SOCKET_GAP_SAMPLE_SECONDS = 10.0
@@ -5542,21 +5605,10 @@ class SlackAgent:
                 # A patrol-enabled but initially repo-less agent can become
                 # active after a verified per-agent repo reload.
                 await self.consume_pending_config()
-                repo = self.github_repo
-                if repo:
-                    prompt = (
-                        f"巡回タスク: `gh issue list --repo {repo} "
-                        f'--label "status:todo" --json number,title,labels` を実行し、'
-                        "候補があれば system prompt の v2 lease protocol で"
-                        "**1件だけ**認領する。absent-ref `--force-with-lease` create が"
-                        "known exit 0 で成功し、ref・metadata commit・issue comment を"
-                        "全量再読して所有者・nonce・時刻・SHA の一致を検証できた場合だけ"
-                        "作業を進める。failure・timeout・unknown・不一致は fail-closed とし、"
-                        "issue 状態やコードを変更しない。"
-                        "進捗と結果を報告してください。"
-                        "認領できる issue が無ければ本文を PATROL_IDLE とだけしてください。"
-                    )
-                    await self._run_patrol_once(prompt, channel)
+                if self.github_repo:
+                    # Host-claim patrol: the claim tool picks and claims one
+                    # issue before any provider turn is spent.
+                    await self._run_patrol_once(None, channel)
             except Exception:
                 logger.warning(
                     "agent %s patrol_loop iteration failed",
@@ -5570,8 +5622,11 @@ class SlackAgent:
                 count=self.patrol_count,
             )
 
-    async def _run_patrol_once(self, prompt: str, channel: str) -> None:
-        """Run patrol and consume a deferred snapshot on every exit path."""
+    async def _run_patrol_once(self, prompt: str | None, channel: str) -> None:
+        """Run patrol and consume a deferred snapshot on every exit path.
+
+        ``prompt=None`` runs the host-claim patrol (see _run_patrol_once_inner).
+        """
         config_snapshot = replace(
             self.cfg, allowed_tools=list(self.cfg.allowed_tools)
         )
@@ -5623,7 +5678,7 @@ class SlackAgent:
             quota_reservation
         )
         try:
-            provider_ran = await self._run_patrol_once_inner(
+            outcome = await self._run_patrol_once_inner(
                 prompt,
                 channel,
                 config_snapshot=config_snapshot,
@@ -5654,11 +5709,12 @@ class SlackAgent:
             raise
         else:
             # A patrol skipped before any provider call (ACL, runtime, repo,
-            # membership) proves nothing about the provider; it must not
-            # reset the strike streak.
-            if provider_ran:
+            # membership) proves nothing about the provider or GitHub; it must
+            # not reset the strike streak or close the fence.
+            if outcome == "ran":
                 cooldown.note_success()
                 self._turn_pacer.note_clean_turn()
+            if outcome in ("ran", "idle"):
                 self._patrol_fence.note_success()
         finally:
             _CURRENT_QUOTA_RESERVATION.reset(quota_token)
@@ -5708,16 +5764,23 @@ class SlackAgent:
 
     async def _run_patrol_once_inner(
         self,
-        prompt: str,
+        prompt: str | None,
         channel: str,
         *,
         config_snapshot: AgentConfig,
         repo_snapshot: str | None,
         admission: RuntimeAdmission,
-    ) -> bool:
+    ) -> str:
         """Run one patrol from one immutable admitted config snapshot.
 
-        Returns True only when a provider turn actually ran.
+        ``prompt=None`` is the host-claim patrol: the host lists todo issues
+        and claims one with the claim tool first, so an idle round costs no
+        provider turn and the model never runs the lease protocol by hand;
+        while the turn works, the host renews the lease.
+
+        Returns ``"skipped"`` (pre-checks stopped it), ``"idle"`` (GitHub was
+        reachable but nothing was claimable) or ``"ran"`` (a provider turn
+        ran).
         """
         async with self.runtime_limiter.slot(
             self.name,
@@ -5731,7 +5794,7 @@ class SlackAgent:
                     self.name,
                     channel,
                 )
-                return
+                return "skipped"
             runtime = config_snapshot.runtime
             if runtime == "openai":
                 logger.warning(
@@ -5739,13 +5802,13 @@ class SlackAgent:
                     "Git/shell tools",
                     self.name,
                 )
-                return
+                return "skipped"
             if not repo_snapshot:
                 logger.warning(
                     "agent %s patrol skipped: no verified GitHub repo",
                     self.name,
                 )
-                return
+                return "skipped"
             allowed_agent_names = await self._channel_agent_names(
                 self.app.client if self.app is not None else None,
                 channel,
@@ -5763,7 +5826,27 @@ class SlackAgent:
                     self.name,
                     channel,
                 )
-                return
+                return "skipped"
+            claim: dict | None = None
+            if prompt is None:
+                claim = await self._claim_patrol_issue(
+                    repo_snapshot, config_snapshot
+                )
+                if claim is None:
+                    logger.debug(
+                        "agent %s patrol idle: nothing claimable", self.name
+                    )
+                    return "idle"
+                prompt = build_patrol_work_prompt(
+                    issue=int(claim["number"]),
+                    title=str(claim.get("title") or ""),
+                    release_command=self._claim_command(
+                        "release",
+                        repo=repo_snapshot,
+                        issue=str(claim["number"]),
+                        config=config_snapshot,
+                    ),
+                )
             project_id = policy.project_id if policy is not None else ""
             system_prompt = self._system_prompt(
                 allowed_agent_names,
@@ -5771,82 +5854,35 @@ class SlackAgent:
                 config=config_snapshot,
                 github_repo=repo_snapshot,
             )
-            if runtime == "codex":
-                codex_result = await self._run_codex_exec(
-                    f"{system_prompt}\n---\n{prompt}",
-                    resume_session=None,
-                    config=config_snapshot,
-                )
-                result_text, _tid, _tok = codex_result[:3]
-                usage = (
-                    codex_result[3]
-                    if len(codex_result) > 3
-                    else ProviderTokenUsage(
-                        input_tokens=_tok,
-                        total_tokens=_tok,
-                        complete=False,
-                    )
-                )
-                self._settle_quota_usage(usage)
-            elif runtime == "claude":
-                options = ClaudeAgentOptions(
-                    cwd=config_snapshot.workspace,
-                    allowed_tools=config_snapshot.allowed_tools,
-                    permission_mode="default",
-                    max_turns=config_snapshot.max_turns,
-                    system_prompt=system_prompt,
-                    model=config_snapshot.claude_model or None,
-                    effort=(
-                        config_snapshot.effort
-                        if config_snapshot.effort in CLAUDE_EFFORTS
-                        else None
-                    ),
-                )
-                result_text = ""
-                provider_usage: ProviderTokenUsage | None = None
-                signals = TurnSignals()
-                await self._pace_turn_start()
-                self._mark_quota_runtime_started()
-                try:
-                    async with asyncio.timeout(config_snapshot.claude_timeout):
-                        async for message in query(
-                            prompt=prompt, options=options
-                        ):
-                            observe_claude_message(signals, message)
-                            if isinstance(message, ResultMessage):
-                                result_text = message.result or ""
-                                provider_usage = claude_result_usage(
-                                    getattr(message, "usage", None)
-                                )
-                except TimeoutError:
-                    raise
-                except Exception as exc:
-                    if provider_usage is not None:
-                        self._settle_quota_usage(provider_usage)
-                    rate_error = signals.rate_limit_error(
-                        str(exc), now=time.time()
-                    )
-                    if rate_error is not None:
-                        raise rate_error from exc
-                    if signals.error_text:
-                        raise RuntimeError(
-                            "patrol claude turn returned an error result: "
-                            f"{signals.error_text[:300]}"
-                        ) from exc
-                    raise
-                if provider_usage is not None:
-                    self._settle_quota_usage(provider_usage)
-                if signals.error_text:
-                    # Never post a provider error as a top-level patrol report.
-                    rate_error = signals.rate_limit_error(now=time.time())
-                    if rate_error is not None:
-                        raise rate_error
-                    raise RuntimeError(
-                        "patrol claude turn returned an error result: "
-                        f"{signals.error_text[:300]}"
-                    )
+            work = self._patrol_provider_turn(
+                prompt,
+                system_prompt=system_prompt,
+                config_snapshot=config_snapshot,
+            )
+            if claim is None:
+                result_text = await work
             else:
-                raise RuntimeError(f"unsupported patrol runtime: {runtime}")
+                issue = int(claim["number"])
+                try:
+                    result_text = await self._with_claim_renewal(
+                        work,
+                        issue=issue,
+                        renew=lambda: self._run_claim_tool(
+                            "renew",
+                            repo=repo_snapshot,
+                            issue=issue,
+                            config=config_snapshot,
+                        ),
+                    )
+                except ClaimLeaseLostError as exc:
+                    await self._post_result(
+                        channel,
+                        None,
+                        f"⛔ issue #{issue} の claim を更新できなかったため、"
+                        f"作業を中止しました（{exc.status}）。"
+                        "issue の状態を確認してください。",
+                    )
+                    raise
             result = result_text or (
                 "(runtime からテキストの応答がありませんでした)"
             )
@@ -5854,7 +5890,263 @@ class SlackAgent:
                 logger.debug("agent %s patrol idle", self.name)
             else:
                 await self._post_result(channel, None, result)
-            return True
+            return "ran"
+
+    async def _patrol_provider_turn(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str,
+        config_snapshot: AgentConfig,
+    ) -> str:
+        """One fresh-session provider turn for patrol; returns its text."""
+        runtime = config_snapshot.runtime
+        if runtime == "codex":
+            codex_result = await self._run_codex_exec(
+                f"{system_prompt}\n---\n{prompt}",
+                resume_session=None,
+                config=config_snapshot,
+            )
+            result_text, _tid, _tok = codex_result[:3]
+            usage = (
+                codex_result[3]
+                if len(codex_result) > 3
+                else ProviderTokenUsage(
+                    input_tokens=_tok,
+                    total_tokens=_tok,
+                    complete=False,
+                )
+            )
+            self._settle_quota_usage(usage)
+            return result_text
+        if runtime != "claude":
+            raise RuntimeError(f"unsupported patrol runtime: {runtime}")
+        options = ClaudeAgentOptions(
+            cwd=config_snapshot.workspace,
+            allowed_tools=config_snapshot.allowed_tools,
+            permission_mode="default",
+            max_turns=config_snapshot.max_turns,
+            system_prompt=system_prompt,
+            model=config_snapshot.claude_model or None,
+            effort=(
+                config_snapshot.effort
+                if config_snapshot.effort in CLAUDE_EFFORTS
+                else None
+            ),
+        )
+        result_text = ""
+        provider_usage: ProviderTokenUsage | None = None
+        signals = TurnSignals()
+        await self._pace_turn_start()
+        self._mark_quota_runtime_started()
+        try:
+            async with asyncio.timeout(config_snapshot.claude_timeout):
+                async for message in query(prompt=prompt, options=options):
+                    observe_claude_message(signals, message)
+                    if isinstance(message, ResultMessage):
+                        result_text = message.result or ""
+                        provider_usage = claude_result_usage(
+                            getattr(message, "usage", None)
+                        )
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            if provider_usage is not None:
+                self._settle_quota_usage(provider_usage)
+            rate_error = signals.rate_limit_error(str(exc), now=time.time())
+            if rate_error is not None:
+                raise rate_error from exc
+            if signals.error_text:
+                raise RuntimeError(
+                    "patrol claude turn returned an error result: "
+                    f"{signals.error_text[:300]}"
+                ) from exc
+            raise
+        if provider_usage is not None:
+            self._settle_quota_usage(provider_usage)
+        if signals.error_text:
+            # Never post a provider error as a top-level patrol report.
+            rate_error = signals.rate_limit_error(now=time.time())
+            if rate_error is not None:
+                raise rate_error
+            raise RuntimeError(
+                "patrol claude turn returned an error result: "
+                f"{signals.error_text[:300]}"
+            )
+        return result_text
+
+    # -- host-side issue claims (issue_claim.py) -----------------------------
+
+    def _claim_command(
+        self,
+        action: str,
+        *,
+        repo: str,
+        issue: str,
+        config: AgentConfig | ExecutionConfig,
+    ) -> str:
+        """Shell-ready claim tool command line (for prompts)."""
+        return claim_tool_command(
+            action,
+            tool=ISSUE_CLAIM_TOOL_PREFIX,
+            repo=repo,
+            issue=issue,
+            agent=self.name,
+            node=config.node_id,
+        )
+
+    async def _run_claim_tool(
+        self,
+        action: str,
+        *,
+        repo: str,
+        issue: int,
+        config: AgentConfig | ExecutionConfig,
+    ) -> dict:
+        """Run issue_claim.py; any failure to get a verdict is ``unknown``."""
+        cmd = [
+            sys.executable,
+            ISSUE_CLAIM_TOOL,
+            action,
+            "--repo",
+            repo,
+            "--issue",
+            str(int(issue)),
+            "--agent",
+            self.name,
+            "--node",
+            config.node_id or "unspecified",
+        ]
+        rc, out, err = await run_host_command(
+            cmd, cwd=config.workspace, timeout=CLAIM_TOOL_TIMEOUT_SECONDS
+        )
+        lines = [line for line in out.splitlines() if line.strip()]
+        try:
+            result = json.loads(lines[-1]) if lines else None
+        except ValueError:
+            result = None
+        if not isinstance(result, dict) or "status" not in result:
+            logger.warning(
+                "agent %s claim tool %s gave no verdict (rc=%s): %s",
+                self.name,
+                action,
+                rc,
+                err[-500:],
+            )
+            return {"status": "unknown", "issue": int(issue), "reason": "no verdict"}
+        return result
+
+    async def _patrol_candidates(
+        self, repo: str, config: AgentConfig
+    ) -> list[dict]:
+        """Open ``status:todo`` issues, oldest first; a gh failure raises."""
+        rc, out, err = await run_host_command(
+            [
+                "gh",
+                "issue",
+                "list",
+                "--repo",
+                repo,
+                "--label",
+                "status:todo",
+                "--state",
+                "open",
+                "--json",
+                "number,title",
+                "--limit",
+                "20",
+            ],
+            cwd=config.workspace,
+            timeout=CLAIM_TOOL_TIMEOUT_SECONDS,
+        )
+        if rc != 0:
+            raise RuntimeError(f"gh issue list failed: {err.strip()[-300:]}")
+        try:
+            issues = json.loads(out or "[]")
+        except ValueError as exc:
+            raise RuntimeError("gh issue list returned malformed JSON") from exc
+        candidates = [
+            item
+            for item in issues
+            if isinstance(item, dict) and isinstance(item.get("number"), int)
+        ]
+        return sorted(candidates, key=lambda item: item["number"])
+
+    async def _claim_patrol_issue(
+        self, repo: str, config: AgentConfig
+    ) -> dict | None:
+        """Claim the oldest claimable todo issue; None when nothing is claimable."""
+        for candidate in (await self._patrol_candidates(repo, config))[
+            :PATROL_CLAIM_ATTEMPTS
+        ]:
+            result = await self._run_claim_tool(
+                "claim", repo=repo, issue=candidate["number"], config=config
+            )
+            if result.get("status") == "claimed":
+                logger.info(
+                    "agent %s patrol claimed issue #%s",
+                    self.name,
+                    candidate["number"],
+                )
+                return {**candidate, **result}
+            logger.info(
+                "agent %s patrol could not claim issue #%s: %s %s",
+                self.name,
+                candidate["number"],
+                result.get("status"),
+                str(result.get("reason") or "")[:200],
+            )
+        return None
+
+    async def _with_claim_renewal(
+        self,
+        work: Any,
+        *,
+        issue: int,
+        renew: Any,
+        renew_every: float = CLAIM_RENEW_SECONDS,
+    ) -> str:
+        """Await ``work`` while renewing its issue lease; stop work if it lapses.
+
+        A failed or unknown renewal means the claim may no longer be ours, so
+        the turn is cancelled rather than allowed to keep changing code.
+        """
+        work_task = asyncio.ensure_future(work)
+
+        async def renew_loop() -> dict:
+            while True:
+                await asyncio.sleep(renew_every)
+                try:
+                    result = await renew()
+                except Exception as exc:
+                    return {"status": "unknown", "reason": str(exc)[:200]}
+                if result.get("status") != "renewed":
+                    return result
+
+        renew_task = asyncio.create_task(renew_loop())
+        try:
+            done, _pending = await asyncio.wait(
+                {work_task, renew_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if work_task in done:
+                return work_task.result()
+            lost = renew_task.result()
+            logger.warning(
+                "agent %s lost issue #%s lease (%s): cancelling the turn",
+                self.name,
+                issue,
+                lost.get("status"),
+            )
+            work_task.cancel()
+            await asyncio.gather(work_task, return_exceptions=True)
+            raise ClaimLeaseLostError(
+                issue, str(lost.get("status") or "unknown")
+            )
+        finally:
+            for task in (renew_task, work_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(renew_task, work_task, return_exceptions=True)
 
     async def _maybe_rollover(
         self, thread_key: str, thread_ts: str, say: Any
@@ -7658,7 +7950,10 @@ class SlackAgent:
                 f'- タスク管理は GitHub Issues が唯一の正。着手前に `gh issue list --repo {repo} --label "status:todo"` で確認する。\n'
             )
             base += format_github_claim_protocol(
-                repo, self.name, active_config.node_id
+                repo,
+                self.name,
+                active_config.node_id,
+                tool_command=ISSUE_CLAIM_TOOL_PREFIX,
             )
             base += (
                 "- ローカルコードを閲覧・調査・作業する前にremote情報を取得し、最新状態を確認する。thread worktreeでは現在の管理branchを維持し、`gh issue develop --checkout` や `gh pr checkout` は使わない。\n"

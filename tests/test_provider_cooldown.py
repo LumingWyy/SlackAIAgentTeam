@@ -771,14 +771,14 @@ def test_skipped_patrol_does_not_reset_strikes(tmp_path, monkeypatch):
     assert cooldown.remaining() == 0.0
 
     async def skipped_inner(*_args, **_kwargs):
-        return False
+        return "skipped"
 
     agent._run_patrol_once_inner = skipped_inner
     asyncio.run(agent._run_patrol_once("p", "C-PATROL"))
     assert cooldown.strikes == 1
 
     async def ran_inner(*_args, **_kwargs):
-        return True
+        return "ran"
 
     agent._run_patrol_once_inner = ran_inner
     asyncio.run(agent._run_patrol_once("p", "C-PATROL"))

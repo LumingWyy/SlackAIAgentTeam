@@ -15,6 +15,7 @@ Multiple agents run Socket Mode in one Python process. In channels, an agent spe
 | `multi_app.py` | Multi-agent entry: config load, Roster, SlackAgent, Socket Mode |
 | `multi_core.py` | Pure logic layer (no slack/claude package deps) |
 | `state_store.py` | SQLite thread-state persistence (sessions / summaries survive restarts) |
+| `issue_claim.py` | Host-side GitHub issue claim tool (v2 lease: `claim` / `renew` / `release` / `verify`) |
 | `agents.yaml` | Agent definitions (`card` / persona, ownership, node, projects) |
 | `agents.distributed.example.yaml` | Two humans × two local agents distributed example |
 | `slack-app-manifest-agent.yaml` | Slack App manifest template (one App per agent) |
@@ -666,7 +667,7 @@ Expected path:
 
 ### Patrol
 
-Agents can periodically scan `status:todo` issues, atomically claim one with an issue-specific Git-ref lease, and progress; idle rounds emit `PATROL_IDLE` (no post). The lease is 30 minutes, is renewed at least every 15 minutes, and becomes takeover-eligible only after a 5-minute grace measured from GitHub's server `Date`. Create, renewal, stale takeover, and release use `--force-with-lease` against an absent or exactly observed ref SHA. Before work, the ref, metadata commit, and marker comment must agree on issue, agent, node, nonce, timestamps, and SHA. Any read failure, missing/mismatched marker, failed command, timeout, or uncertain result is fail-closed. Operators should inspect and conditionally recover stale refs; never delete them unconditionally. The shared GitHub assignee is not ownership.
+Agents can periodically scan `status:todo` issues, atomically claim one with an issue-specific Git-ref lease, and progress. The lease protocol runs in `issue_claim.py` (`claim` / `renew` / `release` / `verify`, one JSON verdict; only `claimed` / `renewed` is ownership), not in the model: patrol lists todo issues and claims the oldest claimable one on the host, so an idle round spends no provider turn, and the host renews the lease while the turn works — a failed or unknown renewal cancels the turn. Interactive turns call the same tool; refs and markers are unchanged, so nodes on the previous prompt-driven protocol interoperate. The lease is 30 minutes, is renewed at least every 15 minutes, and becomes takeover-eligible only after a 5-minute grace measured from GitHub's server `Date`. Create, renewal, stale takeover, and release use `--force-with-lease` against an absent or exactly observed ref SHA. Before work, the ref, metadata commit, and marker comment must agree on issue, agent, node, nonce, timestamps, and SHA. Any read failure, missing/mismatched marker, failed command, timeout, or uncertain result is fail-closed. Operators should inspect and conditionally recover stale refs; never delete them unconditionally. The shared GitHub assignee is not ownership.
 
 Patrol phases use epoch-aligned absolute deadlines and the globally stable logical-agent roster, so different nodes share the same wall-clock schedule. A long run skips missed periods instead of catching up in a burst. Patrol and Slack turns share the same node concurrency limiter and realpath workspace lock.
 

@@ -772,51 +772,28 @@ def test_github_remote_parser_and_claim_identity_encoding_are_canonical():
     protocol = format_github_claim_protocol(
         "acme/widgets", "alice/dev", "node --> $(bad)"
     )
-    assert "agent=alice/dev" in protocol
-    assert "node=node%20--%3E%20%24%28bad%29" in protocol
-    assert "node=node --> $(bad)" not in protocol
+    # Raw ids reach the tool shell-quoted; the tool percent-encodes markers.
+    assert "--agent alice/dev" in protocol
+    assert "--node 'node --> $(bad)'" in protocol
+    assert "--node node --> $(bad)" not in protocol
 
 
-def test_github_claim_protocol_uses_atomic_ref_and_agent_marker():
+def test_github_claim_protocol_delegates_to_the_claim_tool():
     from multi_core import format_github_claim_protocol
 
     protocol = format_github_claim_protocol(
-        "acme/widgets", "alice-dev", "alice-node"
+        "acme/widgets", "alice-dev", "alice-node", tool_command="TOOL"
     )
-    assert "refs/heads/slack-agent-claims/issue-<number>" in protocol
-    assert "repos/acme/widgets/git/ref/heads/slack-agent-claims" in protocol
-    assert (
-        "--force-with-lease="
-        "'refs/heads/slack-agent-claims/issue-<number>:'"
-    ) in protocol
-    assert "agent=alice-dev" in protocol
-    assert "node=alice-node" in protocol
-    assert "nonce=<random-128-bit>" in protocol
-    assert "claimed_at=<github-rfc3339>" in protocol
-    assert "lease_until=<github-rfc3339>" in protocol
+    for action in ("claim", "renew", "release"):
+        assert (
+            f"TOOL {action} --repo acme/widgets --issue <number> "
+            "--agent alice-dev --node alice-node"
+        ) in protocol
+    assert '"status": "claimed"' in protocol
     assert "CLAIM_LEASE_SECONDS=1800" in protocol
     assert "CLAIM_STALE_GRACE_SECONDS=300" in protocol
-    assert "--force-with-lease=" in protocol
-    assert "expected old SHA" in protocol
-    assert "comment read failure" in protocol
-    assert "marker missing" in protocol
-    assert "owner mismatch" in protocol
-    assert "normal release" in protocol
-    assert "--method DELETE" not in protocol
-    assert "--method PATCH" not in protocol
-    assert "@me" not in protocol
-    assert "claimed:<" not in protocol
-    push_target = "'https://github.com/acme/widgets.git'"
-    assert " origin " not in protocol
-    assert protocol.count("git push --force-with-lease=") == 4
-    assert protocol.count(push_target) == 4
-    assert "gh auth setup-git" in protocol
-
-
-# ---------------------------------------------------------------------------
-# TurnBudget (observation-based handoff budget)
-# ---------------------------------------------------------------------------
-
+    assert "https://github.com/acme/widgets.git" in protocol
+    assert "--force-with-lease=" not in protocol
 
 def test_turn_budget_initial_remaining():
     tb = TurnBudget(max_rounds=3)

@@ -15,6 +15,7 @@
 | `multi_app.py` | マルチ agent 入口：設定読込、Roster、SlackAgent、Socket Mode |
 | `multi_core.py` | 純粋ロジック層（slack/claude パッケージ非依存） |
 | `state_store.py` | SQLite スレッド状態永続化（セッション/要約が再起動をまたいで残る） |
+| `issue_claim.py` | ホスト側の GitHub issue claim ツール（v2 lease: `claim` / `renew` / `release` / `verify`） |
 | `agents.yaml` | agent 定義（`card` / persona、所有者、node、project） |
 | `agents.distributed.example.yaml` | 2 人 × 各 2 ローカル agent の分散構成例 |
 | `slack-app-manifest-agent.yaml` | agent ごとの Slack App 用 manifest テンプレート |
@@ -569,7 +570,7 @@ managed branch を切り替えずに review します。
 
 `status:todo` issue を周期スキャンし、issue 固有の Git-ref lease を原子的に作成して 1 件 claim。lease は 30 分、15 分以内ごとに更新し、GitHub server の `Date` で期限後 5 分の grace を過ぎた場合だけ stale takeover 可能です。作成・更新・takeover・解放は、ref 不在または観測済み SHA を条件に `--force-with-lease` で行います。作業前に ref・metadata commit・marker comment の issue/agent/node/nonce/timestamp/SHA が完全一致することを再確認します。読み取り失敗、marker 欠落/不一致、command 失敗、timeout、結果不明はすべて fail-closed です。運用者も stale ref を無条件削除せず、観測済み SHA を条件に回復してください。共有 GitHub assignee は所有権を表しません。
 
-巡回位相は epoch 基準の絶対 deadline と全 node 共通の安定した logical-agent roster を使います。異なる node も同じ wall-clock schedule となり、長時間実行後は missed period を飛ばして追いつき burst を起こしません。GitHub 有効時は workspace の `origin` fetch/push URL がすべて設定済み canonical `OWNER/REPO` と一致しない限り、その workspace の GitHub workflow と巡回を無効化します。lease CAS push は変更可能な remote 名を使わず、明示的な canonical `https://github.com/OWNER/REPO.git` に固定するため、非対話 HTTPS 認証（例: `gh auth setup-git`）を事前設定してください。巡回と Slack turn は同じ node concurrency limiter と realpath workspace lock を共有します。暇なら `PATROL_IDLE`（投稿なし）。
+巡回位相は epoch 基準の絶対 deadline と全 node 共通の安定した logical-agent roster を使います。異なる node も同じ wall-clock schedule となり、長時間実行後は missed period を飛ばして追いつき burst を起こしません。GitHub 有効時は workspace の `origin` fetch/push URL がすべて設定済み canonical `OWNER/REPO` と一致しない限り、その workspace の GitHub workflow と巡回を無効化します。lease CAS push は変更可能な remote 名を使わず、明示的な canonical `https://github.com/OWNER/REPO.git` に固定するため、非対話 HTTPS 認証（例: `gh auth setup-git`）を事前設定してください。巡回と Slack turn は同じ node concurrency limiter と realpath workspace lock を共有します。暇なら `PATROL_IDLE`（投稿なし）。lease プロトコルはモデルではなく `issue_claim.py`（`claim` / `renew` / `release` / `verify`、JSON の判定を1つ出力し、`claimed` / `renewed` だけが所有）が実行する。巡回はホストが todo issue を列挙して最も古い claim 可能な issue を先に claim するため、暇な回は provider ターンを消費しない。作業中はホストが lease を更新し、更新の失敗・不明時はそのターンを取り消す。対話ターンも同じツールを使う。ref と marker の形式は変わらないので、従来の prompt 駆動プロトコルの node と混在できる。
 
 ```yaml
 github:
