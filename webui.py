@@ -2738,12 +2738,12 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
             <label class="guide-done"><input type="checkbox" data-guide-check="roles">
               <span data-i18n="guide.done">标记完成</span></label>
           </div>
-          <p class="body" data-i18n="guide.roles.body">每人保留 2–3 个 agent。dev 写代码，reviewer 独立审查，planner/pm 只拆任务；OpenAI agent 默认没有本地文件工具。</p>
+          <p class="body" data-i18n="guide.roles.body">每人保留 2–3 个 agent。developer 写代码，reviewer 独立审查，planner/pm 只拆任务；OpenAI agent 默认没有本地文件工具。</p>
           <table class="agent-guide">
             <thead><tr><th data-i18n="guide.agent.role">角色</th><th>runtime</th>
               <th data-i18n="guide.agent.must">必须做到</th><th data-i18n="guide.agent.never">不要做</th></tr></thead>
             <tbody>
-              <tr><td>dev</td><td class="runtime" data-guide-label-key="lbl.runtime">Claude / Codex</td>
+              <tr><td>developer</td><td class="runtime" data-guide-label-key="lbl.runtime">Claude / Codex</td>
                 <td data-guide-label-key="guide.agent.must" data-i18n="guide.dev.must">确认完成标准；实现并测试；commit、push、贴 PR；只交给一个 reviewer。</td>
                 <td class="never" data-guide-label-key="guide.agent.never" data-i18n="guide.dev.never">不要在别人的节点登录；不要把未 push 的本地路径当成交付物。</td></tr>
               <tr><td>reviewer</td><td class="runtime" data-guide-label-key="lbl.runtime">不同模型优先</td>
@@ -2824,7 +2824,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
           </div>
           <p class="body" data-i18n="guide.prompts.body">card 让队友知道何时找它、交什么、拿回什么；persona 约束它如何工作。推荐模板可复制后按项目改写。</p>
           <div class="prompt-stack">
-            <details class="prompt-row"><summary><span data-i18n="guide.prompt.dev">dev persona 推荐</span>
+            <details class="prompt-row"><summary><span data-i18n="guide.prompt.dev">developer persona 推荐</span>
               <button class="btn text copy-btn" onclick="event.preventDefault();copyGuidePrompt('dev')"><span class="ic-wrap" aria-hidden="true"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><span data-i18n="guide.copy">复制</span></button></summary>
               <pre data-guide-prompt="dev"></pre></details>
             <details class="prompt-row"><summary><span data-i18n="guide.prompt.reviewer">reviewer persona 推荐</span>
@@ -2837,7 +2837,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
           <div class="guide-evidence">
             <div><h3 data-i18n="guide.evidence">完成证据</h3>
               <ul><li><span data-i18n="guide.prompts.ev1">每个 card 能在 6 行内说清输入、输出和禁区</span></li>
-                <li><span data-i18n="guide.prompts.ev2">reviewer 与 dev 使用独立验证标准，OpenAI persona 明示无本地工具</span></li></ul></div>
+                <li><span data-i18n="guide.prompts.ev2">reviewer 与 developer 使用独立验证标准，OpenAI persona 明示无本地工具</span></li></ul></div>
             <div class="guide-actions"><button class="btn line" onclick="showTab('cfg')" data-i18n="guide.goto.prompt">去编辑 Prompt</button></div>
           </div>
         </div>
@@ -2852,7 +2852,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
             <label class="guide-done"><input type="checkbox" data-guide-check="first-task">
               <span data-i18n="guide.done">标记完成</span></label>
           </div>
-          <p class="body" data-i18n="guide.task.body">人类给一个明确任务；dev 在本地 worktree 实现并产出 PR；reviewer 独立验证。跨机器只传 Slack 上下文和 durable artifact。</p>
+          <p class="body" data-i18n="guide.task.body">人类给一个明确任务；developer 在本地 worktree 实现并产出 PR；reviewer 独立验证。跨机器只传 Slack 上下文和 durable artifact。</p>
           <div class="prompt-stack">
             <details class="prompt-row" open><summary><span data-i18n="guide.prompt.task">人类启动任务模板</span>
               <button class="btn text copy-btn" onclick="event.preventDefault();copyGuidePrompt('task')"><span class="ic-wrap" aria-hidden="true"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><span data-i18n="guide.copy">复制</span></button></summary>
@@ -3079,7 +3079,7 @@ const I18N={
    'guide.done':'标记完成','guide.evidence':'完成证据','guide.do':'按这个顺序','guide.copy':'复制','guide.copied':'模板已复制','guide.copyselect':'浏览器禁止复制；模板已全选，请按系统复制键','guide.copyfail':'复制失败',
    'guide.next':'下一步：{n}','guide.complete':'上手完成。现在按“一任务一线程”开始协作。','guide.next.roles':'确定角色与 owner/node','guide.next.slack':'创建并邀请 Slack Apps','guide.next.local':'连接本机账号与仓库','guide.next.prompts':'为每个 agent 写职责 Prompt','guide.next.first-task':'跑通第一次任务与交接',
    'guide.goto.cfg':'去团队构成','guide.goto.slack':'去设置 Slack App','guide.goto.auth':'去认证','guide.goto.prompt':'去编辑 Prompt','guide.goto.mon':'去监视运行',
-   'guide.roles.eye':'团队契约','guide.roles.title':'先分清谁负责什么','guide.roles.body':'每人保留 2–3 个 agent。dev 写代码，reviewer 独立审查，planner/pm 只拆任务；OpenAI agent 默认没有本地文件工具。',
+   'guide.roles.eye':'团队契约','guide.roles.title':'先分清谁负责什么','guide.roles.body':'每人保留 2–3 个 agent。developer 写代码，reviewer 独立审查，planner/pm 只拆任务；OpenAI agent 默认没有本地文件工具。',
    'guide.agent.role':'角色','guide.agent.must':'必须做到','guide.agent.never':'不要做',
    'guide.dev.must':'确认完成标准；实现并测试；commit、push、贴 PR；只交给一个 reviewer。','guide.dev.never':'不要在别人的节点登录；不要把未 push 的本地路径当成交付物。',
    'guide.reviewer.must':'独立查看 PR/diff；按严重度和文件行号报告；明确通过或退回。','guide.reviewer.never':'未经要求不要直接改代码；不要用实现者结论代替验证。',
@@ -3091,9 +3091,9 @@ const I18N={
    'guide.prompt.channel':'Slack 频道规则模板','guide.local.eye':'私有节点','guide.local.title':'只连接这台机器自己的账号','guide.local.body':'登录本人 Claude/Codex/GitHub，OpenAI Key 只放本机 env；创建独立 workspace、state 和 worktree volume。绝不挂载另一位 owner 的认证目录。',
    'guide.local.ev1':'「认证」显示所选 runtime 与 GitHub 已验证','guide.local.ev2':'本机 env 只含本人 Slack Token、控制 Bearer 和 AI Key','guide.local.ev3':'仓库 origin 与 agent 的 canonical OWNER/REPO 一致',
    'guide.prompts.eye':'PROMPT 契约','guide.prompts.title':'Prompt 写职责，不写口号','guide.prompts.body':'card 让队友知道何时找它、交什么、拿回什么；persona 约束它如何工作。推荐模板可复制后按项目改写。',
-   'guide.prompt.dev':'dev persona 推荐','guide.prompt.reviewer':'reviewer persona 推荐','guide.prompt.planner':'planner / pm persona 推荐',
-   'guide.prompts.ev1':'每个 card 能在 6 行内说清输入、输出和禁区','guide.prompts.ev2':'reviewer 与 dev 使用独立验证标准，OpenAI persona 明示无本地工具',
-   'guide.task.eye':'第一次真实闭环','guide.task.title':'在一个 Slack 线程跑完整闭环','guide.task.body':'人类给一个明确任务；dev 在本地 worktree 实现并产出 PR；reviewer 独立验证。跨机器只传 Slack 上下文和 durable artifact。',
+   'guide.prompt.dev':'developer persona 推荐','guide.prompt.reviewer':'reviewer persona 推荐','guide.prompt.planner':'planner / pm persona 推荐',
+   'guide.prompts.ev1':'每个 card 能在 6 行内说清输入、输出和禁区','guide.prompts.ev2':'reviewer 与 developer 使用独立验证标准，OpenAI persona 明示无本地工具',
+   'guide.task.eye':'第一次真实闭环','guide.task.title':'在一个 Slack 线程跑完整闭环','guide.task.body':'人类给一个明确任务；developer 在本地 worktree 实现并产出 PR；reviewer 独立验证。跨机器只传 Slack 上下文和 durable artifact。',
    'guide.prompt.task':'人类启动任务模板','guide.prompt.handoff':'结构化 HANDOFF 模板','guide.task.ev1':'同一个根线程里能看到目标、测试结果、PR URL 和单目标 handoff','guide.task.ev2':'reviewer 给出明确通过，或带严重度与文件行号的退回意见',
    'mon.title':'智能体运行状况','mon.sub':'一览各智能体的状态与模型；模型和 runtime 可在此免重启切换。',
    'status.live':'运行中','status.down':'未启动','status.dis':'未连接',
@@ -3148,7 +3148,7 @@ const I18N={
    'guide.done':'完了にする','guide.evidence':'完了の証拠','guide.do':'この順で実施','guide.copy':'コピー','guide.copied':'テンプレートをコピーしました','guide.copyselect':'browser がコピーを拒否しました。テンプレートを全選択したのでコピーキーを押してください','guide.copyfail':'コピーできませんでした',
    'guide.next':'次：{n}','guide.complete':'準備完了です。「1タスク・1スレッド」で運用を始めてください。','guide.next.roles':'role と owner/node を決める','guide.next.slack':'Slack App を作成して招待する','guide.next.local':'このノードの認証と repo を接続する','guide.next.prompts':'agent ごとの責務 Prompt を書く','guide.next.first-task':'最初のタスクと引き継ぎを完走する',
    'guide.goto.cfg':'チーム構成へ','guide.goto.slack':'Slack App 設定へ','guide.goto.auth':'認証へ','guide.goto.prompt':'Prompt 編集へ','guide.goto.mon':'運用監視へ',
-   'guide.roles.eye':'チーム契約','guide.roles.title':'最初に責務を分ける','guide.roles.body':'各自 2〜3 agent を持ちます。dev は実装、reviewer は独立レビュー、planner/pm は分解のみ。OpenAI agent は既定でローカルファイルを扱いません。',
+   'guide.roles.eye':'チーム契約','guide.roles.title':'最初に責務を分ける','guide.roles.body':'各自 2〜3 agent を持ちます。developer は実装、reviewer は独立レビュー、planner/pm は分解のみ。OpenAI agent は既定でローカルファイルを扱いません。',
    'guide.agent.role':'role','guide.agent.must':'必須','guide.agent.never':'しないこと',
    'guide.dev.must':'完了条件を確認し、実装・テスト・commit・push・PR を行い、1人の reviewer に渡す。','guide.dev.never':'他人のノードへログインしない。未 push のローカルパスを成果物にしない。',
    'guide.reviewer.must':'PR/diff を独立確認し、重大度とファイル行を付け、承認か差し戻しかを明示する。','guide.reviewer.never':'依頼なしに直接修正しない。実装者の結論を検証の代わりにしない。',
@@ -3160,9 +3160,9 @@ const I18N={
    'guide.prompt.channel':'Slack チャンネルルール','guide.local.eye':'プライベートノード','guide.local.title':'このマシンの自分のアカウントだけを接続','guide.local.body':'自分の Claude/Codex/GitHub にログインし、OpenAI Key はローカル env のみに保存します。workspace、state、worktree volume は owner ごとに分離します。',
    'guide.local.ev1':'「認証」で利用 runtime と GitHub が検証済み','guide.local.ev2':'ローカル env には本人の Slack Token、control Bearer、AI Key だけがある','guide.local.ev3':'repo origin が agent の canonical OWNER/REPO と一致する',
    'guide.prompts.eye':'PROMPT 契約','guide.prompts.title':'Prompt には責務を書く','guide.prompts.body':'card は、いつ呼ぶか・何を渡すか・何を返すかを仲間へ示します。persona は作業手順を制約します。テンプレートをコピーしてプロジェクトに合わせてください。',
-   'guide.prompt.dev':'dev persona 推奨','guide.prompt.reviewer':'reviewer persona 推奨','guide.prompt.planner':'planner / pm persona 推奨',
-   'guide.prompts.ev1':'各 card は6行以内で入力・出力・禁止事項が分かる','guide.prompts.ev2':'reviewer と dev は別の検証基準を持ち、OpenAI persona はローカルツールなしと明記',
-   'guide.task.eye':'最初の実運用ループ','guide.task.title':'1つの Slack スレッドで完走する','guide.task.body':'人が明確なタスクを渡し、dev はローカル worktree で実装して PR を作成、reviewer が独立検証します。ノード間では Slack 文脈と永続成果物だけを渡します。',
+   'guide.prompt.dev':'developer persona 推奨','guide.prompt.reviewer':'reviewer persona 推奨','guide.prompt.planner':'planner / pm persona 推奨',
+   'guide.prompts.ev1':'各 card は6行以内で入力・出力・禁止事項が分かる','guide.prompts.ev2':'reviewer と developer は別の検証基準を持ち、OpenAI persona はローカルツールなしと明記',
+   'guide.task.eye':'最初の実運用ループ','guide.task.title':'1つの Slack スレッドで完走する','guide.task.body':'人が明確なタスクを渡し、developer はローカル worktree で実装して PR を作成、reviewer が独立検証します。ノード間では Slack 文脈と永続成果物だけを渡します。',
    'guide.prompt.task':'人が開始するタスクのテンプレート','guide.prompt.handoff':'構造化 HANDOFF テンプレート','guide.task.ev1':'同じルートスレッドに目的、テスト結果、PR URL、単一 target の handoff がある','guide.task.ev2':'reviewer が明確に承認、または重大度とファイル行付きで差し戻す',
    'mon.title':'エージェント運用状況','mon.sub':'稼働中の各エージェントの状態・モデルをひと目で。モデルと runtime はここから再起動なしで切り替えられます。',
    'status.live':'稼働中','status.down':'未起動','status.dis':'未接続',
@@ -3217,7 +3217,7 @@ const I18N={
    'guide.done':'Mark complete','guide.evidence':'Completion evidence','guide.do':'Do this in order','guide.copy':'Copy','guide.copied':'template copied','guide.copyselect':'Browser copy is blocked; the template is selected—use the system copy shortcut','guide.copyfail':'copy failed',
    'guide.next':'Next: {n}','guide.complete':'Setup complete. Start collaborating with one task per thread.','guide.next.roles':'assign roles and owner/node','guide.next.slack':'create and invite Slack Apps','guide.next.local':'connect this node’s accounts and repository','guide.next.prompts':'write a responsibility prompt for each agent','guide.next.first-task':'complete the first task and handoff',
    'guide.goto.cfg':'Open Team setup','guide.goto.slack':'Set up Slack Apps','guide.goto.auth':'Open Auth','guide.goto.prompt':'Edit prompts','guide.goto.mon':'Monitor the run',
-   'guide.roles.eye':'TEAM CONTRACT','guide.roles.title':'Assign responsibility first','guide.roles.body':'Keep two or three agents per person. dev writes code, reviewer verifies independently, and planner/pm only scopes work. OpenAI agents have no local file tools by default.',
+   'guide.roles.eye':'TEAM CONTRACT','guide.roles.title':'Assign responsibility first','guide.roles.body':'Keep two or three agents per person. developer writes code, reviewer verifies independently, and planner/pm only scopes work. OpenAI agents have no local file tools by default.',
    'guide.agent.role':'role','guide.agent.must':'must do','guide.agent.never':'do not',
    'guide.dev.must':'Confirm done criteria; implement and test; commit, push, link a PR; hand off to one reviewer.','guide.dev.never':'Never sign in on someone else’s node or treat an unpushed local path as a deliverable.',
    'guide.reviewer.must':'Inspect the PR/diff independently; report severity and file lines; clearly approve or return it.','guide.reviewer.never':'Do not edit unless asked or substitute the implementer’s conclusion for verification.',
@@ -3229,9 +3229,9 @@ const I18N={
    'guide.prompt.channel':'Slack channel rules','guide.local.eye':'PRIVATE NODE','guide.local.title':'Connect only this machine’s accounts','guide.local.body':'Sign in to your own Claude/Codex/GitHub and keep the OpenAI key in local env only. Use separate workspace, state, and worktree volumes; never mount another owner’s auth directory.',
    'guide.local.ev1':'Auth shows the chosen runtime and GitHub as verified','guide.local.ev2':'Local env contains only this owner’s Slack tokens, control Bearer, and AI key','guide.local.ev3':'Repository origin matches the agent’s canonical OWNER/REPO',
    'guide.prompts.eye':'PROMPT CONTRACT','guide.prompts.title':'Write responsibilities, not slogans','guide.prompts.body':'The card tells teammates when to call an agent, what to hand over, and what comes back. The persona constrains how it works. Copy a template and adapt it to the project.',
-   'guide.prompt.dev':'Recommended dev persona','guide.prompt.reviewer':'Recommended reviewer persona','guide.prompt.planner':'Recommended planner / pm persona',
-   'guide.prompts.ev1':'Each card explains input, output, and boundaries in six lines or fewer','guide.prompts.ev2':'reviewer and dev use independent standards; an OpenAI persona states that local tools are unavailable',
-   'guide.task.eye':'FIRST LIVE LOOP','guide.task.title':'Complete one loop in one Slack thread','guide.task.body':'A human provides one clear task; dev implements in the local worktree and publishes a PR; reviewer verifies independently. Across machines, pass only Slack context and durable artifacts.',
+   'guide.prompt.dev':'Recommended developer persona','guide.prompt.reviewer':'Recommended reviewer persona','guide.prompt.planner':'Recommended planner / pm persona',
+   'guide.prompts.ev1':'Each card explains input, output, and boundaries in six lines or fewer','guide.prompts.ev2':'reviewer and developer use independent standards; an OpenAI persona states that local tools are unavailable',
+   'guide.task.eye':'FIRST LIVE LOOP','guide.task.title':'Complete one loop in one Slack thread','guide.task.body':'A human provides one clear task; developer implements in the local worktree and publishes a PR; reviewer verifies independently. Across machines, pass only Slack context and durable artifacts.',
    'guide.prompt.task':'Human task kickoff template','guide.prompt.handoff':'Structured HANDOFF template','guide.task.ev1':'One root thread contains the goal, test result, PR URL, and a single-target handoff','guide.task.ev2':'reviewer clearly approves or returns findings with severity and file lines',
    'mon.title':'Agent Operations','mon.sub':'Every agent’s status and model at a glance. Switch model and runtime here without restarting.',
    'status.live':'Online','status.down':'Offline','status.dis':'Disconnected',
@@ -3301,7 +3301,7 @@ const GUIDE_PROMPTS={
       '你是独立 reviewer，不复述实现者结论。',
       '先读取任务完成标准，再检查 PR/diff、失败路径、并发与安全边界，并运行适当验证。',
       '按 Critical / Important / Suggestion 报告问题，附文件与行号、影响和可复现证据。',
-      '有 Critical/Important 时明确退回给一个 dev；没有时明确写“通过”并列出验证。',
+      '有 Critical/Important 时明确退回给一个 developer；没有时明确写“通过”并列出验证。',
       '未经要求不要直接改实现；没有本地工具时必须说明，并基于 Slack 中可见材料评审。'
     ].join(GUIDE_NL),
     planner:[
@@ -3311,7 +3311,7 @@ const GUIDE_PROMPTS={
       '不要写代码，也不要声称访问过本地仓库；需要事实时要求提供 Issue、PR 或文件摘录。'
     ].join(GUIDE_NL),
     task:[
-      '@alice/dev 处理 TASK-123',
+      '@alice/developer 处理 TASK-123',
       '',
       '目标：<最终要得到什么>',
       '背景：<相关 Issue / PR / 现状>',
@@ -3343,7 +3343,7 @@ const GUIDE_PROMPTS={
       'あなたは独立 reviewer です。実装者の結論をそのまま採用しません。',
       '完了条件を読み、PR/diff、失敗経路、並行性、安全境界を確認し、適切な検証を実行します。',
       'Critical / Important / Suggestion で分類し、ファイル行、影響、再現証拠を付けます。',
-      'Critical/Important があれば dev 1人へ差し戻し、なければ「承認」と検証内容を明記します。',
+      'Critical/Important があれば developer 1人へ差し戻し、なければ「承認」と検証内容を明記します。',
       '依頼なしに実装を変更しません。ローカルツールがなければ明示し、Slack 上の材料だけで評価します。'
     ].join(GUIDE_NL),
     planner:[
@@ -3353,7 +3353,7 @@ const GUIDE_PROMPTS={
       'コードを書かず、ローカル repo を見たと主張しません。必要なら Issue、PR、抜粋を要求します。'
     ].join(GUIDE_NL),
     task:[
-      '@alice/dev TASK-123 を対応してください',
+      '@alice/developer TASK-123 を対応してください',
       '',
       '目的：<最終的に得たいもの>',
       '背景：<Issue / PR / 現状>',
@@ -3385,7 +3385,7 @@ const GUIDE_PROMPTS={
       'You are an independent reviewer; do not repeat the implementer’s conclusion.',
       'Read the done criteria, inspect the PR/diff, failure paths, concurrency, and security boundaries, then run proportionate checks.',
       'Classify findings as Critical, Important, or Suggestion, with file lines, impact, and reproducible evidence.',
-      'Return Critical/Important findings to one dev. Otherwise explicitly approve and list verification.',
+      'Return Critical/Important findings to one developer. Otherwise explicitly approve and list verification.',
       'Do not edit unless asked. If local tools are unavailable, say so and review only material visible in Slack.'
     ].join(GUIDE_NL),
     planner:[
@@ -3395,7 +3395,7 @@ const GUIDE_PROMPTS={
       'Do not write code or claim local repository access. Ask for an Issue, PR, or excerpt when facts are needed.'
     ].join(GUIDE_NL),
     task:[
-      '@alice/dev handle TASK-123',
+      '@alice/developer handle TASK-123',
       '',
       'Goal: <the final outcome>',
       'Context: <Issue / PR / current behavior>',
