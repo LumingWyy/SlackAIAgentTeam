@@ -173,14 +173,22 @@ def test_classify_provider_rate_limit():
 
     assert classify_provider_rate_limit(
         ProviderRateLimitedError("x", retry_after=12.0)
-    ) == (True, 12.0)
-    assert classify_provider_rate_limit(TimeoutError()) == (False, None)
+    ) == (True, 12.0, True)
+    assert classify_provider_rate_limit(
+        ProviderRateLimitedError("x", replay_safe=False)
+    ) == (True, None, False)
+    assert classify_provider_rate_limit(TimeoutError()) == (
+        False,
+        None,
+        False,
+    )
     assert classify_provider_rate_limit(
         RuntimeError("Rate limit reached")
-    ) == (True, None)
+    ) == (True, None, True)
     assert classify_provider_rate_limit(RuntimeError("boom")) == (
         False,
         None,
+        False,
     )
 
 
@@ -191,9 +199,9 @@ def test_classify_provider_rate_limit_reads_retry_after_header():
 
     exc = RuntimeError("HTTP 429 Too Many Requests")
     exc.response = SimpleNamespace(headers={"retry-after": "37"})
-    assert classify_provider_rate_limit(exc) == (True, 37.0)
+    assert classify_provider_rate_limit(exc) == (True, 37.0, True)
     exc.response = SimpleNamespace(headers={"retry-after": "not-a-number"})
-    assert classify_provider_rate_limit(exc) == (True, None)
+    assert classify_provider_rate_limit(exc) == (True, None, True)
 
 
 def test_provider_cooldown_from_env(monkeypatch):
@@ -334,3 +342,370 @@ def test_run_turn_waits_out_preexisting_cooldown(tmp_path, monkeypatch):
     assert _run(agent) == "ok"
     assert len(calls) == 1
     assert agent._provider_cooldown.remaining() == 0.0
+
+
+def test_run_turn_does_not_replay_a_turn_that_ran_tools(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    calls = _stub_dispatch(
+        agent,
+        [ProviderRateLimitedError("usage limit", replay_safe=False), "dup"],
+    )
+    with pytest.raises(ProviderRateLimitedError) as info:
+        _run(agent)
+    assert len(calls) == 1
+    assert info.value.replay_safe is False
+    # The cooldown is still armed for the next turn.
+    assert agent._provider_cooldown.strikes == 1
+
+
+def test_run_turn_does_not_retry_when_reset_exceeds_cap(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    calls = _stub_dispatch(
+        agent,
+        [ProviderRateLimitedError("five hour window", retry_after=4 * 3600.0)],
+    )
+    with pytest.raises(ProviderRateLimitedError) as info:
+        _run(agent)
+    assert len(calls) == 1
+    assert info.value.retry_after == 4 * 3600.0
+
+
+def test_run_turn_does_not_retry_after_thread_reset(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    calls = _stub_dispatch(agent, [ProviderRateLimitedError("429"), "late"])
+    monkeypatch.setattr(agent, "_turn_generation", lambda _key: (9, 9))
+    with pytest.raises(ProviderRateLimitedError):
+        _run(agent)
+    assert len(calls) == 1
+
+
+def test_run_turn_wraps_untyped_rate_limit_after_retry(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    _stub_dispatch(agent, [RuntimeError("HTTP 429 Too Many Requests")])
+    with pytest.raises(ProviderRateLimitedError) as info:
+        _run(agent)
+    assert info.value.replay_safe is True
+    assert isinstance(info.value.__cause__, RuntimeError)
+
+
+# ---------------------------------------------------------------------------
+# TurnSignals / notices (pure)
+# ---------------------------------------------------------------------------
+
+
+def test_turn_signals_require_rate_limit_evidence():
+    from multi_core import TurnSignals
+
+    assert TurnSignals(error_text="Prompt is too long").rate_limit_error(
+        now=0.0
+    ) is None
+    error = TurnSignals(rate_limit_seen=True).rate_limit_error(
+        "Claude Code returned an error result: success", now=0.0
+    )
+    assert isinstance(error, ProviderRateLimitedError)
+    assert error.replay_safe is True
+    assert error.retry_after is None
+
+
+def test_turn_signals_reset_time_and_tool_activity():
+    from multi_core import TurnSignals
+
+    signals = TurnSignals(
+        rate_limit_seen=True, resets_at=1600.0, tool_activity=True
+    )
+    error = signals.rate_limit_error(now=1000.0)
+    assert error.retry_after == 600.0
+    assert error.replay_safe is False
+    # Text alone is enough evidence (e.g. "usage limit reached").
+    error = TurnSignals(error_text="Claude AI usage limit reached").rate_limit_error(
+        now=0.0
+    )
+    assert error is not None
+
+
+def test_side_effect_tool_classification():
+    from multi_core import is_side_effect_tool
+
+    assert not is_side_effect_tool("Read")
+    assert not is_side_effect_tool("Grep")
+    assert is_side_effect_tool("Bash")
+    assert is_side_effect_tool("Edit")
+    assert is_side_effect_tool("mcp__github__create_issue")
+
+
+def test_rate_limit_notice_variants():
+    from multi_core import format_rate_limit_notice
+
+    assert "自動再試行はしていません" in format_rate_limit_notice(
+        retry_after=None, replay_safe=False
+    )
+    assert "約 60 分後" in format_rate_limit_notice(
+        retry_after=3541.0, replay_safe=True
+    )
+    assert "しばらく待って" in format_rate_limit_notice(
+        retry_after=None, replay_safe=True
+    )
+
+
+def test_cooldown_exceeds_cap():
+    cd, _clock = _cooldown(
+        base_seconds=60.0, max_seconds=480.0, hard_cap_seconds=900.0
+    )
+    assert not cd.exceeds_cap(None)
+    assert not cd.exceeds_cap(900.0)
+    assert cd.exceeds_cap(901.0)
+
+
+# ---------------------------------------------------------------------------
+# Claude SDK stream: the CLI exits non-zero right after an error result
+# ---------------------------------------------------------------------------
+
+
+def _claude_error_result(**overrides):
+    from claude_agent_sdk import ResultMessage
+
+    fields = dict(
+        subtype="success",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=True,
+        num_turns=1,
+        session_id="sess-new",
+        result="API Error: Request rejected",
+        usage={"input_tokens": 10, "output_tokens": 2},
+        api_error_status=429,
+    )
+    fields.update(overrides)
+    return ResultMessage(**fields)
+
+
+def _fake_claude_stream(monkeypatch, messages):
+    import multi_app
+
+    async def fake_query(*, prompt, options):
+        for message in messages:
+            yield message
+        raise Exception("Claude Code returned an error result: success")
+
+    monkeypatch.setattr(multi_app, "query", fake_query)
+
+
+def test_run_claude_detects_rate_limit_after_sdk_error_exit(
+    tmp_path, monkeypatch
+):
+    agent = _build_agent(tmp_path, monkeypatch)
+    _fake_claude_stream(monkeypatch, [_claude_error_result()])
+    with pytest.raises(ProviderRateLimitedError) as info:
+        asyncio.run(agent._run_claude("p", "C1:1.0", (0, 0)))
+    assert info.value.replay_safe is True
+    # No session write-back: a retry resumes the pre-turn session.
+    assert "C1:1.0" not in agent.sessions
+
+
+def test_run_claude_marks_turn_with_side_effect_tool_unsafe(
+    tmp_path, monkeypatch
+):
+    from claude_agent_sdk import AssistantMessage, ToolUseBlock
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    tool_turn = AssistantMessage(
+        content=[ToolUseBlock(id="t1", name="Bash", input={"command": "git push"})],
+        model="m",
+    )
+    _fake_claude_stream(
+        monkeypatch, [tool_turn, _claude_error_result(api_error_status=None, result="Claude AI usage limit reached")]
+    )
+    with pytest.raises(ProviderRateLimitedError) as info:
+        asyncio.run(agent._run_claude("p", "C1:1.0", (0, 0)))
+    assert info.value.replay_safe is False
+
+
+def test_run_claude_reads_rejected_window_reset(tmp_path, monkeypatch):
+    import time as time_module
+
+    from claude_agent_sdk import RateLimitEvent
+    from claude_agent_sdk.types import RateLimitInfo
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    resets_at = int(time_module.time()) + 3 * 3600
+    event = RateLimitEvent(
+        rate_limit_info=RateLimitInfo(status="rejected", resets_at=resets_at),
+        uuid="u",
+        session_id="s",
+    )
+    _fake_claude_stream(
+        monkeypatch,
+        [event, _claude_error_result(api_error_status=None, result="")],
+    )
+    with pytest.raises(ProviderRateLimitedError) as info:
+        asyncio.run(agent._run_claude("p", "C1:1.0", (0, 0)))
+    assert info.value.retry_after == pytest.approx(3 * 3600, abs=5)
+
+
+def test_run_claude_non_rate_limit_error_stays_generic(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    _fake_claude_stream(
+        monkeypatch,
+        [_claude_error_result(api_error_status=None, result="Prompt is too long")],
+    )
+    with pytest.raises(Exception) as info:
+        asyncio.run(agent._run_claude("p", "C1:1.0", (0, 0)))
+    assert not isinstance(info.value, ProviderRateLimitedError)
+
+
+# ---------------------------------------------------------------------------
+# Codex: only a failed turn is a rate limit
+# ---------------------------------------------------------------------------
+
+
+def test_parse_codex_events_tracks_turn_status_and_tools():
+    jsonl = (
+        '{"type":"item.started","item":{"id":"i1","type":"command_execution"}}\n'
+        '{"type":"error","message":"Reconnecting... 429 Too Many Requests"}\n'
+        '{"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"done"}}\n'
+        '{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":1}}'
+    )
+    parsed = parse_codex_events(jsonl)
+    assert parsed["tool_activity"] is True
+    assert parsed["turn_completed"] is True
+    assert parsed["turn_failed"] is False
+    assert parsed["last_message"] == "done"
+    quiet = parse_codex_events(
+        '{"type":"item.completed","item":{"id":"i0","type":"error","message":"config warning"}}\n'
+        '{"type":"turn.failed","error":{"message":"Rate limit reached"}}'
+    )
+    assert quiet["tool_activity"] is False
+    assert quiet["turn_failed"] is True
+
+
+class _FakeCodexProcess:
+    def __init__(self, stdout: str, returncode: int = 0, stderr: str = ""):
+        self._stdout = stdout.encode()
+        self._stderr = stderr.encode()
+        self.returncode = returncode
+
+    async def communicate(self):
+        return self._stdout, self._stderr
+
+    async def wait(self):
+        return self.returncode
+
+
+def _fake_codex(monkeypatch, proc):
+    import multi_app
+
+    async def fake_create(*_args, **_kwargs):
+        return proc
+
+    monkeypatch.setattr(multi_app.asyncio, "create_subprocess_exec", fake_create)
+
+
+def test_codex_recovered_stream_error_is_not_a_rate_limit(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    _fake_codex(
+        monkeypatch,
+        _FakeCodexProcess(
+            '{"type":"thread.started","thread_id":"t1"}\n'
+            '{"type":"error","message":"Reconnecting... 2/5 429 Too Many Requests"}\n'
+            '{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"ok"}}\n'
+            '{"type":"turn.completed","usage":{"input_tokens":5,"output_tokens":1}}'
+        ),
+    )
+    text, thread_id, *_ = asyncio.run(agent._run_codex_exec("p", None))
+    assert text == "ok"
+    assert thread_id == "t1"
+
+
+def test_codex_failed_turn_with_tools_is_not_replay_safe(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    _fake_codex(
+        monkeypatch,
+        _FakeCodexProcess(
+            '{"type":"item.started","item":{"id":"i1","type":"file_change"}}\n'
+            '{"type":"turn.failed","error":{"message":"Rate limit reached"}}',
+            returncode=1,
+        ),
+    )
+    with pytest.raises(ProviderRateLimitedError) as info:
+        asyncio.run(agent._run_codex_exec("p", None))
+    assert info.value.replay_safe is False
+
+
+# ---------------------------------------------------------------------------
+# NodeRuntimeLimiter: a cooldown wait hands the slot back
+# ---------------------------------------------------------------------------
+
+
+def test_sleep_released_frees_capacity_for_other_agents():
+    from multi_app import NodeRuntimeLimiter
+
+    async def scenario():
+        limiter = NodeRuntimeLimiter(max_concurrency=1, max_queue=2)
+        cooling = limiter.try_admit("a", "/ws/a")
+        assert cooling.state == "running"
+        other_ran = asyncio.Event()
+
+        async def other():
+            async with limiter.slot("b", "/ws/b"):
+                other_ran.set()
+
+        sleeper = asyncio.create_task(limiter.sleep_released(cooling, 0.05))
+        await asyncio.sleep(0)
+        assert limiter.snapshot("a")["paused"] == 1
+        await asyncio.wait_for(other(), timeout=1)
+        assert other_ran.is_set()
+        await asyncio.wait_for(sleeper, timeout=1)
+        assert cooling.state == "running"
+        assert limiter.snapshot("a")["running"] == 1
+        limiter.release_admission(cooling)
+        assert limiter.snapshot("a")["node_running"] == 0
+
+    asyncio.run(scenario())
+
+
+def test_sleep_released_requeues_at_head_when_node_is_full():
+    from multi_app import NodeRuntimeLimiter
+
+    async def scenario():
+        limiter = NodeRuntimeLimiter(max_concurrency=1, max_queue=2)
+        cooling = limiter.try_admit("a", "/ws/a")
+        sleeper = asyncio.create_task(limiter.sleep_released(cooling, 0.01))
+        await asyncio.sleep(0)
+        busy = limiter.try_admit("b", "/ws/b")
+        assert busy.state == "running"
+        late = limiter.try_admit("c", "/ws/c")
+        assert late.state == "queued"
+        await asyncio.sleep(0.05)
+        assert cooling.state == "queued"
+        limiter.release_admission(busy)
+        await asyncio.wait_for(sleeper, timeout=1)
+        # The paused job regains the slot ahead of the later arrival.
+        assert cooling.state == "running"
+        assert late.state == "queued"
+        limiter.release_admission(cooling)
+        assert late.state == "running"
+        limiter.release_admission(late)
+
+    asyncio.run(scenario())
+
+
+def test_sleep_released_cancellation_releases_cleanly():
+    from multi_app import NodeRuntimeLimiter
+
+    async def scenario():
+        limiter = NodeRuntimeLimiter(max_concurrency=1, max_queue=1)
+
+        async def job():
+            async with limiter.slot("a", "/ws/a") as admission:
+                await limiter.sleep_released(admission, 10)
+
+        task = asyncio.create_task(job())
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        snap = limiter.snapshot("a")
+        assert snap["node_running"] == 0
+        assert snap["node_admitted"] == 0
+
+    asyncio.run(scenario())

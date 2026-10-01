@@ -34,7 +34,15 @@ from slack_sdk.http_retry.builtin_async_handlers import (
     AsyncRateLimitErrorRetryHandler,
 )
 
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, SystemMessage, query
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    RateLimitEvent,
+    ResultMessage,
+    SystemMessage,
+    ToolUseBlock,
+    query,
+)
 
 from control_auth import (
     ControlAuthenticator,
@@ -48,6 +56,7 @@ from multi_core import (
     ProviderCooldown,
     ProviderRateLimitedError,
     TurnBudget,
+    TurnSignals,
     build_activation_prompt,
     build_freshness_recheck_prompt,
     canonical_github_repo,
@@ -59,7 +68,9 @@ from multi_core import (
     filter_context_messages,
     flatten_event_text,
     format_github_claim_protocol,
+    format_rate_limit_notice,
     is_rate_limit_signal,
+    is_side_effect_tool,
     is_slack_file_url,
     is_verbatim_duplicate,
     latest_message_ts,
@@ -208,21 +219,65 @@ def _provider_error_retry_after(exc: BaseException) -> float | None:
 
 def classify_provider_rate_limit(
     exc: BaseException,
-) -> tuple[bool, float | None]:
-    """``(is_rate_limit, retry_after_seconds)`` for a failed runtime turn.
+) -> tuple[bool, float | None, bool]:
+    """``(is_rate_limit, retry_after_seconds, replay_safe)`` for a failed turn.
 
     Timeouts are never rate limits (retrying immediately against a slow
-    provider is the caller's existing behavior to keep).
+    provider is the caller's existing behavior to keep). Claude and Codex
+    turns raise a typed error carrying their own replay safety; an untyped
+    match comes from the tool-less OpenAI path and is safe to replay.
     """
     if isinstance(exc, ProviderRateLimitedError):
-        return True, exc.retry_after
+        return True, exc.retry_after, exc.replay_safe
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
-        return False, None
+        return False, None, False
     if isinstance(exc, OpenAIRateLimitError):
-        return True, _provider_error_retry_after(exc)
+        return True, _provider_error_retry_after(exc), True
     if is_rate_limit_signal(str(exc)):
-        return True, _provider_error_retry_after(exc)
-    return False, None
+        return True, _provider_error_retry_after(exc), True
+    return False, None, False
+
+
+def observe_claude_message(signals: TurnSignals, message: Any) -> None:
+    """Fold one Claude SDK stream message into the turn's signals.
+
+    The CLI exits non-zero right after an error result, so the SDK raises a
+    generic exception on the next read; these structured fields are the only
+    reliable rate-limit evidence once that happens.
+    """
+    if isinstance(message, AssistantMessage):
+        if getattr(message, "error", None) == "rate_limit":
+            signals.rate_limit_seen = True
+        for block in getattr(message, "content", None) or []:
+            if isinstance(block, ToolUseBlock) and is_side_effect_tool(
+                block.name
+            ):
+                signals.tool_activity = True
+    elif isinstance(message, RateLimitEvent):
+        info = message.rate_limit_info
+        if info.status == "rejected":
+            signals.rate_limit_seen = True
+            resets = [
+                float(value)
+                for value in (
+                    info.resets_at,
+                    info.overage_resets_at
+                    if info.overage_status == "rejected"
+                    else None,
+                )
+                if value
+            ]
+            if resets:
+                signals.resets_at = max(resets)
+    elif isinstance(message, ResultMessage):
+        if getattr(message, "is_error", False):
+            signals.error_text = (
+                getattr(message, "result", None)
+                or "; ".join(getattr(message, "errors", None) or [])
+                or str(getattr(message, "subtype", "") or "error")
+            )
+            if getattr(message, "api_error_status", None) in (429, 529):
+                signals.rate_limit_seen = True
 
 
 def normalize_openai_base_url(value: str, *, agent_name: str = "") -> str:
@@ -1922,6 +1977,24 @@ class ProviderTokenUsage:
         )
 
 
+def claude_result_usage(usage: dict | None) -> ProviderTokenUsage:
+    """Provider usage from a Claude ``ResultMessage.usage`` mapping."""
+    usage = usage or {}
+    direct_input = int(usage.get("input_tokens") or 0)
+    cache_tokens = sum(
+        int(usage.get(key) or 0)
+        for key in ("cache_read_input_tokens", "cache_creation_input_tokens")
+    )
+    output_tokens = int(usage.get("output_tokens") or 0)
+    return ProviderTokenUsage(
+        input_tokens=direct_input + cache_tokens,
+        output_tokens=output_tokens,
+        cache_tokens=cache_tokens,
+        total_tokens=direct_input + cache_tokens + output_tokens,
+        complete="input_tokens" in usage and "output_tokens" in usage,
+    )
+
+
 @dataclass
 class QuotaReservation:
     reservation_id: str
@@ -2360,6 +2433,11 @@ _CURRENT_QUOTA_RESERVATION: ContextVar[QuotaReservation | None] = ContextVar(
 _CURRENT_EXECUTION_PLAN: ContextVar[ExecutionPlan | None] = ContextVar(
     "current_execution_plan", default=None
 )
+# The admission whose slot the current activation is running in; lets a
+# provider cooldown wait hand the slot back instead of sleeping on it.
+_HELD_RUNTIME_ADMISSION: ContextVar[RuntimeAdmission | None] = ContextVar(
+    "held_runtime_admission", default=None
+)
 
 
 class NodeRuntimeLimiter:
@@ -2487,9 +2565,43 @@ class NodeRuntimeLimiter:
             await reservation.ready.wait()
             if reservation.released:
                 raise RuntimeError("runtime admission released before execution")
-            yield
+            yield reservation
         finally:
             self.release_admission(reservation)
+
+    async def sleep_released(
+        self, admission: RuntimeAdmission, seconds: float
+    ) -> None:
+        """Sleep without holding node capacity, then wait to run again.
+
+        A running admission hands its slot and workspace back for the sleep
+        and rejoins the head of the waiting line afterwards (outside
+        ``max_queue``: it was already admitted), so one agent's provider
+        cooldown cannot starve the other agents on the node.
+        """
+        if (
+            admission.released
+            or admission.state != "running"
+            or self._admissions.get(admission.token) is not admission
+        ):
+            await asyncio.sleep(seconds)
+            return
+        self._running_total = max(0, self._running_total - 1)
+        self._active_workspaces.discard(admission.workspace)
+        admission.state = "paused"
+        admission.ready.clear()
+        self._promote_waiters()
+        await asyncio.sleep(seconds)
+        if admission.released:
+            raise RuntimeError("runtime admission released while paused")
+        if self._can_run(admission.workspace):
+            self._mark_running(admission)
+        else:
+            admission.state = "queued"
+            self._waiting.insert(0, admission)
+        await admission.ready.wait()
+        if admission.released:
+            raise RuntimeError("runtime admission released while paused")
 
     def snapshot(self, agent_name: str) -> dict[str, int]:
         queued = sum(
@@ -2502,9 +2614,15 @@ class NodeRuntimeLimiter:
             and admission.state == "running"
             for admission in self._admissions.values()
         )
+        paused = sum(
+            admission.agent_name == agent_name
+            and admission.state == "paused"
+            for admission in self._admissions.values()
+        )
         return {
             "queued": queued,
             "running": running,
+            "paused": paused,
             "node_max_concurrency": self.max_concurrency,
             "node_max_queue": self.max_queue,
             "node_admitted": len(self._admissions),
@@ -4481,20 +4599,24 @@ class SlackAgent:
                 self.name,
                 execution_plan.execution_path,
                 admission=admission,
-            ):
-                if execution_plan.worktree_plan is None:
-                    await self._activate_inner(event, client, say)
-                else:
-                    manager = self.worktree_manager
-                    if manager is None:
-                        raise WorktreeError(
-                            "thread worktree manager is unavailable"
-                        )
-                    async with manager.lease(
-                        execution_plan.worktree_plan,
-                        owner=execution_plan.config.owner,
-                    ):
+            ) as held_admission:
+                held_token = _HELD_RUNTIME_ADMISSION.set(held_admission)
+                try:
+                    if execution_plan.worktree_plan is None:
                         await self._activate_inner(event, client, say)
+                    else:
+                        manager = self.worktree_manager
+                        if manager is None:
+                            raise WorktreeError(
+                                "thread worktree manager is unavailable"
+                            )
+                        async with manager.lease(
+                            execution_plan.worktree_plan,
+                            owner=execution_plan.config.owner,
+                        ):
+                            await self._activate_inner(event, client, say)
+                finally:
+                    _HELD_RUNTIME_ADMISSION.reset(held_token)
         except WorktreeError as exc:
             logger.warning(
                 "agent %s worktree activation failed thread=%s: %s",
@@ -4663,6 +4785,20 @@ class SlackAgent:
                         result = (
                             f"⏱️ 処理が {active_config.claude_timeout} 秒でタイムアウト"
                             "しました。依頼を分割するか、もう一度お試しください。"
+                        )
+                    except ProviderRateLimitedError as exc:
+                        turn_ok = False
+                        logger.warning(
+                            "agent %s _activate gave up on a rate-limited "
+                            "turn (replay_safe=%s retry_after=%s): %s",
+                            self.name,
+                            exc.replay_safe,
+                            exc.retry_after,
+                            str(exc)[:300],
+                        )
+                        result = format_rate_limit_notice(
+                            retry_after=exc.retry_after,
+                            replay_safe=exc.replay_safe,
                         )
                     except Exception:
                         turn_ok = False
@@ -5123,7 +5259,9 @@ class SlackAgent:
                 admission=admission,
             )
         except Exception as exc:
-            rate_limited, retry_after = classify_provider_rate_limit(exc)
+            rate_limited, retry_after, _replay_safe = (
+                classify_provider_rate_limit(exc)
+            )
             if rate_limited:
                 delay = self._provider_cooldown.note_rate_limited(retry_after)
                 self._turn_pacer.note_rate_limited()
@@ -5257,42 +5395,42 @@ class SlackAgent:
                 )
                 result_text = ""
                 provider_usage: ProviderTokenUsage | None = None
+                signals = TurnSignals()
                 await self._pace_turn_start()
                 self._mark_quota_runtime_started()
-                async with asyncio.timeout(config_snapshot.claude_timeout):
-                    async for message in query(prompt=prompt, options=options):
-                        if isinstance(message, ResultMessage):
-                            result_text = message.result or ""
-                            raw_usage = getattr(message, "usage", None) or {}
-                            direct_input = int(
-                                raw_usage.get("input_tokens") or 0
-                            )
-                            cache_tokens = sum(
-                                int(raw_usage.get(key) or 0)
-                                for key in (
-                                    "cache_read_input_tokens",
-                                    "cache_creation_input_tokens",
+                try:
+                    async with asyncio.timeout(config_snapshot.claude_timeout):
+                        async for message in query(
+                            prompt=prompt, options=options
+                        ):
+                            observe_claude_message(signals, message)
+                            if isinstance(message, ResultMessage):
+                                result_text = message.result or ""
+                                provider_usage = claude_result_usage(
+                                    getattr(message, "usage", None)
                                 )
-                            )
-                            output_tokens = int(
-                                raw_usage.get("output_tokens") or 0
-                            )
-                            provider_usage = ProviderTokenUsage(
-                                input_tokens=direct_input + cache_tokens,
-                                output_tokens=output_tokens,
-                                cache_tokens=cache_tokens,
-                                total_tokens=(
-                                    direct_input
-                                    + cache_tokens
-                                    + output_tokens
-                                ),
-                                complete=(
-                                    "input_tokens" in raw_usage
-                                    and "output_tokens" in raw_usage
-                                ),
-                            )
+                except TimeoutError:
+                    raise
+                except Exception as exc:
+                    if provider_usage is not None:
+                        self._settle_quota_usage(provider_usage)
+                    rate_error = signals.rate_limit_error(
+                        str(exc), now=time.time()
+                    )
+                    if rate_error is not None:
+                        raise rate_error from exc
+                    raise
                 if provider_usage is not None:
                     self._settle_quota_usage(provider_usage)
+                if signals.error_text:
+                    # Never post a provider error as a top-level patrol report.
+                    rate_error = signals.rate_limit_error(now=time.time())
+                    if rate_error is not None:
+                        raise rate_error
+                    raise RuntimeError(
+                        "patrol claude turn returned an error result: "
+                        f"{signals.error_text[:300]}"
+                    )
             else:
                 raise RuntimeError(f"unsupported patrol runtime: {runtime}")
             result = result_text or (
@@ -5653,22 +5791,18 @@ class SlackAgent:
         baseline and the cleared session would be silently recreated.
 
         A provider rate limit arms the per-agent cooldown and the turn is
-        retried once after it expires; a Slack mention must not be lost, so
-        the turn waits instead of being skipped. A turn that starts while a
-        cooldown is armed also waits first. Timeouts and other errors keep
-        their existing single-attempt behavior.
+        retried once after it expires, but only when the failed attempt is
+        provably replay-safe (no side-effecting tool ran), the provider's
+        reset fits one cooldown, and the thread was not reset meanwhile.
+        Otherwise a typed ``ProviderRateLimitedError`` reaches the caller.
+        A turn that starts while a cooldown is armed waits first, with its
+        node slot handed back. Timeouts and other errors keep their existing
+        single-attempt behavior.
         """
         for attempt in (0, 1):
             wait = self._provider_cooldown.remaining()
             if wait > 0:
-                logger.warning(
-                    "agent %s provider cooldown active: waiting %.1fs "
-                    "before turn thread=%s",
-                    self.name,
-                    wait,
-                    thread_key,
-                )
-                await asyncio.sleep(wait)
+                await self._wait_out_cooldown(wait, thread_key)
             try:
                 result = await self._dispatch_turn(
                     prompt,
@@ -5678,7 +5812,11 @@ class SlackAgent:
                     project_id=project_id,
                 )
             except Exception as exc:
-                rate_limited, retry_after = classify_provider_rate_limit(exc)
+                (
+                    rate_limited,
+                    retry_after,
+                    replay_safe,
+                ) = classify_provider_rate_limit(exc)
                 if not rate_limited:
                     raise
                 delay = self._provider_cooldown.note_rate_limited(retry_after)
@@ -5693,13 +5831,39 @@ class SlackAgent:
                     thread_key,
                     str(exc)[:300],
                 )
-                if attempt == 0:
+                if (
+                    attempt == 0
+                    and replay_safe
+                    and not self._provider_cooldown.exceeds_cap(retry_after)
+                    and gen == self._turn_generation(thread_key)
+                ):
                     continue
-                raise
+                if isinstance(exc, ProviderRateLimitedError):
+                    raise
+                raise ProviderRateLimitedError(
+                    str(exc)[-500:] or "provider rate limited",
+                    retry_after=retry_after,
+                    replay_safe=replay_safe,
+                ) from exc
             self._provider_cooldown.note_success()
             self._turn_pacer.note_clean_turn()
             return result
         raise AssertionError("unreachable: _run_turn retry loop exhausted")
+
+    async def _wait_out_cooldown(self, wait: float, thread_key: str) -> None:
+        """Wait out the provider cooldown without occupying a node slot."""
+        logger.warning(
+            "agent %s provider cooldown active: waiting %.1fs before turn "
+            "thread=%s",
+            self.name,
+            wait,
+            thread_key,
+        )
+        admission = _HELD_RUNTIME_ADMISSION.get()
+        if admission is None:
+            await asyncio.sleep(wait)
+        else:
+            await self.runtime_limiter.sleep_released(admission, wait)
 
     async def _dispatch_turn(
         self,
@@ -5877,14 +6041,23 @@ class SlackAgent:
             )
         parsed = parse_codex_events(stdout.decode(errors="replace"))
         # A rate-limited codex run reports through an error event or stderr;
-        # surface it as a typed error so _run_turn can cool down and retry.
+        # surface it as a typed error so _run_turn can cool down. Only a turn
+        # that actually failed counts: an ``error`` event alone can be a stream
+        # retry that later recovered into ``turn.completed``.
         error_message = str(parsed.get("error_message") or "")
-        if is_rate_limit_signal(error_message) or (
-            proc.returncode != 0 and is_rate_limit_signal(stderr_text)
+        turn_failed = (
+            parsed["turn_failed"]
+            or proc.returncode != 0
+            or not parsed["turn_completed"]
+        )
+        if turn_failed and (
+            is_rate_limit_signal(error_message)
+            or (proc.returncode != 0 and is_rate_limit_signal(stderr_text))
         ):
             raise ProviderRateLimitedError(
                 (error_message or stderr_text.strip())[-500:]
-                or "codex runtime rate limited"
+                or "codex runtime rate limited",
+                replay_safe=not parsed["tool_activity"],
             )
         return (
             parsed["last_message"] or "",
@@ -6175,65 +6348,55 @@ class SlackAgent:
         pending_session = ""
         pending_stats: dict[str, int] | None = None
         provider_usage: ProviderTokenUsage | None = None
-        result_is_error = False
+        signals = TurnSignals()
         await self._pace_turn_start()
         self._mark_quota_runtime_started()
-        async with asyncio.timeout(active_config.claude_timeout):
-            async for message in query(prompt=prompt, options=options):
-                if (
-                    isinstance(message, SystemMessage)
-                    and message.subtype == "init"
-                ):
-                    pending_session = message.data.get("session_id") or ""
-                elif isinstance(message, ResultMessage):
-                    result_text = message.result or ""
-                    result_is_error = bool(
-                        getattr(message, "is_error", False)
-                    )
-                    usage = getattr(message, "usage", None) or {}
-                    input_tokens = sum(
-                        int(usage.get(k) or 0)
-                        for k in (
-                            "input_tokens",
-                            "cache_read_input_tokens",
-                            "cache_creation_input_tokens",
+        try:
+            async with asyncio.timeout(active_config.claude_timeout):
+                async for message in query(prompt=prompt, options=options):
+                    observe_claude_message(signals, message)
+                    if (
+                        isinstance(message, SystemMessage)
+                        and message.subtype == "init"
+                    ):
+                        pending_session = message.data.get("session_id") or ""
+                    elif isinstance(message, ResultMessage):
+                        result_text = message.result or ""
+                        usage = getattr(message, "usage", None) or {}
+                        input_tokens = sum(
+                            int(usage.get(k) or 0)
+                            for k in (
+                                "input_tokens",
+                                "cache_read_input_tokens",
+                                "cache_creation_input_tokens",
+                            )
                         )
-                    )
-                    pending_stats = {
-                        "input_tokens": input_tokens,
-                        "num_turns": int(getattr(message, "num_turns", 0) or 0),
-                    }
-                    direct_input = int(usage.get("input_tokens") or 0)
-                    cache_tokens = sum(
-                        int(usage.get(key) or 0)
-                        for key in (
-                            "cache_read_input_tokens",
-                            "cache_creation_input_tokens",
-                        )
-                    )
-                    output_tokens = int(usage.get("output_tokens") or 0)
-                    provider_usage = ProviderTokenUsage(
-                        input_tokens=direct_input + cache_tokens,
-                        output_tokens=output_tokens,
-                        cache_tokens=cache_tokens,
-                        total_tokens=(
-                            direct_input + cache_tokens + output_tokens
-                        ),
-                        complete=(
-                            "input_tokens" in usage
-                            and "output_tokens" in usage
-                        ),
-                    )
+                        pending_stats = {
+                            "input_tokens": input_tokens,
+                            "num_turns": int(
+                                getattr(message, "num_turns", 0) or 0
+                            ),
+                        }
+                        provider_usage = claude_result_usage(usage)
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            # The CLI exits non-zero after an error result and the SDK raises
+            # a generic error; charge what the turn reported, then surface a
+            # typed rate limit (before any session write-back, so a retry
+            # resumes the pre-turn session).
+            if provider_usage is not None:
+                self._settle_quota_usage(provider_usage)
+            rate_error = signals.rate_limit_error(str(exc), now=time.time())
+            if rate_error is not None:
+                raise rate_error from exc
+            raise
         if provider_usage is not None:
             self._settle_quota_usage(provider_usage)
-        # A rate-limited CLI turn arrives as an error ResultMessage, not an
-        # exception; surface it as one so _run_turn can cool down and retry.
-        # Raised after quota settlement and before any session write-back, so
-        # the retry resumes the pre-turn session.
-        if result_is_error and is_rate_limit_signal(result_text):
-            raise ProviderRateLimitedError(
-                result_text or "claude runtime rate limited"
-            )
+        if signals.error_text:
+            rate_error = signals.rate_limit_error(now=time.time())
+            if rate_error is not None:
+                raise rate_error
         if gen != self._turn_generation(thread_key):
             logger.warning(
                 "agent %s discarding claude turn session (state cleared mid-turn)",

@@ -1773,6 +1773,9 @@ def test_parse_codex_events_empty():
         "total_tokens": 0,
         "usage_complete": False,
         "error_message": "",
+        "turn_completed": False,
+        "turn_failed": False,
+        "tool_activity": False,
     }
 
 

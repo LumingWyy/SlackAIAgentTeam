@@ -1339,6 +1339,11 @@ def format_thread_context(
     return body
 
 
+CODEX_SIDE_EFFECT_ITEM_TYPES = frozenset(
+    {"command_execution", "file_change", "mcp_tool_call"}
+)
+
+
 def parse_codex_events(jsonl: str) -> dict:
     """Parse JSONL output from `codex exec --json`.
 
@@ -1348,6 +1353,10 @@ def parse_codex_events(jsonl: str) -> dict:
     - input_tokens: usage from ``turn.completed`` (input + cached_input)
     - output/cache/total tokens and whether input+output were both reported
     - error_message: text of the last ``error`` / ``turn.failed`` event ("")
+    - turn_completed / turn_failed: whether those terminal events arrived
+      (an ``error`` event alone may be a recovered stream retry)
+    - tool_activity: a side-effecting item (command, file change, MCP call)
+      started, so replaying the prompt is not safe
     Non-JSON lines and unknown events are skipped (tolerant of format drift).
     """
     thread_id: str | None = None
@@ -1358,6 +1367,9 @@ def parse_codex_events(jsonl: str) -> dict:
     total_tokens = 0
     usage_complete = False
     error_message = ""
+    turn_completed = False
+    turn_failed = False
+    tool_activity = False
     for line in jsonl.splitlines():
         line = line.strip()
         if not line:
@@ -1373,13 +1385,20 @@ def parse_codex_events(jsonl: str) -> dict:
             tid = event.get("thread_id")
             if isinstance(tid, str) and tid:
                 thread_id = tid
-        elif etype == "item.completed":
+        elif etype in ("item.started", "item.updated", "item.completed"):
             item = event.get("item") or {}
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") in CODEX_SIDE_EFFECT_ITEM_TYPES:
+                tool_activity = True
+            if etype != "item.completed":
+                continue
             if item.get("type") == "agent_message":
                 text = item.get("text")
                 if isinstance(text, str):
                     last_message = text
         elif etype == "turn.completed":
+            turn_completed = True
             usage = event.get("usage") or {}
             direct_input = int(usage.get("input_tokens") or 0)
             cache_tokens = int(usage.get("cached_input_tokens") or 0)
@@ -1394,6 +1413,7 @@ def parse_codex_events(jsonl: str) -> dict:
             if isinstance(message, str) and message:
                 error_message = message
         elif etype == "turn.failed":
+            turn_failed = True
             error = event.get("error")
             message = (
                 error.get("message") if isinstance(error, dict) else None
@@ -1409,6 +1429,9 @@ def parse_codex_events(jsonl: str) -> dict:
         "total_tokens": total_tokens,
         "usage_complete": usage_complete,
         "error_message": error_message,
+        "turn_completed": turn_completed,
+        "turn_failed": turn_failed,
+        "tool_activity": tool_activity,
     }
 
 
@@ -1664,11 +1687,24 @@ def parse_freshness_decision(text: str) -> tuple[str, str]:
 
 
 class ProviderRateLimitedError(RuntimeError):
-    """The AI provider refused or aborted a turn due to rate/usage limiting."""
+    """The AI provider refused or aborted a turn due to rate/usage limiting.
 
-    def __init__(self, message: str, retry_after: float | None = None):
+    ``replay_safe`` is False when the failed attempt may already have run a
+    side-effecting tool (shell, file edit, MCP call): replaying the same
+    prompt could then repeat a push or a GitHub comment, so it must not be
+    retried automatically.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        retry_after: float | None = None,
+        *,
+        replay_safe: bool = True,
+    ):
         super().__init__(message)
         self.retry_after = retry_after
+        self.replay_safe = replay_safe
 
 
 _RATE_LIMIT_SIGNAL_RE = re.compile(
@@ -1691,6 +1727,88 @@ def is_rate_limit_signal(text: str) -> bool:
     A false positive merely delays one retry by the cooldown.
     """
     return bool(text) and bool(_RATE_LIMIT_SIGNAL_RE.search(text))
+
+
+# Tools that only read; any other tool (Bash, Edit, MCP, sub-agents, ...) may
+# have changed the workspace or the outside world.
+READ_ONLY_TOOL_NAMES = frozenset(
+    {
+        "Read",
+        "Glob",
+        "Grep",
+        "LS",
+        "NotebookRead",
+        "TodoRead",
+        "TodoWrite",
+        "ToolSearch",
+        "WebFetch",
+        "WebSearch",
+    }
+)
+
+
+def is_side_effect_tool(name: str) -> bool:
+    return str(name or "") not in READ_ONLY_TOOL_NAMES
+
+
+@dataclass
+class TurnSignals:
+    """Evidence collected while one runtime turn streams.
+
+    ``rate_limit_seen`` is a structured provider signal (HTTP 429/529, a
+    ``rate_limit`` assistant error, a rejected usage window); ``resets_at`` is
+    the epoch second that window reopens. Only consulted once the turn has
+    failed, so a rejected-but-overage-allowed window never fails a good turn.
+    """
+
+    tool_activity: bool = False
+    rate_limit_seen: bool = False
+    resets_at: float | None = None
+    error_text: str = ""
+
+    def rate_limit_error(
+        self, cause_text: str = "", *, now: float
+    ) -> ProviderRateLimitedError | None:
+        """Typed error for a failed turn, or None when it was not rate limiting."""
+        texts = [text for text in (self.error_text, cause_text) if text]
+        if not self.rate_limit_seen and not any(
+            is_rate_limit_signal(text) for text in texts
+        ):
+            return None
+        retry_after = (
+            max(0.0, self.resets_at - now)
+            if self.resets_at is not None
+            else None
+        )
+        message = (texts[0] if texts else "provider rate limited")[-500:]
+        return ProviderRateLimitedError(
+            message,
+            retry_after=retry_after,
+            replay_safe=not self.tool_activity,
+        )
+
+
+def format_rate_limit_notice(
+    *, retry_after: float | None, replay_safe: bool
+) -> str:
+    """Thread notice for a turn abandoned because of provider rate limiting."""
+    if not replay_safe:
+        return (
+            "⏸️ AI provider のレート制限で処理が途中で止まりました。"
+            "一部の操作が実行済みの可能性があるため自動再試行はしていません。"
+            "状態を確認してから、もう一度 @メンションしてください。"
+        )
+    if retry_after is not None and retry_after > 0:
+        minutes = max(1, math.ceil(retry_after / 60))
+        return (
+            "⏸️ AI provider の利用上限に達しました。"
+            f"約 {minutes} 分後に解除される見込みです。"
+            "解除後にもう一度 @メンションしてください。"
+        )
+    return (
+        "⏸️ AI provider のレート制限が続いています。"
+        "しばらく待ってからもう一度 @メンションしてください。"
+    )
 
 
 class ProviderCooldown:
@@ -1732,6 +1850,10 @@ class ProviderCooldown:
     def note_success(self) -> None:
         self._strikes = 0
         self._until = 0.0
+
+    def exceeds_cap(self, retry_after: float | None) -> bool:
+        """True when the provider asks for a longer wait than one cooldown allows."""
+        return retry_after is not None and retry_after > self._hard_cap
 
     def remaining(self) -> float:
         return max(0.0, self._until - self._clock())

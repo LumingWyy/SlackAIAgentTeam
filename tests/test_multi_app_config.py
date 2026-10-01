@@ -4480,6 +4480,7 @@ def test_slack_admission_queue_is_bounded_and_recovers_after_cancel(
         assert agent.runtime_limiter.snapshot("local") == {
             "queued": 0,
             "running": 1,
+            "paused": 0,
             "node_max_concurrency": 1,
             "node_max_queue": 0,
             "node_admitted": 1,
