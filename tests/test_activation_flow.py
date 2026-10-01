@@ -791,3 +791,117 @@ def test_stopped_patrol_round_hands_the_issue_back(tmp_path, monkeypatch):
     asyncio.run(agent._release_stopped_claim("acme/widgets", 7, agent.cfg, "C-PATROL"))
     assert calls == [("release", 7)]
     assert "#7" in posts[0] and "todo" in posts[0]
+
+
+def _stream_then_hang(monkeypatch, session_id, started):
+    import multi_app
+    from claude_agent_sdk import SystemMessage
+
+    async def fake_query(*, prompt, options):
+        yield SystemMessage(subtype="init", data={"session_id": session_id})
+        started.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(multi_app, "query", fake_query)
+
+
+@pytest.mark.parametrize("operator_stop", [True, False])
+def test_interrupted_first_turn_keeps_its_session_only_on_operator_stop(
+    tmp_path, monkeypatch, operator_stop
+):
+    """A stop keeps the new session for the next turn; other cancels do not."""
+    agent = _build_agent(tmp_path, monkeypatch)
+    started = asyncio.Event()
+    _stream_then_hang(monkeypatch, "sess-first", started)
+    thread_key = "C1:100.0"
+
+    async def scenario():
+        turn = asyncio.create_task(
+            agent._run_claude("p", thread_key, agent._turn_generation(thread_key))
+        )
+        await started.wait()
+        if operator_stop:
+            agent.set_paused(True)
+        turn.cancel()
+        await asyncio.gather(turn, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert agent.sessions.get(thread_key) == ("sess-first" if operator_stop else None)
+
+
+def test_turn_after_a_stop_is_told_not_to_pick_the_work_back_up(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    started = asyncio.Event()
+    replies = iter(["hang", "ok", "ok"])
+
+    rec = _wire(agent, ["unused"])
+
+    async def fake_run_turn(prompt, thread_key, gen, **kwargs):
+        rec.turns.append(prompt)
+        if next(replies) == "hang":
+            started.set()
+            await asyncio.sleep(3600)
+        return "done"
+
+    agent._run_turn = fake_run_turn
+
+    async def scenario():
+        event = _event(ts="101.0")
+        task = asyncio.create_task(agent._activate_inner(event, object(), _say))
+        agent._tasks.add(task)
+        agent._task_triggers[task] = (event, object(), _say)
+        await started.wait()
+        await agent.stop()
+        agent.resume()
+        await agent._activate_inner(_event(ts="103.0"), object(), _say)
+        await agent._activate_inner(_event(ts="105.0"), object(), _say)
+
+    asyncio.run(scenario())
+    note = "操作者が途中で停止しました"
+    assert note not in rec.turns[0]
+    assert note in rec.turns[1]  # the first turn after the stop
+    assert note not in rec.turns[2]  # said once
+
+
+# ---------------------------------------------------------------------------
+# Slack identity (what Slack shows for the bot)
+# ---------------------------------------------------------------------------
+
+def test_slack_identity_reads_the_shown_name_not_the_app_name():
+    from multi_core import slack_identity
+
+    user = {"name": "ai_agent_luming", "profile": {"real_name": "dev", "display_name": ""}}
+    bot = {"name": "Agent (developer)", "app_id": "A0BJRUTHFV5"}
+    assert slack_identity(user, bot) == {
+        "display_name": "dev",
+        "username": "ai_agent_luming",
+        "app_name": "Agent (developer)",
+        "app_id": "A0BJRUTHFV5",
+        "app_home_url": "https://api.slack.com/apps/A0BJRUTHFV5/app-home",
+    }
+    renamed = {"name": "x", "profile": {"real_name": "dev", "display_name": "developer"}}
+    assert slack_identity(renamed, bot)["display_name"] == "developer"
+    odd = slack_identity(user, {"app_id": "javascript:alert(1)"})
+    assert odd["app_id"] == "" and odd["app_home_url"] == ""
+
+
+def test_sync_rereads_the_bot_profile_from_slack(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    names = iter(["dev", "developer"])
+
+    class Client:
+        async def users_info(self, user):
+            assert user == SELF_USER
+            return {"user": {"name": "dev", "profile": {"real_name": next(names)}}}
+
+        async def bots_info(self, bot):
+            assert bot == SELF_BOT
+            return {"bot": {"name": "Agent (dev)", "app_id": "A0TESTAPP1"}}
+
+    class App:
+        client = Client()
+
+    agent.app = App()
+    assert asyncio.run(agent.refresh_slack_identity())["display_name"] == "dev"
+    assert asyncio.run(agent.refresh_slack_identity())["display_name"] == "developer"
+    assert agent.status_snapshot()["slack"]["display_name"] == "developer"

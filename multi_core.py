@@ -2381,6 +2381,35 @@ def is_side_effect_tool(name: str) -> bool:
     return str(name or "") not in READ_ONLY_TOOL_NAMES
 
 
+_SLACK_APP_ID_RE = re.compile(r"A[A-Z0-9]{6,20}")
+
+
+def slack_identity(user: dict | None, bot: dict | None) -> dict[str, str]:
+    """What Slack shows for a bot, from ``users.info`` + ``bots.info``.
+
+    Messages show ``display_name`` (a bot's is usually empty, so Slack falls
+    back to ``real_name``, the App Home "Display Name (Bot Name)"); the app
+    name and username are separate settings and do not change it.
+    """
+    user = user or {}
+    bot = bot or {}
+    profile = user.get("profile") or {}
+    app_id = str(bot.get("app_id") or "")
+    if not _SLACK_APP_ID_RE.fullmatch(app_id):
+        app_id = ""
+    return {
+        "display_name": str(
+            profile.get("display_name") or profile.get("real_name") or user.get("name") or ""
+        ),
+        "username": str(user.get("name") or ""),
+        "app_name": str(bot.get("name") or ""),
+        "app_id": app_id,
+        "app_home_url": (
+            f"https://api.slack.com/apps/{app_id}/app-home" if app_id else ""
+        ),
+    }
+
+
 def format_stopped_notice(agent: str, *, interrupted: bool = False) -> str:
     """Slack notice for a thread that reached an agent its operator stopped."""
     if interrupted:

@@ -205,6 +205,18 @@ def test_monitor_card_can_stop_and_resume_an_agent():
         assert script.count(f"'{key}':") == 3, key
 
 
+def test_monitor_card_shows_and_syncs_the_slack_name():
+    script = _main_script(webui.INDEX_HTML)
+    assert "${slackIdentity(a.slack)}" in script
+    assert 'data-action="sync-slack"' in script
+    assert "else if(action==='sync-slack')syncSlack(n);" in script
+    assert "safeHttpUrl(sl.app_home_url" in script  # link only to a vetted URL
+    for key in ("slack.lbl", "slack.sync", "slack.edit", "slack.hint", "slack.unknown", "toast.slack"):
+        assert script.count(f"'{key}':") == 3, key
+    routes = {(r.method, r.resource.canonical) for r in webui.make_app().router.routes() if r.resource}
+    assert ("POST", "/api/live/{name}/slack-identity") in routes
+
+
 def test_stop_and_resume_proxy_to_the_admin_api(monkeypatch):
     sent = []
 
