@@ -351,6 +351,7 @@ DM 中人类可无 `@` 对话（peer 不会在 DM 中交接）。
 | 回复新鲜度门控 | 发帖前检查生成期间线程内新到的同事/授权人类消息，触发恰好一次重新判断（`POST_ORIGINAL` 原样发 / 修订全文 / `NO_REPLY` 撤回）；与最新非本人消息逐字重复的回复不会发出。只读本地转录（零额外 Slack API 调用），门控自身出错时 fail-open 照常发帖。`FRESHNESS_RECHECK=0` 可关闭 |
 | Provider 限流冷却 | AI 轮次被限流时（Claude / Codex / OpenAI 的 429、用量上限、overloaded 信号；尊重 `Retry-After`）武装按 provider 账号共享的冷却（本机所有 Claude agent 共用一个 Claude 登录、所有 Codex agent 共用一个 Codex 登录；OpenAI 按端点 + key 变量区分）——基础 **60 秒**，连续触发翻倍至上限 **480 秒**。冷却结束后只在确认安全时重试一次：未执行有副作用的工具（shell、编辑、MCP）、provider 给出的恢复时间在 15 分钟内、线程未被重置；否则不静默重放，而是在线程里说明原因。冷却等待期间会让出节点并发槽，其他 agent 不受影响。冷却期内开始的轮次先等待；巡回轮直接跳过（下个周期自然重试）。成功轮次重置连击。状态见 `/state` 的 `provider_cooldown`；用 `PROVIDER_COOLDOWN_BASE_SECONDS` / `PROVIDER_COOLDOWN_MAX_SECONDS` 调整 |
 | 自适应轮次节拍器 | 全部本地 agent 共享一条节点级的 provider 轮次启动时间线，按自适应间隔错开——基础 **0.5 秒**，每次限流翻倍至上限 **8 秒**，连续 **5** 个清洁轮次后减半回落——让共用同一 provider 账号的 2-3 个 agent 永不同拍开火。覆盖 Slack、新鲜度复查与巡回轮次；等待发生在单轮超时窗口开启之前，不降低总并发。状态见 `/state` 的 `turn_pacer`；用 `PROVIDER_PACER_BASE_SECONDS`（0 为关闭）/ `PROVIDER_PACER_MAX_SECONDS` / `PROVIDER_PACER_CLEAN_TURNS` 调整 |
+| Socket 投递缺口 | Socket Mode 断线（或主机休眠）超过 **120 秒**可能已错过 Slack 的重投窗口，共享转录会在下次读取时从线程根消息重新校验，不再把缺口当作完整上下文。用 `SOCKET_GAP_REVALIDATE_SECONDS` 调整 |
 
 ## 安全
 

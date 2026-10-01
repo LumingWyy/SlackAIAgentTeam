@@ -1350,8 +1350,11 @@ def parse_codex_events(jsonl: str) -> dict:
     Returns the final message/session plus provider token breakdown:
     - thread_id: ``thread_id`` from ``thread.started`` (for resume)
     - last_message: text of the last ``item.completed`` with item.type == "agent_message"
-    - input_tokens: usage from ``turn.completed`` (input + cached_input)
+    - input_tokens: ``turn.completed`` input, which already includes the
+      cached part (``cached_input_tokens`` is a subset, not an addition)
     - output/cache/total tokens and whether input+output were both reported
+    Codex reports these counters cumulatively over a resumed session; see
+    ``codex_usage_delta`` for per-turn accounting.
     - error_message: text of the last ``error`` / ``turn.failed`` event ("")
     - turn_completed / turn_failed: whether those terminal events arrived
       (an ``error`` event alone may be a recovered stream retry)
@@ -1400,10 +1403,9 @@ def parse_codex_events(jsonl: str) -> dict:
         elif etype == "turn.completed":
             turn_completed = True
             usage = event.get("usage") or {}
-            direct_input = int(usage.get("input_tokens") or 0)
+            input_tokens = int(usage.get("input_tokens") or 0)
             cache_tokens = int(usage.get("cached_input_tokens") or 0)
             output_tokens = int(usage.get("output_tokens") or 0)
-            input_tokens = direct_input + cache_tokens
             total_tokens = input_tokens + output_tokens
             usage_complete = (
                 "input_tokens" in usage and "output_tokens" in usage
@@ -1433,6 +1435,27 @@ def parse_codex_events(jsonl: str) -> dict:
         "turn_failed": turn_failed,
         "tool_activity": tool_activity,
     }
+
+
+def codex_usage_delta(
+    current: tuple[int, int, int],
+    baseline: tuple[int, int, int] | None,
+) -> tuple[int, int, int]:
+    """Per-turn ``(input, cache, output)`` from codex's cumulative counters.
+
+    ``codex exec resume`` reports usage accumulated over the whole session.
+    No baseline (a new session) or any counter that went backwards (a fresh
+    or compacted session) means the current values are this turn's own.
+    """
+    if baseline is None or any(
+        now < before for now, before in zip(current, baseline)
+    ):
+        return current
+    return (
+        current[0] - baseline[0],
+        current[1] - baseline[1],
+        current[2] - baseline[2],
+    )
 
 
 def build_activation_prompt(
@@ -1880,6 +1903,33 @@ class ProviderCooldown:
             "base_seconds": self._base,
             "max_seconds": self._max,
         }
+
+
+class LiveCoverageMonitor:
+    """Detect a live-delivery gap from periodic connection samples.
+
+    ``observe`` is fed the wall clock and whether the Socket Mode link is
+    up. It returns True once, when the link is up again after not being
+    seen up for ``threshold_seconds`` — a dropped connection or a host that
+    slept (no samples at all) both qualify. Wall time is used on purpose:
+    a suspended host's monotonic clock may not advance.
+    """
+
+    def __init__(self, threshold_seconds: float) -> None:
+        if threshold_seconds <= 0:
+            raise ValueError("gap threshold must be positive")
+        self.threshold_seconds = float(threshold_seconds)
+        self._last_up: float | None = None
+
+    def observe(self, now: float, connected: bool) -> bool:
+        if not connected:
+            return False
+        gap = (
+            self._last_up is not None
+            and now - self._last_up >= self.threshold_seconds
+        )
+        self._last_up = now
+        return gap
 
 
 DEFAULT_OPENAI_ACCOUNT_URL = "https://api.openai.com/v1"

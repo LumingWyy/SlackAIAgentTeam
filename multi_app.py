@@ -30,6 +30,7 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI, RateLimitError as OpenAIRateLimitError
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
+from slack_sdk.errors import SlackApiError
 from slack_sdk.http_retry.builtin_async_handlers import (
     AsyncRateLimitErrorRetryHandler,
 )
@@ -52,6 +53,7 @@ from control_auth import (
 from multi_core import (
     AdaptivePacer,
     EventDeduper,
+    LiveCoverageMonitor,
     ProjectPolicy,
     ProviderCooldown,
     ProviderCooldownRegistry,
@@ -61,6 +63,7 @@ from multi_core import (
     build_activation_prompt,
     build_freshness_recheck_prompt,
     canonical_github_repo,
+    codex_usage_delta,
     classify_sender,
     constrain_handoff_targets,
     default_slack_token_env_names,
@@ -133,6 +136,7 @@ OPENAI_EMPTY_REPLY = "(OpenAI API からテキストの応答がありません�
 EMPTY_REPLY_PLACEHOLDERS = frozenset(
     {CLAUDE_EMPTY_REPLY, CODEX_EMPTY_REPLY, OPENAI_EMPTY_REPLY}
 )
+CODEX_USAGE_BASELINE_LIMIT = 4096
 
 
 def provider_cooldown_from_env() -> ProviderCooldown:
@@ -225,6 +229,61 @@ def _provider_error_retry_after(exc: BaseException) -> float | None:
     except (TypeError, ValueError):
         return None
     return value if value >= 0 else None
+
+
+SOCKET_GAP_SAMPLE_SECONDS = 10.0
+
+
+def socket_gap_threshold_from_env() -> float:
+    """``SOCKET_GAP_REVALIDATE_SECONDS`` (default 120); invalid fails startup."""
+    raw = os.environ.get("SOCKET_GAP_REVALIDATE_SECONDS", "").strip()
+    if not raw:
+        return 120.0
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            "SOCKET_GAP_REVALIDATE_SECONDS must be a number of seconds "
+            f"(got: {raw!r})"
+        ) from exc
+    if value <= SOCKET_GAP_SAMPLE_SECONDS:
+        raise RuntimeError(
+            "SOCKET_GAP_REVALIDATE_SECONDS must exceed the "
+            f"{SOCKET_GAP_SAMPLE_SECONDS:g}s sample interval (got: {raw!r})"
+        )
+    return value
+
+
+async def watch_live_coverage(
+    handlers: list[Any],
+    transcript_store: TranscriptStore,
+    *,
+    threshold_seconds: float,
+    sample_seconds: float = SOCKET_GAP_SAMPLE_SECONDS,
+    clock: Any = time.time,
+) -> None:
+    """Revalidate shared transcripts after any Socket Mode delivery gap.
+
+    Slack redelivers unacknowledged events only for a few minutes, so a
+    longer disconnect or host sleep loses live events for good; without
+    this, a thread marked complete would keep serving the hole as context.
+    """
+    monitors = [LiveCoverageMonitor(threshold_seconds) for _ in handlers]
+    while True:
+        for handler, monitor in zip(handlers, monitors):
+            try:
+                connected = bool(await handler.client.is_connected())
+            except Exception:
+                connected = False
+            if monitor.observe(clock(), connected):
+                flagged = transcript_store.mark_coverage_gap()
+                logger.warning(
+                    "socket delivery gap >= %.0fs detected; %d transcript "
+                    "thread(s) will be revalidated",
+                    threshold_seconds,
+                    flagged,
+                )
+        await asyncio.sleep(sample_seconds)
 
 
 def classify_provider_rate_limit(
@@ -2722,6 +2781,8 @@ class SlackAgent:
         # thread_key → previous session summary (injected into new session after rollover)
         self.thread_summaries: dict[str, str] = {}
         self.deduper = EventDeduper()
+        # codex thread id → last cumulative (input, cache, output) counters.
+        self._codex_usage_baselines: dict[str, tuple[int, int, int]] = {}
         # AI-provider back-off per provider account; armed on rate-limited
         # turns, reset by a clean turn. Production shares one registry across
         # local agents (they share the Claude / Codex login), so the first
@@ -4865,11 +4926,23 @@ class SlackAgent:
                             ),
                         )
 
-                    # last_seen is in-process redelivery bookkeeping and always applies;
-                    # persistence is skipped when the thread was cleared mid-turn, or the
-                    # deleted row would come straight back with this turn's state.
-                    self.last_seen[thread_key] = ts
-                    if gen == self._turn_generation(thread_key):
+                    # last_seen is the context cursor: _fetch_context drops
+                    # messages at or before it because the session already
+                    # holds them. Only a successful turn wrote its session, so
+                    # a failed turn must not advance it — otherwise a retry
+                    # ("@agent try again") would lose the original question.
+                    # Persistence is also skipped when the thread was cleared
+                    # mid-turn, or the deleted row would come straight back;
+                    # the cursor stays cleared too, since the fresh session
+                    # that follows a reset holds none of the earlier messages.
+                    if not turn_ok:
+                        logger.info(
+                            "agent %s keep context cursor (turn failed) thread=%s",
+                            self.name,
+                            thread_key,
+                        )
+                    elif gen == self._turn_generation(thread_key):
+                        self.last_seen[thread_key] = ts
                         self.persist_thread(
                             thread_key, ts, execution_plan
                         )
@@ -5006,8 +5079,12 @@ class SlackAgent:
             try:
                 resp = await self.app.client.chat_postMessage(**post_kwargs)
                 posted_text = (resp.get("message") or {}).get("text") or ""
-            except Exception:
-                # Fall back to plain text when markdown_text is unavailable/fails, to guarantee delivery
+            except SlackApiError:
+                # Slack answered and refused markdown_text, so nothing was
+                # posted: plain text is a safe second attempt. Any other
+                # failure (timeout, dropped connection) may have delivered the
+                # chunk already; re-posting would duplicate the reply and its
+                # handoff mention, so it propagates instead.
                 logger.warning(
                     "agent %s markdown_text post failed, fallback to text",
                     self.name,
@@ -6181,6 +6258,7 @@ class SlackAgent:
                 complete=False,
             )
         )
+        usage = self._codex_turn_usage(resume_session, thread_id, usage)
         self._settle_quota_usage(usage)
         if gen != self._turn_generation(thread_key):
             # State was cleared while this turn was in flight (!reset / restart /
@@ -6199,6 +6277,52 @@ class SlackAgent:
             "num_turns": 0,
         }
         return result_text or CODEX_EMPTY_REPLY
+
+    def _codex_turn_usage(
+        self,
+        resume_session: str | None,
+        thread_id: str | None,
+        usage: ProviderTokenUsage,
+    ) -> ProviderTokenUsage:
+        """Bill only this turn: codex reports session-cumulative counters.
+
+        Without the delta every resumed turn re-billed the whole session. A
+        turn that reported no usage leaves the baseline where it was.
+        """
+        session = thread_id or resume_session
+        if not session or not (usage.input_tokens or usage.output_tokens):
+            return usage
+        current = (usage.input_tokens, usage.cache_tokens, usage.output_tokens)
+        baseline = None
+        if resume_session:
+            baseline = self._codex_usage_baselines.get(resume_session)
+            if baseline is None and self._store is not None:
+                baseline = self._store.load_codex_usage_baseline(
+                    resume_session
+                )
+        delta_input, delta_cache, delta_output = codex_usage_delta(
+            current, baseline
+        )
+        self._codex_usage_baselines.pop(session, None)
+        self._codex_usage_baselines[session] = current
+        while len(self._codex_usage_baselines) > CODEX_USAGE_BASELINE_LIMIT:
+            self._codex_usage_baselines.pop(
+                next(iter(self._codex_usage_baselines))
+            )
+        if self._store is not None:
+            self._store.save_codex_usage_baseline(
+                session,
+                input_tokens=current[0],
+                cache_tokens=current[1],
+                output_tokens=current[2],
+            )
+        return ProviderTokenUsage(
+            input_tokens=delta_input,
+            output_tokens=delta_output,
+            cache_tokens=delta_cache,
+            total_tokens=delta_input + delta_output,
+            complete=usage.complete,
+        )
 
     def _openai_system_prompt(
         self,
@@ -8496,6 +8620,8 @@ async def main() -> None:
     turn_pacer = provider_pacer_from_env()
     # One cooldown per provider account across all local agents.
     provider_cooldowns = ProviderCooldownRegistry(provider_cooldown_from_env)
+    provider_cooldown_from_env()  # validate the env before going live
+    socket_gap_threshold = socket_gap_threshold_from_env()
     agents = [
         SlackAgent(
             cfg,
@@ -8613,6 +8739,11 @@ async def main() -> None:
     await asyncio.gather(
         *[h.start_async() for h in handlers],
         *[a.patrol_loop() for a in patrol_agents],
+        watch_live_coverage(
+            handlers,
+            transcript_store,
+            threshold_seconds=socket_gap_threshold,
+        ),
     )
 
 

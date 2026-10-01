@@ -172,6 +172,7 @@ class TranscriptStore:
             "byte_evicted_threads": 0,
             "ingested": 0,
             "duplicates": 0,
+            "coverage_gaps": 0,
         }
         if self._state_store is not None:
             self._state_store.sweep_transcripts(
@@ -1522,6 +1523,24 @@ class TranscriptStore:
             thread_ts,
             authoritative_ts=current_ts,
         )
+
+    def mark_coverage_gap(self) -> int:
+        """Live delivery may have missed events: revalidate before trusting.
+
+        A Socket Mode gap longer than Slack's redelivery window (host sleep,
+        network loss) leaves holes that a "complete" thread would otherwise
+        serve forever. Rotating the boot id makes rows validated before the
+        gap reload as unvalidated, and every in-memory complete thread gets
+        one full revalidation on its next read. Returns the threads flagged.
+        """
+        self.boot_id = uuid.uuid4().hex
+        flagged = 0
+        for state in self._threads.values():
+            if state.complete and not state.needs_revalidate:
+                state.needs_revalidate = True
+                flagged += 1
+        self._counters["coverage_gaps"] += 1
+        return flagged
 
     def status_snapshot(self) -> dict[str, Any]:
         """Sanitized counters only: never channel IDs, users, or message text."""

@@ -192,6 +192,20 @@ CREATE TABLE IF NOT EXISTS worktree_mappings (
 )
 """
 
+# `codex exec resume` reports usage accumulated over the whole session; the
+# last cumulative counters per codex thread let a restart still bill only
+# the new turn's delta.
+_CODEX_USAGE_BASELINES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS codex_usage_baselines (
+    session_id    TEXT PRIMARY KEY,
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    cache_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    updated_at    REAL NOT NULL
+)
+"""
+CODEX_USAGE_BASELINE_TTL_SECONDS = 30 * 24 * 3600
+
 
 class StateStoreLockError(RuntimeError):
     """Raised when another live StateStore already owns the same DB path."""
@@ -261,6 +275,7 @@ class StateStore:
             conn.execute(_OWNER_QUOTA_RESERVATIONS_SCHEMA)
             conn.execute(_WORKTREE_MAPPINGS_SCHEMA)
             self._migrate_worktree_schema(conn)
+            conn.execute(_CODEX_USAGE_BASELINES_SCHEMA)
             conn.commit()
             self._conn = conn
             self._harden_file_perms()
@@ -1320,6 +1335,64 @@ class StateStore:
                 "state store write failed (%s)", sql.split()[0], exc_info=True
             )
             return -1
+
+    def load_codex_usage_baseline(
+        self, session_id: str
+    ) -> tuple[int, int, int] | None:
+        """Last cumulative ``(input, cache, output)`` of one codex thread."""
+        if self._conn is None or not session_id:
+            return None
+        try:
+            row = self._conn.execute(
+                """
+                SELECT input_tokens, cache_tokens, output_tokens
+                FROM codex_usage_baselines WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            logger.warning("codex usage baseline read failed", exc_info=True)
+            return None
+        if row is None:
+            return None
+        return int(row[0]), int(row[1]), int(row[2])
+
+    def save_codex_usage_baseline(
+        self,
+        session_id: str,
+        *,
+        input_tokens: int,
+        cache_tokens: int,
+        output_tokens: int,
+        now: float | None = None,
+    ) -> None:
+        if not session_id:
+            return
+        now = time.time() if now is None else now
+        self._exec(
+            """
+            INSERT INTO codex_usage_baselines (
+                session_id, input_tokens, cache_tokens, output_tokens,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                input_tokens = excluded.input_tokens,
+                cache_tokens = excluded.cache_tokens,
+                output_tokens = excluded.output_tokens,
+                updated_at = excluded.updated_at
+            """,
+            (
+                session_id,
+                int(input_tokens),
+                int(cache_tokens),
+                int(output_tokens),
+                now,
+            ),
+        )
+        self._exec(
+            "DELETE FROM codex_usage_baselines WHERE updated_at < ?",
+            (now - CODEX_USAGE_BASELINE_TTL_SECONDS,),
+        )
 
     def save_turn(
         self,

@@ -1748,10 +1748,11 @@ def test_parse_codex_events_full():
     parsed = parse_codex_events(CODEX_JSONL)
     assert parsed["thread_id"] == "019f8e52-fede-7b01"
     assert parsed["last_message"] == "最終回答"  # use last agent_message
-    assert parsed["input_tokens"] == 42640 + 20224
+    # cached_input_tokens is a subset of input_tokens, never added on top.
+    assert parsed["input_tokens"] == 42640
     assert parsed["output_tokens"] == 316
     assert parsed["cache_tokens"] == 20224
-    assert parsed["total_tokens"] == 42640 + 20224 + 316
+    assert parsed["total_tokens"] == 42640 + 316
     assert parsed["usage_complete"] is True
 
 
@@ -1826,3 +1827,12 @@ def test_tag_continuation_lines_tags_every_line():
         tag_continuation_lines("a\r\nb\rc", "[feed] ")
         == "a\n[feed] b\n[feed] c"
     )
+
+
+def test_codex_usage_delta():
+    from multi_core import codex_usage_delta
+
+    assert codex_usage_delta((100, 10, 5), None) == (100, 10, 5)
+    assert codex_usage_delta((250, 90, 9), (100, 10, 5)) == (150, 80, 4)
+    # A counter going backwards means a fresh/compacted session.
+    assert codex_usage_delta((40, 0, 2), (100, 10, 5)) == (40, 0, 2)
