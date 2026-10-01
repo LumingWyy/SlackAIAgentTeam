@@ -583,3 +583,96 @@ def test_absorbed_trigger_does_not_get_inbox_reaction(tmp_path, monkeypatch):
 
     asyncio.run(scenario())
     assert rec.reactions == []
+
+
+# ---------------------------------------------------------------------------
+# Activation ledger: restart reports cut-off work instead of hiding it
+# ---------------------------------------------------------------------------
+
+
+def test_activation_ledger_take_is_scoped_and_bounded(tmp_path):
+    from state_store import StateStore
+
+    store = StateStore(str(tmp_path / "ledger.db"))
+    for index in range(5):
+        store.record_activation(
+            "dev",
+            team_id="T1",
+            channel_id="C1",
+            trigger_ts=f"10{index}.0",
+            thread_ts="100.0",
+            now=1000.0 + index,
+        )
+    store.record_activation(
+        "dev", team_id="T1", channel_id="C1", trigger_ts="1.0", thread_ts="",
+        now=1.0,
+    )
+    store.record_activation(
+        "dev", team_id="T2", channel_id="C9", trigger_ts="9.0", thread_ts="",
+        now=1000.0,
+    )
+    store.record_activation(
+        "qa", team_id="T1", channel_id="C1", trigger_ts="8.0", thread_ts="",
+        now=1000.0,
+    )
+    store.clear_activation("dev", channel_id="C1", trigger_ts="104.0")
+    rows = store.take_interrupted_activations(
+        "dev", team_id="T1", max_age_seconds=3600, limit=3, now=1010.0
+    )
+    assert [row["trigger_ts"] for row in rows] == ["103.0", "102.0", "101.0"]
+    # Everything for (dev, T1) is consumed, including stale/excess rows.
+    assert store.take_interrupted_activations(
+        "dev", team_id="T1", max_age_seconds=3600, limit=10, now=1010.0
+    ) == []
+    assert len(
+        store.take_interrupted_activations(
+            "dev", team_id="T2", max_age_seconds=3600, limit=10, now=1010.0
+        )
+    ) == 1
+    store.close()
+
+
+def test_restart_reconciliation_reports_interrupted_activation(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from state_store import StateStore
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    store = StateStore(str(tmp_path / "ledger.db"))
+    agent._store = store
+    event = _event(ts="101.0")
+    plan = agent.build_execution_plan(event)
+    agent._ledger_record(event, plan)
+
+    reactions: list[dict] = []
+
+    async def fake_reaction(_client, channel, ts, add=None, remove=None):
+        reactions.append({"ts": ts, "add": add, "remove": remove})
+
+    agent._set_reaction = fake_reaction
+    client = _FakeClient(None)
+    agent.app = SimpleNamespace(client=client)
+    assert asyncio.run(agent.reconcile_interrupted_activations()) == 1
+    assert {"ts": "101.0", "add": "warning", "remove": "inbox_tray"} in reactions
+    assert client.calls[0]["thread_ts"] == "100.0"
+    assert "中断されました" in client.calls[0]["text"]
+    # Reported once only.
+    assert asyncio.run(agent.reconcile_interrupted_activations()) == 0
+    store.close()
+
+
+def test_finished_activation_leaves_no_ledger_row(tmp_path, monkeypatch):
+    from state_store import StateStore
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    store = StateStore(str(tmp_path / "ledger.db"))
+    agent._store = store
+    event = _event(ts="101.0")
+    agent._ledger_record(event, agent.build_execution_plan(event))
+    agent._ledger_clear(event)
+    assert store.take_interrupted_activations(
+        "dev", team_id="T_TEST", max_age_seconds=3600, limit=10
+    ) == []
+    store.close()

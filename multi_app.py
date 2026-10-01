@@ -147,6 +147,10 @@ EMPTY_REPLY_PLACEHOLDERS = frozenset(
 CODEX_USAGE_BASELINE_LIMIT = 4096
 # A provider cooldown wait at least this long is announced in the thread.
 COOLDOWN_NOTICE_SECONDS = 30.0
+# Restart reconciliation reports at most this many recent cut-off
+# activations per agent; older or excess rows are dropped silently.
+INTERRUPTED_ACTIVATION_MAX_AGE_SECONDS = 24 * 3600.0
+INTERRUPTED_ACTIVATION_NOTICE_LIMIT = 20
 
 
 def provider_cooldown_from_env() -> ProviderCooldown:
@@ -4027,10 +4031,12 @@ class SlackAgent:
         )
         self._tasks.add(task)
         self._register_pending_trigger(execution_plan.thread_key, event)
+        self._ledger_record(event, execution_plan)
 
         def _release(completed: asyncio.Task) -> None:
             self._tasks.discard(completed)
             self._forget_trigger(execution_plan.thread_key, event)
+            self._ledger_clear(event)
             self.runtime_limiter.release_admission(admission)
             # A task cancelled before its coroutine receives a first timeslice
             # never enters _activate(), so its ``finally`` cannot release the
@@ -4775,6 +4781,86 @@ class SlackAgent:
                     self.name,
                     exc_info=True,
                 )
+
+    def _ledger_record(self, event: dict, plan: ExecutionPlan) -> None:
+        """Note an admitted activation so a restart can report it as cut off."""
+        if self._store is None:
+            return
+        channel, ts = self._trigger_key(event)
+        try:
+            self._store.record_activation(
+                self.name,
+                team_id=self.team_id or "",
+                channel_id=channel,
+                trigger_ts=ts,
+                thread_ts=plan.root_thread_ts or "",
+            )
+        except Exception:
+            logger.warning(
+                "agent %s activation ledger write failed", self.name, exc_info=True
+            )
+
+    def _ledger_clear(self, event: dict) -> None:
+        if self._store is None:
+            return
+        channel, ts = self._trigger_key(event)
+        try:
+            self._store.clear_activation(
+                self.name, channel_id=channel, trigger_ts=ts
+            )
+        except Exception:
+            logger.warning(
+                "agent %s activation ledger clear failed", self.name, exc_info=True
+            )
+
+    async def reconcile_interrupted_activations(self) -> int:
+        """Report activations the previous process left unfinished.
+
+        Their ⏳/📥 would otherwise stay forever and the requester would never
+        learn the work stopped. They are not re-run: the cut-off turn may
+        already have pushed or commented, so a human decides.
+        """
+        if self._store is None or self.app is None:
+            return 0
+        rows = self._store.take_interrupted_activations(
+            self.name,
+            team_id=self.team_id or "",
+            max_age_seconds=INTERRUPTED_ACTIVATION_MAX_AGE_SECONDS,
+            limit=INTERRUPTED_ACTIVATION_NOTICE_LIMIT,
+        )
+        client = self.app.client
+        for row in rows:
+            channel, ts = row["channel_id"], row["trigger_ts"]
+            await self._set_reaction(
+                client, channel, ts, remove="hourglass_flowing_sand"
+            )
+            await self._set_reaction(
+                client, channel, ts, add="warning", remove="inbox_tray"
+            )
+            try:
+                await client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=row["thread_ts"] or ts,
+                    text=(
+                        f"⚠️ {self.name} の再起動により、この依頼の処理が"
+                        "中断されました。途中まで実行された操作がある"
+                        "可能性があります。状態を確認し、必要なら"
+                        "もう一度 @メンションしてください。"
+                    ),
+                )
+            except Exception:
+                logger.warning(
+                    "agent %s failed to report an interrupted activation",
+                    self.name,
+                    exc_info=True,
+                )
+        if rows:
+            logger.warning(
+                "agent %s reported %d activation(s) interrupted by restart",
+                self.name,
+                len(rows),
+            )
+        return len(rows)
 
     @staticmethod
     def _trigger_key(event: dict) -> tuple[str, str]:
@@ -8914,6 +9000,10 @@ async def main() -> None:
                     a.name,
                     restored,
                 )
+        # Before Socket Mode starts: every ledger row left now is from the
+        # previous process.
+        for a in agents:
+            await a.reconcile_interrupted_activations()
 
     for a in agents:
         logger.info(

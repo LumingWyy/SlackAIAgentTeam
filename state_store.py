@@ -206,6 +206,20 @@ CREATE TABLE IF NOT EXISTS codex_usage_baselines (
 """
 CODEX_USAGE_BASELINE_TTL_SECONDS = 30 * 24 * 3600
 
+# Admitted Slack activations that have not finished. A row left behind at
+# startup means the previous process stopped mid-activation.
+_ACTIVATION_LEDGER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS activation_ledger (
+    agent       TEXT NOT NULL,
+    team_id     TEXT NOT NULL DEFAULT '',
+    channel_id  TEXT NOT NULL,
+    trigger_ts  TEXT NOT NULL,
+    thread_ts   TEXT NOT NULL DEFAULT '',
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (agent, channel_id, trigger_ts)
+)
+"""
+
 
 class StateStoreLockError(RuntimeError):
     """Raised when another live StateStore already owns the same DB path."""
@@ -276,6 +290,7 @@ class StateStore:
             conn.execute(_WORKTREE_MAPPINGS_SCHEMA)
             self._migrate_worktree_schema(conn)
             conn.execute(_CODEX_USAGE_BASELINES_SCHEMA)
+            conn.execute(_ACTIVATION_LEDGER_SCHEMA)
             conn.commit()
             self._conn = conn
             self._harden_file_perms()
@@ -1335,6 +1350,89 @@ class StateStore:
                 "state store write failed (%s)", sql.split()[0], exc_info=True
             )
             return -1
+
+    def record_activation(
+        self,
+        agent: str,
+        *,
+        team_id: str,
+        channel_id: str,
+        trigger_ts: str,
+        thread_ts: str,
+        now: float | None = None,
+    ) -> None:
+        self._exec(
+            """
+            INSERT OR REPLACE INTO activation_ledger (
+                agent, team_id, channel_id, trigger_ts, thread_ts, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                agent,
+                team_id,
+                channel_id,
+                trigger_ts,
+                thread_ts,
+                time.time() if now is None else now,
+            ),
+        )
+
+    def clear_activation(
+        self, agent: str, *, channel_id: str, trigger_ts: str
+    ) -> None:
+        self._exec(
+            """
+            DELETE FROM activation_ledger
+            WHERE agent = ? AND channel_id = ? AND trigger_ts = ?
+            """,
+            (agent, channel_id, trigger_ts),
+        )
+
+    def take_interrupted_activations(
+        self,
+        agent: str,
+        *,
+        team_id: str,
+        max_age_seconds: float,
+        limit: int,
+        now: float | None = None,
+    ) -> list[dict[str, str]]:
+        """Remove this agent's leftover rows; return the recent ones, newest first.
+
+        Call once at startup, before any new activation is admitted: every
+        row still present belonged to the previous process.
+        """
+        if self._conn is None:
+            return []
+        now = time.time() if now is None else now
+        try:
+            rows = self._conn.execute(
+                """
+                SELECT channel_id, trigger_ts, thread_ts, created_at
+                FROM activation_ledger
+                WHERE agent = ? AND team_id = ?
+                ORDER BY created_at DESC
+                """,
+                (agent, team_id),
+            ).fetchall()
+            self._conn.execute(
+                "DELETE FROM activation_ledger WHERE agent = ? AND team_id = ?",
+                (agent, team_id),
+            )
+            self._conn.commit()
+        except sqlite3.Error:
+            logger.warning("activation ledger read failed", exc_info=True)
+            return []
+        recent = [
+            {
+                "channel_id": str(row[0]),
+                "trigger_ts": str(row[1]),
+                "thread_ts": str(row[2]),
+            }
+            for row in rows
+            if now - float(row[3]) <= max_age_seconds
+        ]
+        return recent[:limit]
 
     def load_codex_usage_baseline(
         self, session_id: str

@@ -267,6 +267,7 @@ Manifest includes **`agent_view`** (Agent messaging UX). Requires `slack-bolt>=1
 - Human-attached files on the triggering message are downloaded to `<workspace>/.slack-files/` (max 3 files, 10MB each; swept after 48h). Agents read them with local tools.
 - Status uses reactions on the trigger message (📥 queued behind a busy thread or full node → ⏳ while working → ✅ done / ❌ failed / 🤐 reply withdrawn by the freshness recheck); no "working…" placeholder post. A provider cooldown wait of 30s+ posts one notice with the expected resume time.
 - Failures get an actionable notice by category (context too long → `!reset`; auth / billing → node owner). Patrol stops after 3 consecutive failures of one category, posts one notice to its channel, probes every 6th round, and resumes on the first success (`/state`: `patrol_fence`, `last_failure`).
+- A restart no longer leaves ⏳ forever: admitted activations are recorded in the state DB (`activation_ledger`), and on startup each one the previous process left unfinished gets ⚠️ and a thread notice asking the requester to check and re-mention. It is never re-run automatically, because the cut-off turn may already have pushed or commented.
 - Triggers that queue in one thread (e.g. "@dev add X", then "@dev also Y" while it is busy) are answered together in one turn, with every trigger listed in order, instead of a second turn re-answering what the first already saw as context.
 - A registered agent written as plain-text `@name` notifies nobody; the post gets a one-line warning instead of a silently stalled handoff.
 
