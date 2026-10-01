@@ -707,6 +707,18 @@ async def _inspect_workspace(path: str) -> dict[str, Any]:
     }
 
 
+async def _repo_reachable(repo: str) -> bool | None:
+    """Whether the local gh account can see ``repo``; None when unknown."""
+    if not repo:
+        return None
+    rc, _out, _err = await _run(
+        ["gh", "repo", "view", repo, "--json", "nameWithOwner"], timeout=15
+    )
+    if rc == -1:  # gh missing or timed out
+        return None
+    return rc == 0
+
+
 async def h_update_workspace(request: web.Request) -> web.Response:
     """Check (``dry_run``) or save one agent's local workspace and GitHub repo.
 
@@ -753,12 +765,15 @@ async def h_update_workspace(request: web.Request) -> web.Response:
         effective = repo or inherited
     else:
         effective = str(entry.get("github_repo") or inherited)
-    facts = await _inspect_workspace(path)
+    facts, reachable = await asyncio.gather(
+        _inspect_workspace(path), _repo_reachable(effective)
+    )
     result: dict[str, Any] = {
         "ok": True,
         "path": path,
         **facts,
         "github_repo": effective,
+        "repo_reachable": reachable,
         "mismatch": bool(
             facts["origin_repo"]
             and effective
@@ -2621,11 +2636,15 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
 .foot{padding:44px 0 24px;color:var(--faint);font-family:var(--mono);font-size:.7rem;letter-spacing:.06em;text-align:center;
   text-transform:uppercase}
 /* local workspace row on each agent card */
-.wsrow{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
+.wsrow{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;margin-top:14px;padding:12px 14px;border-radius:var(--r-lg);
+  background:var(--bg);border:1px solid var(--line)}
+.wsrow .btn{margin-left:auto}
+.state.warn{color:var(--warn);background:oklch(0.7 0.14 72 / 0.12)}.state.warn::before{background:var(--warn)}
 .wspath{font-family:var(--mono);font-size:.8rem;color:var(--ink);overflow-wrap:anywhere}
 .wspath .faint{color:var(--faint)}
 .wsedit{margin-top:12px;padding:16px;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--bg)}
 .wsedit[hidden]{display:none}
+.ctl .wsedit{grid-column:1/-1;margin-top:0}
 .wsedit.open{animation:rise .35s var(--out) both}
 .wsinfo{display:flex;align-items:center;gap:6px 10px;flex-wrap:wrap;font-family:var(--mono);font-size:.74rem;color:var(--muted);margin-top:12px}
 .wsinfo:empty{display:none}
@@ -2936,13 +2955,15 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
               <span data-i18n="guide.done">标记完成</span></label>
           </div>
           <p class="body" data-i18n="guide.local.body">登录本人 Claude/Codex/GitHub，OpenAI Key 只放本机 env；创建独立 workspace、state 和 worktree volume。绝不挂载另一位 owner 的认证目录。</p>
+          <p class="body" data-i18n="guide.local.ws">workspace 是 agent 读写代码的本机目录，必须是目标 GitHub 仓库的 clone（origin 指向 agent 的 OWNER/REPO）。</p>
           <div class="guide-evidence">
             <div><h3 data-i18n="guide.evidence">完成证据</h3>
               <ul><li><span data-i18n="guide.local.ev1">「认证」显示所选 runtime 与 GitHub 已验证</span></li>
                 <li><span data-i18n="guide.local.ev2">本机 env 只含本人 Slack Token、控制 Bearer 和 AI Key</span></li>
-                <li><span data-i18n="guide.local.ev3">仓库 origin 与 agent 的 canonical OWNER/REPO 一致</span></li></ul></div>
-            <div class="guide-actions"><button class="btn solid" onclick="showTab('auth')" data-i18n="guide.goto.auth">去认证</button>
-              <button class="btn line" onclick="showTab('cfg')" data-i18n="guide.goto.cfg">去团队构成</button></div>
+                <li><span data-i18n="guide.local.ev3">仓库 origin 与 agent 的 canonical OWNER/REPO 一致</span></li>
+                <li><span data-i18n="guide.local.ev4">每张 agent 卡片的 workspace 显示「就绪」</span></li></ul></div>
+            <div class="guide-actions"><button class="btn solid" onclick="openWorkspaceSettings()" data-i18n="guide.goto.ws">去设置 workspace</button>
+              <button class="btn line" onclick="showTab('auth')" data-i18n="guide.goto.auth">去认证</button></div>
           </div>
         </div>
       </li>
@@ -3047,13 +3068,6 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
   <section id="panel-cfg" class="panel">
     <div class="lede"><h1 data-i18n="cfg.title">チーム構成</h1>
       <div class="sub" data-i18n="cfg.sub">agents.yaml と .env の編集。保存すると稼働中の multi_app に自動反映されます（agent の追加/削除は再起動が必要）。</div></div>
-    <div class="card">
-      <div class="head"><span class="nm" data-i18n="rules.title">共通チャンネルのルール（テンプレート）</span>
-        <span style="flex:1"></span>
-        <button class="btn text copy-btn" id="rules-copy" onclick="copyRules()"><span class="ic-wrap" aria-hidden="true"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><span data-i18n="rules.copy">コピー</span></button></div>
-      <div class="sub" data-i18n="rules.sub" style="margin:6px 0 10px">Slack 共通チャンネルの topic/説明に貼ると、各 agent がこのルールに従います。</div>
-      <pre id="rules-pre" style="max-height:320px">…</pre>
-    </div>
     <div id="agents"></div>
     <div class="card">
       <div class="head"><span class="nm" data-i18n="cfg.newagent">新しい agent</span></div>
@@ -3075,6 +3089,13 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
       <textarea id="new-persona" rows="3" placeholder="…"></textarea>
       <div style="margin-top:16px"><button class="btn solid" onclick="addAgent()" data-i18n="cfg.save">保存</button>
       <span class="msg" id="new-msg"></span></div>
+    </div>
+    <div class="card">
+      <div class="head"><span class="nm" data-i18n="rules.title">共通チャンネルのルール（テンプレート）</span>
+        <span style="flex:1"></span>
+        <button class="btn text copy-btn" id="rules-copy" onclick="copyRules()"><span class="ic-wrap" aria-hidden="true"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><span data-i18n="rules.copy">コピー</span></button></div>
+      <div class="sub" data-i18n="rules.sub" style="margin:6px 0 10px">Slack 共通チャンネルの topic/説明に貼ると、各 agent がこのルールに従います。</div>
+      <pre id="rules-pre" style="max-height:320px">…</pre>
     </div>
   </section>
 
@@ -3275,7 +3296,7 @@ const I18N={
    'cfg.save':'保存','cfg.setup':'设置','cfg.retoken':'重设 token','cfg.required':'必需','cfg.optional':'可选',
    'wz.s1':'1. 点「用此 manifest 在 Slack 创建」（或打开 api.slack.com/apps →「From a manifest」贴入下方）→ 选择 workspace → Create → Install to Workspace',
    'wz.copy':'复制 manifest','wz.create':'用此 manifest 在 Slack 创建','wz.s2':'2. 粘贴 Bot Token (xoxb-) 与 App-Level Token (xapp-, connections:write)：',
-   'wz.save':'验证并写入 .env','tok.copied':'manifest 已复制','saved':'✓ 已保存','savefail':'保存失败','unlock.title':'需要控制令牌','unlock.hint':'这个节点启用了控制认证。输入 .env 里为你（owner）配置的控制 Bearer 令牌；只保存在本标签页的会话里。','unlock.save':'解锁','unlock.bad':'令牌不正确，请重新输入。','ws.title':'本地 workspace','ws.edit':'修改','ws.path':'目录（绝对路径或 ~/…）','ws.repo':'GitHub 仓库（OWNER/REPO，留空沿用默认）','ws.check':'检查','ws.unset':'未设置（使用 CLAUDE_WORKSPACE 或启动目录）','ws.nogit':'不是 git 仓库，GitHub 协作不可用','ws.branch':'分支','ws.mismatch':'origin 与 GitHub 仓库不一致，GitHub 协作会被禁用','ws.useorigin':'改用 {r}','cfg.editpersona':'编辑内容','cfg.restarthint':'重启 multi_app 生效','cfg.worktreerootrestart':'worktree root 仅在重启后生效；重启前请先用旧 root clean remove 仍存活的映射',
+   'wz.save':'验证并写入 .env','tok.copied':'manifest 已复制','saved':'✓ 已保存','savefail':'保存失败','unlock.title':'需要控制令牌','unlock.hint':'这个节点启用了控制认证。输入 .env 里为你（owner）配置的控制 Bearer 令牌；只保存在本标签页的会话里。','unlock.save':'解锁','unlock.bad':'令牌不正确，请重新输入。','ws.title':'本地 workspace','ws.edit':'修改','ws.path':'目录（绝对路径或 ~/…）','ws.repo':'GitHub 仓库（OWNER/REPO，留空沿用默认）','ws.check':'检查','ws.unset':'未设置（使用 CLAUDE_WORKSPACE 或启动目录）','ws.nogit':'不是 git 仓库，GitHub 协作不可用','ws.branch':'分支','ws.mismatch':'origin 与 GitHub 仓库不一致，GitHub 协作会被禁用','ws.useorigin':'改用 {r}','ws.setup':'设置 workspace','ws.ok':'就绪','ws.missing':'目录不存在','ws.unsetshort':'未设置','ws.nogitshort':'不是 git 仓库','ws.mismatchshort':'origin 不一致','ws.badreposhort':'GitHub 仓库不可用','ws.badrepo':'GitHub 上找不到 {r}，或当前 gh 账号无权访问；GitHub 协作会被禁用','ws.checking':'检查中…','guide.local.ws':'workspace 是 agent 读写代码的本机目录，必须是目标 GitHub 仓库的 clone（origin 指向 agent 的 OWNER/REPO）。在「团队构成」每张 agent 卡片里设置；打开时会自动检查目录、git、origin 和仓库能否访问。','guide.local.ev4':'每张 agent 卡片的 workspace 显示「就绪」','guide.goto.ws':'去设置 workspace','ws.ghoff':'{r} 的 GitHub 协作已禁用','cfg.editpersona':'编辑内容','cfg.restarthint':'重启 multi_app 生效','cfg.worktreerootrestart':'worktree root 仅在重启后生效；重启前请先用旧 root clean remove 仍存活的映射',
       'nav.auth':'认证','auth.title':'认证','auth.sub':'智能体实际运行环境（优先 Docker 容器，否则本机）的登录凭据。',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
    'auth.signin':'开始登录','auth.openurl':'打开下方链接完成授权，再把页面给出的 code 粘贴回来。',
@@ -3344,7 +3365,7 @@ const I18N={
    'cfg.save':'保存','cfg.setup':'セットアップ','cfg.retoken':'token 再設定','cfg.required':'必須','cfg.optional':'任意',
    'wz.s1':'1.「この manifest で Slack に作成」を押す（または api.slack.com/apps →「From a manifest」に下記を貼付）→ workspace を選択 → Create → Install to Workspace',
    'wz.copy':'manifest をコピー','wz.create':'この manifest で Slack に作成','wz.s2':'2. Bot Token (xoxb-) と App-Level Token (xapp-, connections:write) を貼付:',
-   'wz.save':'検証して .env に保存','tok.copied':'manifest コピー','saved':'✓ 保存','savefail':'保存に失敗しました','unlock.title':'コントロールトークンが必要です','unlock.hint':'このノードはコントロール認証が有効です。.env に自分（owner）用に設定したコントロール Bearer トークンを入力してください。このタブのセッションにだけ保存されます。','unlock.save':'ロック解除','unlock.bad':'トークンが正しくありません。もう一度入力してください。','ws.title':'ローカル workspace','ws.edit':'変更','ws.path':'ディレクトリ（絶対パスまたは ~/…）','ws.repo':'GitHub リポジトリ（OWNER/REPO、空欄なら既定を使用）','ws.check':'確認','ws.unset':'未設定（CLAUDE_WORKSPACE または起動ディレクトリ）','ws.nogit':'git リポジトリではないため GitHub 連携は使えません','ws.branch':'ブランチ','ws.mismatch':'origin と GitHub リポジトリが一致しないため GitHub 連携は無効になります','ws.useorigin':'{r} を使う','cfg.editpersona':'内容を編集','cfg.restarthint':'multi_app 再起動で反映','cfg.worktreerootrestart':'worktree root は再起動時だけ反映されます。稼働中の mapping は先に旧 root 設定で clean remove してください',
+   'wz.save':'検証して .env に保存','tok.copied':'manifest コピー','saved':'✓ 保存','savefail':'保存に失敗しました','unlock.title':'コントロールトークンが必要です','unlock.hint':'このノードはコントロール認証が有効です。.env に自分（owner）用に設定したコントロール Bearer トークンを入力してください。このタブのセッションにだけ保存されます。','unlock.save':'ロック解除','unlock.bad':'トークンが正しくありません。もう一度入力してください。','ws.title':'ローカル workspace','ws.edit':'変更','ws.path':'ディレクトリ（絶対パスまたは ~/…）','ws.repo':'GitHub リポジトリ（OWNER/REPO、空欄なら既定を使用）','ws.check':'確認','ws.unset':'未設定（CLAUDE_WORKSPACE または起動ディレクトリ）','ws.nogit':'git リポジトリではないため GitHub 連携は使えません','ws.branch':'ブランチ','ws.mismatch':'origin と GitHub リポジトリが一致しないため GitHub 連携は無効になります','ws.useorigin':'{r} を使う','ws.setup':'workspace を設定','ws.ok':'準備完了','ws.missing':'ディレクトリなし','ws.unsetshort':'未設定','ws.nogitshort':'git リポジトリではない','ws.mismatchshort':'origin 不一致','ws.badreposhort':'GitHub リポジトリ不可','ws.badrepo':'GitHub に {r} が見つからないか、現在の gh アカウントに権限がありません。GitHub 連携は無効になります','ws.checking':'確認中…','guide.local.ws':'workspace は agent がコードを読み書きするローカルディレクトリで、対象 GitHub リポジトリの clone（origin が agent の OWNER/REPO）である必要があります。「チーム構成」の各 agent カードで設定し、開くとディレクトリ・git・origin・リポジトリへのアクセスを自動で確認します。','guide.local.ev4':'各 agent カードの workspace が「準備完了」','guide.goto.ws':'workspace を設定','ws.ghoff':'{r} の GitHub 連携は無効','cfg.editpersona':'内容を編集','cfg.restarthint':'multi_app 再起動で反映','cfg.worktreerootrestart':'worktree root は再起動時だけ反映されます。稼働中の mapping は先に旧 root 設定で clean remove してください',
       'nav.auth':'認証','auth.title':'認証','auth.sub':'エージェントが実際に動く環境（優先：Docker コンテナ／なければこのホスト）のログイン情報です。',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
    'auth.signin':'ログイン開始','auth.openurl':'下のリンクで承認し、表示された code を貼り付けてください。',
@@ -3413,7 +3434,7 @@ const I18N={
    'cfg.save':'Save','cfg.setup':'Set up','cfg.retoken':'Reset tokens','cfg.required':'required','cfg.optional':'optional',
    'wz.s1':'1. Click "Create in Slack from this manifest" (or open api.slack.com/apps → "From a manifest" and paste below) → pick the workspace → Create → Install to Workspace',
    'wz.copy':'Copy manifest','wz.create':'Create in Slack from this manifest','wz.s2':'2. Paste Bot Token (xoxb-) and App-Level Token (xapp-, connections:write):',
-   'wz.save':'Verify & save to .env','tok.copied':'manifest copied','saved':'✓ Saved','savefail':'save failed','unlock.title':'Control token required','unlock.hint':'This node requires control authentication. Enter the control bearer token configured for you (the owner) in .env; it is kept in this tab session only.','unlock.save':'Unlock','unlock.bad':'That token was rejected. Try again.','ws.title':'Local workspace','ws.edit':'Change','ws.path':'Directory (absolute path or ~/…)','ws.repo':'GitHub repo (OWNER/REPO; empty inherits the default)','ws.check':'Check','ws.unset':'not set (falls back to CLAUDE_WORKSPACE or the launch directory)','ws.nogit':'not a git repo; GitHub collaboration is unavailable','ws.branch':'branch','ws.mismatch':'origin differs from the GitHub repo; GitHub collaboration will be disabled','ws.useorigin':'Use {r}','cfg.editpersona':'Edit content','cfg.restarthint':'restart multi_app to apply','cfg.worktreerootrestart':'worktree root applies only after restart; clean-remove live mappings with the old root first',
+   'wz.save':'Verify & save to .env','tok.copied':'manifest copied','saved':'✓ Saved','savefail':'save failed','unlock.title':'Control token required','unlock.hint':'This node requires control authentication. Enter the control bearer token configured for you (the owner) in .env; it is kept in this tab session only.','unlock.save':'Unlock','unlock.bad':'That token was rejected. Try again.','ws.title':'Local workspace','ws.edit':'Change','ws.path':'Directory (absolute path or ~/…)','ws.repo':'GitHub repo (OWNER/REPO; empty inherits the default)','ws.check':'Check','ws.unset':'not set (falls back to CLAUDE_WORKSPACE or the launch directory)','ws.nogit':'not a git repo; GitHub collaboration is unavailable','ws.branch':'branch','ws.mismatch':'origin differs from the GitHub repo; GitHub collaboration will be disabled','ws.useorigin':'Use {r}','ws.setup':'Set workspace','ws.ok':'ready','ws.missing':'directory missing','ws.unsetshort':'not set','ws.nogitshort':'not a git repo','ws.mismatchshort':'origin mismatch','ws.badreposhort':'repo unreachable','ws.badrepo':'{r} was not found on GitHub, or the current gh account cannot access it; GitHub collaboration will be disabled','ws.checking':'checking…','guide.local.ws':'The workspace is the local directory where an agent reads and writes code. It must be a clone of the target GitHub repository (origin points at the agent OWNER/REPO). Set it on each agent card under Setup; opening it checks the directory, git, origin, and repo access automatically.','guide.local.ev4':'Every agent card shows its workspace as ready','guide.goto.ws':'Set up workspaces','ws.ghoff':'GitHub disabled for {r}','cfg.editpersona':'Edit content','cfg.restarthint':'restart multi_app to apply','cfg.worktreerootrestart':'worktree root applies only after restart; clean-remove live mappings with the old root first',
       'nav.auth':'Auth','auth.title':'Authentication','auth.sub':'Sign-in for the runtime agents actually use (Docker when up, otherwise this host).',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
    'auth.signin':'Start sign-in','auth.openurl':'Open the link below to authorize, then paste the code it shows.',
@@ -3990,6 +4011,14 @@ async function loadLive(){
         <div class="field">
           <select data-action="reply-language">${langOpts(a.reply_language||'')}</select>
         </div><span></span>
+        <span class="lbl">${t('ws.title')}</span>
+        <div class="field">
+          <span class="wspath">${a.workspace?esc(a.workspace):`<span class="faint">${t('ws.unset')}</span>`}</span>
+          ${a.github_repo?`<span class="chip">${esc(a.github_repo)}</span>`
+            :(a.configured_github_repo?`<span class="state ws-state warn">${t('ws.ghoff',{r:esc(a.configured_github_repo)})}</span>`:'')}
+        </div>
+        <button class="btn line" data-action="edit-workspace">${t('ws.setup')}</button>
+        ${workspaceEditor(a.workspace,'',a.github_repo||a.configured_github_repo)}
         <div class="arm-slot">${armBar('agent:'+a.name)}</div>
         <div class="confirm ${pend!==undefined?'on':''}">
           <span class="q">${esc(t('confirm.q',{n:a.name,m:pend!==undefined?(pend||t('def.plain')):''}))}</span>
@@ -4042,6 +4071,14 @@ async function loadCfg(){loadRules();const st=await j('/api/state');
         ${a.runtime==='openai'?` · api <span class="${a.openai_api_key_set||a.openai_base_url?'ok':'ng'}">${a.openai_api_key_set||a.openai_base_url?'✓':'—'}</span>${a.openai_base_url?` · proxy <span class="ok" title="${esc(a.openai_base_url)}">✓</span>`:''}`:''}</span>
       <span class="aux" style="margin-left:auto"><button class="btn line" data-action="setup">${a.bot_set&&a.app_set?t('cfg.retoken'):t('cfg.setup')}</button></span>
     </div>
+    <div class="wsrow">
+      <span class="lbl">${t('ws.title')}</span>
+      <span class="wspath">${a.workspace?esc(a.workspace):`<span class="faint">${t('ws.unset')}</span>`}</span>
+      ${a.github_repo?`<span class="chip">${esc(a.github_repo)}</span>`:''}
+      <span class="state ws-state">${a.workspace?t('ws.checking'):t('ws.unsetshort')}</span>
+      <button class="btn line" data-action="edit-workspace">${t('ws.setup')}</button>
+    </div>
+    ${workspaceEditor(a.workspace,a.github_repo_explicit,a.github_repo)}
     <div class="persona">
       <div>${cardPreview(a)}</div>
       <button class="btn text" style="padding-left:0" data-action="edit-persona">✎ ${t('cfg.editpersona')}</button>
@@ -4055,26 +4092,6 @@ async function loadCfg(){loadRules();const st=await j('/api/state');
         <div style="margin-top:8px"><button class="btn solid" data-action="save-persona">${t('cfg.save')}</button>
         <span class="msg persona-msg"></span></div>
       </div>
-    </div>
-    <div class="wsrow">
-      <span class="lbl">${t('ws.title')}</span>
-      <span class="wspath">${a.workspace?esc(a.workspace):`<span class="faint">${t('ws.unset')}</span>`}</span>
-      ${a.github_repo?`<span class="chip">${esc(a.github_repo)}</span>`:''}
-      <button class="btn text" data-action="edit-workspace">✎ ${t('ws.edit')}</button>
-    </div>
-    <div class="wsedit" hidden>
-      <div class="grid2">
-        <div><span class="lbl">${t('ws.path')}</span>
-          <input class="ws-input" value="${esc(a.workspace||'')}" placeholder="~/workspace/my-repo" spellcheck="false" autocomplete="off"></div>
-        <div><span class="lbl">${t('ws.repo')}</span>
-          <input class="repo-input" value="${esc(a.github_repo_explicit||'')}" placeholder="${esc(a.github_repo||'OWNER/REPO')}" spellcheck="false" autocomplete="off"></div>
-      </div>
-      <div class="wsinfo"></div>
-      <div class="rowbtns" style="margin-top:12px">
-        <button class="btn line" data-action="check-workspace">${t('ws.check')}</button>
-        <button class="btn solid" data-action="save-workspace">${t('cfg.save')}</button>
-      </div>
-      <span class="msg ws-msg"></span>
     </div>
     <div class="wiz">
       <p>${t('wz.s1')}</p>
@@ -4094,13 +4111,80 @@ async function loadCfg(){loadRules();const st=await j('/api/state');
     const el=card.querySelector('.card-input');
     if(el)watchCard(el,card.querySelector('.cardlong'));
   });
+  await checkAllWorkspaces(st.agents);
 }
 function editP(card){const e=card.querySelector('.pedit');e.style.display=e.style.display==='none'?'block':'none';}
-function editWorkspace(card){const e=card.querySelector('.wsedit');e.hidden=!e.hidden;e.classList.toggle('open',!e.hidden);
-  if(!e.hidden)card.querySelector('.ws-input').focus();}
+function workspaceEditor(workspace,explicitRepo,effectiveRepo){
+  return `<div class="wsedit" hidden>
+      <div class="grid2">
+        <div><span class="lbl">${t('ws.path')}</span>
+          <input class="ws-input" value="${esc(workspace||'')}" placeholder="~/workspace/my-repo" spellcheck="false" autocomplete="off"></div>
+        <div><span class="lbl">${t('ws.repo')}</span>
+          <input class="repo-input" value="${esc(explicitRepo||'')}" placeholder="${esc(effectiveRepo||'OWNER/REPO')}" spellcheck="false" autocomplete="off"></div>
+      </div>
+      <div class="wsinfo"></div>
+      <div class="rowbtns" style="margin-top:12px">
+        <button class="btn line" data-action="check-workspace">${t('ws.check')}</button>
+        <button class="btn solid" data-action="save-workspace">${t('cfg.save')}</button>
+      </div>
+      <span class="msg ws-msg"></span>
+    </div>`;
+}
+// open monitor editors pause the 5s re-render, which would wipe typed input
+const WS_EDITING=new Set();
+async function editWorkspace(card){
+  const e=card.querySelector('.wsedit');e.hidden=!e.hidden;e.classList.toggle('open',!e.hidden);
+  const n=card.dataset.agent, live=card.classList.contains('node');
+  if(live){if(e.hidden)WS_EDITING.delete(n);else WS_EDITING.add(n);}
+  if(e.hidden)return;
+  if(live&&!card.dataset.wsLoaded){
+    // the live view knows the resolved path; edit the configured values instead
+    try{const st=await j('/api/state'), a=(st.agents||[]).find(x=>x.name===n);
+      if(a){card.querySelector('.ws-input').value=a.workspace||'';
+        const repo=card.querySelector('.repo-input');repo.value=a.github_repo_explicit||'';
+        repo.placeholder=a.github_repo||'OWNER/REPO';card.dataset.wsLoaded='1';}}catch(err){}
+  }
+  card.querySelector('.ws-input').focus();
+  checkWorkspace(n,card);
+}
 function workspaceBody(card,dryRun){
   return JSON.stringify({workspace:card.querySelector('.ws-input').value,
     github_repo:card.querySelector('.repo-input').value,dry_run:!!dryRun});
+}
+let WS_FOCUS=false;
+function openWorkspaceSettings(){WS_FOCUS=true;showTab('cfg');}
+function workspaceVerdict(r){
+  if(!r||!r.ok)return ['off',t('ws.missing')];
+  if(!r.git)return ['warn',t('ws.nogitshort')];
+  if(r.mismatch)return ['warn',t('ws.mismatchshort')];
+  if(r.repo_reachable===false)return ['warn',t('ws.badreposhort')];
+  return ['idle',t('ws.ok')];
+}
+// every card's workspace is checked on load; a broken one on a live agent
+// opens its editor, so "GitHub disabled" never hides behind a quiet row
+async function checkAllWorkspaces(agents){
+  const cards=[...document.querySelectorAll('#agents .card')];
+  const results=await Promise.all(cards.map(async card=>{
+    const a=(agents||[]).find(x=>x.name===card.dataset.agent)||{};
+    if(!a.workspace)return [card,a,null];
+    try{return [card,a,await j('/api/agents/'+encodeURIComponent(a.name)+'/workspace',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:workspaceBody(card,true)})];}
+    catch(e){return [card,a,null];}
+  }));
+  let focus=null;
+  for(const [card,a,r] of results){
+    const badge=card.querySelector('.ws-state');
+    if(!r){if(a.workspace&&badge){badge.className='state ws-state off';badge.textContent=t('ws.missing');}
+      if(!focus&&a.bot_set&&a.app_set)focus=card;continue;}
+    const [cls,label]=workspaceVerdict(r);
+    if(badge){badge.className='state ws-state '+cls;badge.textContent=label;}
+    if(cls!=='idle'){renderWorkspaceFacts(card,r);
+      if(a.bot_set&&a.app_set){const e=card.querySelector('.wsedit');e.hidden=false;if(!focus)focus=card;}}
+  }
+  if(WS_FOCUS){WS_FOCUS=false;const card=focus||cards[0];
+    if(card){const e=card.querySelector('.wsedit');e.hidden=false;e.classList.add('open');
+      card.scrollIntoView({block:'start',behavior:reducedMotion()?'auto':'smooth'});
+      card.querySelector('.ws-input').focus({preventScroll:true});}}
 }
 function renderWorkspaceFacts(card,r){
   const info=card.querySelector('.wsinfo');
@@ -4111,6 +4195,7 @@ function renderWorkspaceFacts(card,r){
     if(r.branch)parts.push(`${t('ws.branch')} ${esc(r.branch)}`);
     if(r.origin_repo)parts.push(`origin ${esc(r.origin_repo)}`);
   }
+  if(r.repo_reachable===false&&r.github_repo)parts.push(`<span class="ng">${t('ws.badrepo',{r:esc(r.github_repo)})}</span>`);
   if(r.mismatch){
     parts.push(`<span class="warn">${t('ws.mismatch')}</span>`);
     parts.push(`<button class="btn text" data-action="use-origin" data-repo="${esc(r.origin_repo)}">${t('ws.useorigin',{r:esc(r.origin_repo)})}</button>`);
@@ -4118,6 +4203,7 @@ function renderWorkspaceFacts(card,r){
   info.innerHTML=parts.join(' · ');
 }
 async function checkWorkspace(n,card){
+  const info=card.querySelector('.wsinfo');info.textContent=t('ws.checking');
   const r=await j('/api/agents/'+encodeURIComponent(n)+'/workspace',{method:'POST',
     headers:{'Content-Type':'application/json'},body:workspaceBody(card,true)});
   renderWorkspaceFacts(card,r);
@@ -4126,8 +4212,11 @@ async function saveWorkspace(n,card){const m=card.querySelector('.ws-msg');m.tex
   const r=await j('/api/agents/'+encodeURIComponent(n)+'/workspace',{method:'POST',
     headers:{'Content-Type':'application/json'},body:workspaceBody(card,false)});
   renderWorkspaceFacts(card,r);
+  const badge=card.querySelector('.ws-state');
+  if(badge&&r.ok){const [cls,label]=workspaceVerdict(r);badge.className='state ws-state '+cls;badge.textContent=label;}
   if(r.ok){m.className='msg '+(savedLiveOk(r,n)?'ok':'ng');m.textContent=savedMsg(r,n);
-    setTimeout(loadCfg,1200);}
+    WS_EDITING.delete(n);
+    setTimeout(()=>{if($('#panel-mon').classList.contains('on'))loadLive();else loadCfg();},1200);}
   else{m.className='msg ng';m.textContent='✕ '+(r.error||t('savefail'));}}
 function savedMsg(r,n){const rl=r.reload||{};
   const ar=((rl.agents||{})[n]||{});
@@ -4418,7 +4507,7 @@ async function ghImport(){
 
 (async()=>{applyI18n();let seen=false;try{seen=localStorage.getItem(GUIDE_SEEN_KEY)==='1'}catch(e){}
   showTab(seen?'mon':'guide');
-  setInterval(()=>{if($('#auto').checked&&$('#panel-mon').classList.contains('on')&&!Object.keys(PENDING).length)loadLive();},5000);})();
+  setInterval(()=>{if($('#auto').checked&&$('#panel-mon').classList.contains('on')&&!Object.keys(PENDING).length&&!WS_EDITING.size)loadLive();},5000);})();
 </script></body></html>
 """
 

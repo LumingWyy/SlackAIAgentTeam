@@ -1726,6 +1726,13 @@ def _workspace_app(tmp_path, monkeypatch, yaml_text):
         return {"ok": False, "error": "offline"}
 
     monkeypatch.setattr(webui, "_admin_reload", _fake_reload)
+    reachable = {"acme/gone"}
+
+    async def _fake_reachable(repo):
+        # no network in tests: "acme/gone" stands for a deleted repository
+        return None if not repo else repo not in reachable
+
+    monkeypatch.setattr(webui, "_repo_reachable", _fake_reachable)
     return target
 
 
@@ -1858,3 +1865,31 @@ def test_guide_links_straight_to_slack_apps_and_the_setup_skill():
     for key in ("guide.open.slack", "guide.slack.do5", "wz.create"):
         assert script.count(f"'{key}':") >= 3, key
     assert "/slack-app-setup" in script
+
+
+def test_workspace_check_flags_a_repo_github_cannot_find(tmp_path, monkeypatch):
+    _workspace_app(
+        tmp_path, monkeypatch,
+        "github:\n  repo: acme/gone\nagents:\n- name: a\n  persona: p\n",
+    )
+    repo = _git_repo(tmp_path / "gone", "https://github.com/acme/gone.git")
+    data = _post_workspace({"workspace": str(repo), "dry_run": True})
+    assert data["ok"] is True and data["mismatch"] is False
+    assert data["repo_reachable"] is False
+    data = _post_workspace(
+        {"workspace": str(repo), "github_repo": "acme/widgets", "dry_run": True}
+    )
+    assert data["repo_reachable"] is True
+
+
+def test_monitor_cards_can_set_the_workspace_without_losing_input():
+    script = _main_script(webui.INDEX_HTML)
+    roster = script[script.index("$('#roster').innerHTML=ags.map"):script.index("function stageModel")]
+    assert 'data-action="edit-workspace"' in roster
+    assert "workspaceEditor(a.workspace" in roster
+    assert "configured_github_repo" in roster
+    # an open editor pauses the 5s re-render
+    assert "!WS_EDITING.size)loadLive();" in script
+    for key in ("ws.setup", "ws.ok", "ws.badrepo", "ws.ghoff", "guide.local.ws", "guide.goto.ws"):
+        assert script.count(f"'{key}':") >= 3, key
+    assert "function openWorkspaceSettings()" in script
