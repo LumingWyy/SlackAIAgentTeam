@@ -1672,6 +1672,30 @@ def build_activation_prompt(
     )
 
 
+def slack_ts_sort_key(ts: str) -> tuple[int, object]:
+    """Exact ordering key for Slack ``ts`` strings (Decimal, not float)."""
+    try:
+        return (0, Decimal(str(ts)))
+    except (InvalidOperation, ValueError):
+        return (1, str(ts))
+
+
+def build_batched_instruction(items: list[tuple[str, str]]) -> str:
+    """One instruction for several triggers that queued in one thread.
+
+    ``items`` are ``(sender_name, instruction)`` pairs, oldest first. Answering
+    them in one turn avoids a second turn that would re-answer what the first
+    already saw in its context.
+    """
+    lines = [
+        "このスレッドに次の依頼がまとめて届いている（古い順）。"
+        "すべてを踏まえて、1回の返信で対応する:"
+    ]
+    for index, (sender, text) in enumerate(items, 1):
+        lines.append(f"{index}. [{sender}] {text}")
+    return "\n".join(lines)
+
+
 def format_channel_guidance(
     topic: str | None,
     purpose: str | None,

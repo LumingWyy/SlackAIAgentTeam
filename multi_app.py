@@ -64,6 +64,7 @@ from multi_core import (
     TurnBudget,
     TurnSignals,
     build_activation_prompt,
+    build_batched_instruction,
     build_freshness_recheck_prompt,
     canonical_github_repo,
     classify_runtime_failure,
@@ -107,6 +108,7 @@ from multi_core import (
     scrub_slack_token_env,
     select_freshness_messages,
     should_activate,
+    slack_ts_sort_key,
     split_markdown,
     split_message,
     strip_leading_mention,
@@ -2796,6 +2798,10 @@ class SlackAgent:
         self._last_failure: dict[str, Any] | None = None
         # (channel, trigger ts) currently showing the 📥 queued reaction.
         self._inbox_marked: set[tuple[str, str]] = set()
+        # thread_key → admitted triggers not yet claimed by a turn, and the
+        # (channel, ts) of triggers a batched turn already answered.
+        self._pending_triggers: dict[str, list[dict]] = {}
+        self._absorbed_triggers: set[tuple[str, str]] = set()
         # codex thread id → last cumulative (input, cache, output) counters.
         self._codex_usage_baselines: dict[str, tuple[int, int, int]] = {}
         # AI-provider back-off per provider account; armed on rate-limited
@@ -4020,9 +4026,11 @@ class SlackAgent:
             thread_key,
         )
         self._tasks.add(task)
+        self._register_pending_trigger(execution_plan.thread_key, event)
 
         def _release(completed: asyncio.Task) -> None:
             self._tasks.discard(completed)
+            self._forget_trigger(execution_plan.thread_key, event)
             self.runtime_limiter.release_admission(admission)
             # A task cancelled before its coroutine receives a first timeslice
             # never enters _activate(), so its ``finally`` cannot release the
@@ -4768,6 +4776,41 @@ class SlackAgent:
                     exc_info=True,
                 )
 
+    @staticmethod
+    def _trigger_key(event: dict) -> tuple[str, str]:
+        return (str(event.get("channel") or ""), str(event.get("ts") or ""))
+
+    def _register_pending_trigger(self, thread_key: str, event: dict) -> None:
+        self._pending_triggers.setdefault(thread_key, []).append(event)
+
+    def _forget_trigger(self, thread_key: str, event: dict) -> None:
+        """Drop a finished (or never-run) trigger's batching bookkeeping."""
+        pending = self._pending_triggers.get(thread_key)
+        if pending is not None:
+            key = self._trigger_key(event)
+            pending[:] = [e for e in pending if self._trigger_key(e) != key]
+            if not pending:
+                self._pending_triggers.pop(thread_key, None)
+        self._absorbed_triggers.discard(self._trigger_key(event))
+
+    def _claim_trigger_batch(self, thread_key: str, event: dict) -> list[dict]:
+        """Every queued trigger this turn answers, oldest first.
+
+        Returns [] when an earlier turn in this thread already answered
+        ``event`` as part of its batch; the caller then has nothing to do.
+        """
+        key = self._trigger_key(event)
+        if key in self._absorbed_triggers:
+            self._absorbed_triggers.discard(key)
+            return []
+        pending = self._pending_triggers.pop(thread_key, [])
+        batch = [e for e in pending if self._trigger_key(e) != key]
+        for other in batch:
+            self._absorbed_triggers.add(self._trigger_key(other))
+        batch.append(event)
+        batch.sort(key=lambda e: slack_ts_sort_key(str(e.get("ts") or "")))
+        return batch
+
     async def _mark_queued(
         self,
         event: dict,
@@ -4784,7 +4827,7 @@ class SlackAgent:
         waits = (admission is not None and admission.state == "queued") or (
             lock is not None and lock.locked()
         )
-        if not waits:
+        if not waits or self._trigger_key(event) in self._absorbed_triggers:
             return
         ts = str(event.get("ts") or "")
         self._inbox_marked.add((execution_plan.channel_id, ts))
@@ -4825,19 +4868,34 @@ class SlackAgent:
             # Snapshot before the turn: !reset / session restart / runtime switch can
             # land while it runs, and must not be undone by this turn's write-back.
             gen = self._turn_generation(thread_key)
+            # Triggers that queued in this thread are answered by one turn:
+            # a second turn would re-answer what the first saw as context.
+            batch = self._claim_trigger_batch(thread_key, event)
+            if not batch:
+                logger.info(
+                    "agent %s trigger already answered by a batched turn "
+                    "thread=%s",
+                    self.name,
+                    thread_key,
+                )
+                return
+            trigger_ts = [str(trigger["ts"]) for trigger in batch]
+            # The newest trigger is the context cursor and freshness anchor.
+            ts = trigger_ts[-1]
             # Outermost: log exit failures from post/reaction so Tasks do not fail silently
             try:
                 # ⏳ up-front so context fetch / file downloads are visibly in progress
-                queued_mark = (channel, ts)
-                was_queued = queued_mark in self._inbox_marked
-                self._inbox_marked.discard(queued_mark)
-                await self._set_reaction(
-                    client,
-                    channel,
-                    ts,
-                    add="hourglass_flowing_sand",
-                    remove="inbox_tray" if was_queued else None,
-                )
+                for trigger_mark_ts in trigger_ts:
+                    queued_mark = (channel, trigger_mark_ts)
+                    was_queued = queued_mark in self._inbox_marked
+                    self._inbox_marked.discard(queued_mark)
+                    await self._set_reaction(
+                        client,
+                        channel,
+                        trigger_mark_ts,
+                        add="hourglass_flowing_sand",
+                        remove="inbox_tray" if was_queued else None,
+                    )
                 # ok means "result delivered to the thread and the turn succeeded";
                 # the finally below turns it into ✅/❌ even when posting itself fails.
                 ok = False
@@ -4847,7 +4905,7 @@ class SlackAgent:
                         client,
                         channel,
                         thread_ts,
-                        exclude_ts=ts,
+                        exclude_ts=frozenset(trigger_ts),
                         thread_key=thread_key,
                         allowed_agent_names=allowed_agent_names,
                     )
@@ -4862,12 +4920,44 @@ class SlackAgent:
                     channel_guidance = await self._fetch_channel_guidance(
                         client, channel
                     )
-                    attachment_note = await self._ingest_files(event)
+                    attachment_notes = [
+                        note
+                        for note in [
+                            await self._ingest_files(trigger)
+                            for trigger in batch
+                        ]
+                        if note
+                    ]
+                    attachment_note = "\n".join(attachment_notes)
 
                     turn_ok = True
                     try:
-                        sender_name = self._display_name_of(event)
-                        instruction = strip_leading_mention(event.get("text", ""))
+                        if len(batch) == 1:
+                            sender_name = self._display_name_of(event)
+                            instruction = strip_leading_mention(
+                                event.get("text", "")
+                            )
+                        else:
+                            senders = [
+                                self._display_name_of(trigger)
+                                for trigger in batch
+                            ]
+                            sender_name = (
+                                senders[-1]
+                                if len(set(senders)) == 1
+                                else "スレッドの参加者"
+                            )
+                            instruction = build_batched_instruction(
+                                [
+                                    (
+                                        sender,
+                                        strip_leading_mention(
+                                            trigger.get("text", "")
+                                        ),
+                                    )
+                                    for sender, trigger in zip(senders, batch)
+                                ]
+                            )
                         prompt = build_activation_prompt(
                             context_block=context_block,
                             sender_name=sender_name,
@@ -5018,13 +5108,14 @@ class SlackAgent:
                         done_reaction = "zipper_mouth_face"
                     else:
                         done_reaction = "white_check_mark"
-                    await self._set_reaction(
-                        client,
-                        channel,
-                        ts,
-                        add=done_reaction,
-                        remove="hourglass_flowing_sand",
-                    )
+                    for trigger_mark_ts in trigger_ts:
+                        await self._set_reaction(
+                            client,
+                            channel,
+                            trigger_mark_ts,
+                            add=done_reaction,
+                            remove="hourglass_flowing_sand",
+                        )
 
                 # After all result chunks are posted, check whether context rollover is needed (still under lock)
                 await self._maybe_rollover(
@@ -5864,11 +5955,18 @@ class SlackAgent:
         channel: str,
         thread_ts: str,
         *,
-        exclude_ts: str,
+        exclude_ts: str | frozenset[str],
         thread_key: str,
         allowed_agent_names: set[str] | frozenset[str] | None = None,
     ) -> str:
-        """Fetch recent thread messages and format as context; degrade to empty string on failure."""
+        """Fetch recent thread messages and format as context; degrade to empty string on failure.
+
+        ``exclude_ts`` are the triggers this turn answers; they appear in the
+        instruction instead.
+        """
+        excluded_ts = (
+            {exclude_ts} if isinstance(exclude_ts, str) else set(exclude_ts)
+        )
         try:
             policy = self._project_policy(channel)
             if not self._project_allows_target(policy):
@@ -5929,7 +6027,7 @@ class SlackAgent:
                 text = (msg.get("text") or "").strip()
                 if not text:
                     continue
-                if msg_ts == exclude_ts:
+                if msg_ts in excluded_ts:
                     continue
                 try:
                     if float(msg_ts) <= float(last):

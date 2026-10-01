@@ -499,3 +499,87 @@ def test_long_cooldown_wait_is_announced_once(tmp_path, monkeypatch):
     assert len(client.calls) == 1
     assert "約 45 秒後" in client.calls[0]["text"]
     assert client.calls[0]["thread_ts"] == plan.root_thread_ts
+
+
+# ---------------------------------------------------------------------------
+# Batching triggers that queued in one thread
+# ---------------------------------------------------------------------------
+
+
+def test_claim_trigger_batch_absorbs_queued_triggers(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    first, second, third = (
+        _event(ts="101.0"),
+        _event(ts="102.0"),
+        _event(ts="103.0"),
+    )
+    for event in (first, second, third):
+        agent._register_pending_trigger("C1:100.0", event)
+    batch = agent._claim_trigger_batch("C1:100.0", second)
+    assert [e["ts"] for e in batch] == ["101.0", "102.0", "103.0"]
+    assert agent._claim_trigger_batch("C1:100.0", first) == []
+    assert agent._claim_trigger_batch("C1:100.0", third) == []
+    assert agent._pending_triggers == {}
+    assert agent._absorbed_triggers == set()
+
+
+def test_unregistered_trigger_is_its_own_batch(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    event = _event(ts="101.0")
+    assert agent._claim_trigger_batch("C1:100.0", event) == [event]
+
+
+def test_forget_trigger_drops_stale_bookkeeping(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    event = _event(ts="101.0")
+    agent._register_pending_trigger("C1:100.0", event)
+    agent._forget_trigger("C1:100.0", event)
+    assert agent._pending_triggers == {}
+
+
+def test_queued_triggers_are_answered_in_one_turn(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    rec = _wire(agent, ["one combined answer"])
+    first = _event(ts="101.0", text="add the export button")
+    second = _event(ts="102.0", text="also make it CSV")
+    agent._register_pending_trigger("C1:100.0", first)
+    agent._register_pending_trigger("C1:100.0", second)
+    excluded: list[frozenset] = []
+
+    async def fake_fetch_context(*_args, exclude_ts, **_kwargs):
+        excluded.append(exclude_ts)
+        return ""
+
+    agent._fetch_context = fake_fetch_context
+    _activate(agent, first)
+    _activate(agent, second)  # already answered: no second turn
+    assert len(rec.turns) == 1
+    assert "add the export button" in rec.turns[0]
+    assert "also make it CSV" in rec.turns[0]
+    assert excluded == [frozenset({"101.0", "102.0"})]
+    assert rec.posts == ["one combined answer"]
+    done = [r for r in rec.reactions if r["add"] == "white_check_mark"]
+    assert len(done) == 2
+    # The cursor moves to the newest answered trigger.
+    assert agent.last_seen["C1:100.0"] == "102.0"
+
+
+def test_absorbed_trigger_does_not_get_inbox_reaction(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    rec = _wire(agent, ["done"])
+    first, second = _event(ts="101.0"), _event(ts="102.0")
+    agent._register_pending_trigger("C1:100.0", first)
+    agent._register_pending_trigger("C1:100.0", second)
+    agent._claim_trigger_batch("C1:100.0", first)
+    plan = agent.build_execution_plan(second)
+
+    async def scenario():
+        lock = agent.locks.setdefault(plan.thread_key, asyncio.Lock())
+        await lock.acquire()
+        try:
+            await agent._mark_queued(second, object(), plan, None)
+        finally:
+            lock.release()
+
+    asyncio.run(scenario())
+    assert rec.reactions == []
