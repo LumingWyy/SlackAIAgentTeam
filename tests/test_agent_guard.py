@@ -49,6 +49,10 @@ def test_gh_merge_shapes_are_refused(args):
         ["--repo", "acme/widgets", "pr", "create", "--title", "x"],
         ["-R", "acme/widgets", "pr", "view", "12"],
         ["--help"],
+        # The reviewer writes its findings back to the PR.
+        ["api", "repos/{owner}/{repo}/pulls/3/reviews", "--method", "POST", "--input", "-"],
+        ["api", "repos/{owner}/{repo}/pulls/3/comments/9/replies", "-f", "body=Fixed"],
+        ["pr", "review", "3", "--comment", "--body-file", "-"],
     ],
 )
 def test_ordinary_gh_use_is_allowed(args):

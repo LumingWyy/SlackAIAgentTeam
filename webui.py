@@ -3532,7 +3532,7 @@ const I18N={
    'guide.prompt.dev':'developer persona 推荐','guide.prompt.reviewer':'reviewer persona 推荐','guide.prompt.planner':'planner / pm persona 推荐',
    'guide.prompts.ev1':'每个 card 能在 6 行内说清输入、输出和禁区','guide.prompts.ev2':'reviewer 与 developer 使用独立验证标准，OpenAI persona 明示无本地工具',
    'guide.task.eye':'第一次真实闭环','guide.task.title':'在一个 Slack 线程跑完整闭环','guide.task.body':'人类给一个明确任务；developer 在本地 worktree 实现并产出 PR；reviewer 独立验证。跨机器只传 Slack 上下文和 durable artifact。',
-   'guide.prompt.task':'人类启动任务模板','guide.prompt.handoff':'结构化 HANDOFF 模板','guide.task.ev1':'同一个根线程里能看到目标、测试结果、PR URL 和单目标 handoff','guide.task.ev2':'reviewer 给出明确通过，或带严重度与文件行号的退回意见',
+   'guide.prompt.task':'人类启动任务模板','guide.prompt.handoff':'结构化 HANDOFF 模板','guide.task.ev1':'同一个根线程里能看到目标、测试结果、PR URL 和单目标 handoff','guide.task.ev2':'reviewer 在 PR 上留下行内 thread 和判定评论，并在 Slack 明确通过，或带严重度与文件行号退回',
    'mon.title':'智能体运行状况','mon.sub':'一览各智能体的状态与模型；模型和 runtime 可在此免重启切换。',
    'status.live':'运行中','status.down':'未启动','status.dis':'未连接',
    'meta.budget':'往复预算','meta.offline':'请启动 multi_app（make run）',
@@ -3601,7 +3601,7 @@ const I18N={
    'guide.prompt.dev':'developer persona 推奨','guide.prompt.reviewer':'reviewer persona 推奨','guide.prompt.planner':'planner / pm persona 推奨',
    'guide.prompts.ev1':'各 card は6行以内で入力・出力・禁止事項が分かる','guide.prompts.ev2':'reviewer と developer は別の検証基準を持ち、OpenAI persona はローカルツールなしと明記',
    'guide.task.eye':'最初の実運用ループ','guide.task.title':'1つの Slack スレッドで完走する','guide.task.body':'人が明確なタスクを渡し、developer はローカル worktree で実装して PR を作成、reviewer が独立検証します。ノード間では Slack 文脈と永続成果物だけを渡します。',
-   'guide.prompt.task':'人が開始するタスクのテンプレート','guide.prompt.handoff':'構造化 HANDOFF テンプレート','guide.task.ev1':'同じルートスレッドに目的、テスト結果、PR URL、単一 target の handoff がある','guide.task.ev2':'reviewer が明確に承認、または重大度とファイル行付きで差し戻す',
+   'guide.prompt.task':'人が開始するタスクのテンプレート','guide.prompt.handoff':'構造化 HANDOFF テンプレート','guide.task.ev1':'同じルートスレッドに目的、テスト結果、PR URL、単一 target の handoff がある','guide.task.ev2':'reviewer が PR に行内 thread と判定コメントを残し、Slack で明確に承認、または重大度とファイル行付きで差し戻す',
    'mon.title':'エージェント運用状況','mon.sub':'稼働中の各エージェントの状態・モデルをひと目で。モデルと runtime はここから再起動なしで切り替えられます。',
    'status.live':'稼働中','status.down':'未起動','status.dis':'未接続',
    'meta.budget':'往復予算','meta.offline':'multi_app を起動してください（make run）',
@@ -3670,7 +3670,7 @@ const I18N={
    'guide.prompt.dev':'Recommended developer persona','guide.prompt.reviewer':'Recommended reviewer persona','guide.prompt.planner':'Recommended planner / pm persona',
    'guide.prompts.ev1':'Each card explains input, output, and boundaries in six lines or fewer','guide.prompts.ev2':'reviewer and developer use independent standards; an OpenAI persona states that local tools are unavailable',
    'guide.task.eye':'FIRST LIVE LOOP','guide.task.title':'Complete one loop in one Slack thread','guide.task.body':'A human provides one clear task; developer implements in the local worktree and publishes a PR; reviewer verifies independently. Across machines, pass only Slack context and durable artifacts.',
-   'guide.prompt.task':'Human task kickoff template','guide.prompt.handoff':'Structured HANDOFF template','guide.task.ev1':'One root thread contains the goal, test result, PR URL, and a single-target handoff','guide.task.ev2':'reviewer clearly approves or returns findings with severity and file lines',
+   'guide.prompt.task':'Human task kickoff template','guide.prompt.handoff':'Structured HANDOFF template','guide.task.ev1':'One root thread contains the goal, test result, PR URL, and a single-target handoff','guide.task.ev2':'reviewer leaves inline threads and a verdict comment on the PR, then clearly approves or returns findings with severity and file lines in Slack',
    'mon.title':'Agent Operations','mon.sub':'Every agent’s status and model at a glance. Switch model and runtime here without restarting.',
    'status.live':'Online','status.down':'Offline','status.dis':'Disconnected',
    'meta.budget':'round budget','meta.offline':'Start multi_app (make run)',
@@ -3739,8 +3739,12 @@ const GUIDE_PROMPTS={
       '你是独立 reviewer，不复述实现者结论。',
       '先读取任务完成标准，再检查 PR/diff、失败路径、并发与安全边界，并运行适当验证。',
       '按 Critical / Important / Suggestion 报告问题，附文件与行号、影响和可复现证据。',
-      '有 Critical/Important 时明确退回给一个 developer；没有时明确写“通过”并列出验证。',
-      '未经要求不要直接改实现；没有本地工具时必须说明，并基于 Slack 中可见材料评审。'
+      '评审完写回对应的 GitHub PR：每个能定位到 diff 行的问题单独一条行内 review thread（严重度、问题、影响、如何验证修复）；判定与总结写在 review 正文评论里。',
+      '用 gh api repos/{owner}/{repo}/pulls/<N>/reviews 提交，event 固定为 COMMENT（同一 GitHub 账号不能 approve 或 request changes 自己的 PR，批准留给人类）；正文以「判定：通过」或「判定：退回」开头，列出验证内容。',
+      '复审时在原 thread 回复「已在 <sha> 修复」或「仍未解决」，不要重开新 thread。',
+      '最后在 Slack 线程回复判定、review 链接和各级问题数；有 Critical/Important 时只退回给一个 developer。',
+      'PR 评论是公开的：不要写 token、env、本机绝对路径或只在 Slack 里讨论的内容。',
+      '未经要求不要直接改实现；没有本地工具或 gh 时必须说明，只基于 Slack 中可见材料评审并只在 Slack 报告。'
     ].join(GUIDE_NL),
     planner:[
       '你是 planner / pm，只负责把需求变成可执行任务。',
@@ -3781,8 +3785,12 @@ const GUIDE_PROMPTS={
       'あなたは独立 reviewer です。実装者の結論をそのまま採用しません。',
       '完了条件を読み、PR/diff、失敗経路、並行性、安全境界を確認し、適切な検証を実行します。',
       'Critical / Important / Suggestion で分類し、ファイル行、影響、再現証拠を付けます。',
-      'Critical/Important があれば developer 1人へ差し戻し、なければ「承認」と検証内容を明記します。',
-      '依頼なしに実装を変更しません。ローカルツールがなければ明示し、Slack 上の材料だけで評価します。'
+      'レビュー後は該当する GitHub PR に書き戻します：diff の行に結び付く指摘は1件ずつ行内 review thread にし（重大度・問題・影響・修正の確認方法）、判定とまとめは review 本文のコメントに書きます。',
+      'gh api repos/{owner}/{repo}/pulls/<N>/reviews で投稿し、event は常に COMMENT（同じ GitHub アカウントは自分の PR を approve / request changes できず、承認は人が行います）。本文は「判定：承認」か「判定：差し戻し」で始め、検証内容を書きます。',
+      '再レビューでは既存 thread に「<sha> で修正済み」か「未解決」と返信し、新しい thread を重複して作りません。',
+      '最後に Slack スレッドへ判定、review の URL、重大度ごとの件数を返します。Critical/Important があれば developer 1人へ差し戻します。',
+      'PR コメントは公開されます：token、env、ローカル絶対パス、Slack 内だけの議論を書きません。',
+      '依頼なしに実装を変更しません。ローカルツールや gh がなければ明示し、Slack 上の材料だけで評価して Slack にだけ報告します。'
     ].join(GUIDE_NL),
     planner:[
       'あなたは planner / pm で、要求を実行可能なタスクへ分解します。',
@@ -3823,8 +3831,12 @@ const GUIDE_PROMPTS={
       'You are an independent reviewer; do not repeat the implementer’s conclusion.',
       'Read the done criteria, inspect the PR/diff, failure paths, concurrency, and security boundaries, then run proportionate checks.',
       'Classify findings as Critical, Important, or Suggestion, with file lines, impact, and reproducible evidence.',
-      'Return Critical/Important findings to one developer. Otherwise explicitly approve and list verification.',
-      'Do not edit unless asked. If local tools are unavailable, say so and review only material visible in Slack.'
+      'After reviewing, write back to the GitHub PR: each finding that maps to a diff line gets its own inline review thread (severity, problem, impact, how to verify the fix); the verdict and summary go in the review body comment.',
+      'Post with gh api repos/{owner}/{repo}/pulls/<N>/reviews, always event COMMENT (one GitHub account cannot approve or request changes on its own PR, and approval stays human). Start the body with “Verdict: PASS” or “Verdict: CHANGES REQUESTED” and list what you verified.',
+      'On re-review, reply in the existing threads (“Fixed in <sha>” or “Still open”) instead of opening duplicates.',
+      'Finally reply in the Slack thread with the verdict, the review URL, and counts per severity; return Critical/Important findings to one developer.',
+      'PR comments are public: never include tokens, env values, local absolute paths, or Slack-only discussion.',
+      'Do not edit unless asked. Without local tools or gh, say so, review only material visible in Slack, and report only in Slack.'
     ].join(GUIDE_NL),
     planner:[
       'You are a planner / pm. Turn a request into an executable task.',

@@ -338,6 +338,20 @@ def test_guide_i18n_and_prompt_templates_cover_all_languages():
     assert script.count('HANDOFF {"target_agent_id"') == 3
 
 
+def test_guide_reviewer_template_writes_the_review_back_to_the_pr():
+    """Findings land on the PR as inline threads plus a verdict comment, in every language."""
+    script = _main_script(webui.INDEX_HTML)
+    start = script.index("const GUIDE_PROMPTS={")
+    prompts = script[start : script.index("};", start)]
+    reviewers = prompts.split("reviewer:[")[1:]
+    assert len(reviewers) == 3
+    for block in reviewers:
+        block = block.split("].join(GUIDE_NL)")[0]
+        assert "gh api repos/{owner}/{repo}/pulls/<N>/reviews" in block
+        assert "COMMENT" in block and "thread" in block
+        assert "Slack" in block and "<sha>" in block
+
+
 def test_guide_progress_and_copy_are_local_only_and_text_safe():
     """Checklist state stays in localStorage and prompt examples use textContent."""
     script = _main_script(webui.INDEX_HTML)

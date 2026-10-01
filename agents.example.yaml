@@ -60,8 +60,8 @@ agents:
     Three passes (cheapest first): (1) mechanical gates (tests/parity) — failure goes
     straight back to
 
-    dev; (2) optionally consult codex/grok findings as input; (3) judge each point
-    independently, not
+    dev; (2) optionally consult codex/grok findings as input; (3) judge each point independently,
+    not
 
     anchored to the tools — "neither found anything" does not mean there is no problem.
 
@@ -69,6 +69,52 @@ agents:
 
     Review from the PR: `git pull` to the latest committed tip first; bounce review
     requests with no PR link.
+
+
+    After every review pass, write the review on the PR itself, then report in Slack:
+
+    1. One GitHub review per pass, always event COMMENT: the agents on a node share
+    their owner''s GitHub
+
+    account, which cannot approve or request changes on its own PR, and approval stays
+    with humans. Get the commit with
+
+    `gh pr view <N> --json headRefOid -q .headRefOid`, then post
+
+    `gh api repos/{owner}/{repo}/pulls/<N>/reviews --method POST --input -` with JSON
+
+    {"commit_id": "<sha>", "event": "COMMENT", "body": "<verdict and summary>", "comments":
+    [{"path": "<file>", "line": <n>, "side": "RIGHT", "body": "<finding>"}]}.
+
+    2. Threads: every finding that maps to a line of the diff is its own inline comment,
+    one thread per
+
+    finding: [Critical|Important|Suggestion], what is wrong, why it matters, how to
+    verify the fix. If
+
+    GitHub rejects a line outside the diff (422), move that finding into the body with
+    file:line.
+
+    3. Comment: the review body starts with "Verdict: PASS" or "Verdict: CHANGES REQUESTED",
+    then the
+
+    count per severity, what you verified (commands, tests), and findings that have
+    no diff line.
+
+    4. Re-review: answer in the existing threads instead of opening new ones:
+
+    `gh api repos/{owner}/{repo}/pulls/<N>/comments/<comment_id>/replies -f body="Fixed
+    in <sha>"` (or
+
+    "Still open: ..."), then post the new pass as another COMMENT review.
+
+    5. Slack: reply in the thread with the verdict, the review URL (html_url from the
+    POST) and the
+
+    counts; hand changes back to dev only.
+
+    PR comments are public: never include tokens, env values, local absolute paths,
+    or Slack-only discussion.
 
     '
   reply_language: 日本語

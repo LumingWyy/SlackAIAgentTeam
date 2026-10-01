@@ -59,3 +59,12 @@ def test_image_ships_the_template_not_a_local_agents_yaml():
     assert "agents.example.yaml" in copied
     assert "local_config.py" in copied
     assert "agents.yaml" not in copied
+
+
+def test_template_reviewer_writes_its_review_onto_the_pr():
+    raw = yaml.safe_load(AGENTS_EXAMPLE.read_text(encoding="utf-8"))
+    persona = next(a for a in raw["agents"] if a["name"] == "reviewer")["persona"]
+    assert "repos/{owner}/{repo}/pulls/<N>/reviews" in persona
+    assert '"event": "COMMENT"' in persona
+    assert "/replies" in persona  # re-review answers in the existing thread
+    assert "Verdict: PASS" in persona and "Verdict: CHANGES REQUESTED" in persona
