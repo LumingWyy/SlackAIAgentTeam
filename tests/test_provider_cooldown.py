@@ -255,8 +255,10 @@ def _build_agent(tmp_path, monkeypatch):
         allowed_humans=set(),
     )
     # Fast cooldown so retry tests do not sleep for real minutes.
-    agent._provider_cooldown = ProviderCooldown(
-        base_seconds=0.01, max_seconds=0.02
+    from multi_core import ProviderCooldownRegistry
+
+    agent._provider_cooldowns = ProviderCooldownRegistry(
+        lambda: ProviderCooldown(base_seconds=0.01, max_seconds=0.02)
     )
     return agent
 
@@ -289,8 +291,8 @@ def test_run_turn_retries_once_after_rate_limit(tmp_path, monkeypatch):
     assert _run(agent) == "recovered"
     assert len(calls) == 2
     # Clean turn reset the streak and the deadline.
-    assert agent._provider_cooldown.strikes == 0
-    assert agent._provider_cooldown.remaining() == 0.0
+    assert agent._cooldown_for().strikes == 0
+    assert agent._cooldown_for().remaining() == 0.0
 
 
 def test_run_turn_raises_after_second_rate_limit(tmp_path, monkeypatch):
@@ -302,8 +304,8 @@ def test_run_turn_raises_after_second_rate_limit(tmp_path, monkeypatch):
     with pytest.raises(ProviderRateLimitedError):
         _run(agent)
     assert len(calls) == 2
-    assert agent._provider_cooldown.strikes == 2
-    assert agent._provider_cooldown.remaining() > 0
+    assert agent._cooldown_for().strikes == 2
+    assert agent._cooldown_for().remaining() > 0
 
 
 def test_run_turn_classifies_generic_rate_limit_text(tmp_path, monkeypatch):
@@ -323,7 +325,7 @@ def test_run_turn_non_rate_limit_error_raises_immediately(
     with pytest.raises(RuntimeError, match="boom"):
         _run(agent)
     assert len(calls) == 1
-    assert agent._provider_cooldown.strikes == 0
+    assert agent._cooldown_for().strikes == 0
 
 
 def test_run_turn_timeout_is_not_retried(tmp_path, monkeypatch):
@@ -332,16 +334,16 @@ def test_run_turn_timeout_is_not_retried(tmp_path, monkeypatch):
     with pytest.raises(TimeoutError):
         _run(agent)
     assert len(calls) == 1
-    assert agent._provider_cooldown.strikes == 0
+    assert agent._cooldown_for().strikes == 0
 
 
 def test_run_turn_waits_out_preexisting_cooldown(tmp_path, monkeypatch):
     agent = _build_agent(tmp_path, monkeypatch)
-    agent._provider_cooldown.note_rate_limited()  # armed before the turn
+    agent._cooldown_for().note_rate_limited()  # armed before the turn
     calls = _stub_dispatch(agent, ["ok"])
     assert _run(agent) == "ok"
     assert len(calls) == 1
-    assert agent._provider_cooldown.remaining() == 0.0
+    assert agent._cooldown_for().remaining() == 0.0
 
 
 def test_run_turn_does_not_replay_a_turn_that_ran_tools(tmp_path, monkeypatch):
@@ -355,7 +357,7 @@ def test_run_turn_does_not_replay_a_turn_that_ran_tools(tmp_path, monkeypatch):
     assert len(calls) == 1
     assert info.value.replay_safe is False
     # The cooldown is still armed for the next turn.
-    assert agent._provider_cooldown.strikes == 1
+    assert agent._cooldown_for().strikes == 1
 
 
 def test_run_turn_does_not_retry_when_reset_exceeds_cap(tmp_path, monkeypatch):
@@ -709,3 +711,73 @@ def test_sleep_released_cancellation_releases_cleanly():
         assert snap["node_admitted"] == 0
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Per-account cooldown sharing
+# ---------------------------------------------------------------------------
+
+
+def test_provider_account_key_groups_local_logins():
+    from multi_core import provider_account_key
+
+    assert provider_account_key("claude") == "claude:local"
+    assert provider_account_key("codex") == "codex:local"
+    assert provider_account_key(
+        "openai", openai_api_key_env="OPENAI_API_KEY"
+    ) == "openai:https://api.openai.com/v1:OPENAI_API_KEY"
+    assert provider_account_key(
+        "openai",
+        openai_base_url="http://127.0.0.1:8317/v1/",
+        openai_api_key_env="OPENAI_API_KEY",
+    ) == "openai:http://127.0.0.1:8317/v1:OPENAI_API_KEY"
+
+
+def test_cooldown_registry_shares_one_instance_per_account():
+    from multi_core import ProviderCooldownRegistry
+
+    registry = ProviderCooldownRegistry(ProviderCooldown)
+    assert registry.get("claude:local") is registry.get("claude:local")
+    assert registry.get("claude:local") is not registry.get("codex:local")
+
+
+def test_local_claude_agents_share_a_cooldown(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    from multi_core import ProviderCooldownRegistry
+
+    first = _build_agent(tmp_path, monkeypatch)
+    second = _build_agent(tmp_path, monkeypatch)
+    shared = ProviderCooldownRegistry(
+        lambda: ProviderCooldown(base_seconds=60.0, max_seconds=60.0)
+    )
+    first._provider_cooldowns = shared
+    second._provider_cooldowns = shared
+    first._cooldown_for().note_rate_limited()
+    assert second._cooldown_for().remaining() > 0
+    codex_cfg = replace(second.cfg, runtime="codex")
+    assert second._cooldown_for(codex_cfg).remaining() == 0.0
+
+
+def test_skipped_patrol_does_not_reset_strikes(tmp_path, monkeypatch):
+    import time as time_module
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    cooldown = agent._cooldown_for(agent.cfg)
+    cooldown.note_rate_limited()
+    time_module.sleep(0.03)  # deadline passes; the strike streak remains
+    assert cooldown.remaining() == 0.0
+
+    async def skipped_inner(*_args, **_kwargs):
+        return False
+
+    agent._run_patrol_once_inner = skipped_inner
+    asyncio.run(agent._run_patrol_once("p", "C-PATROL"))
+    assert cooldown.strikes == 1
+
+    async def ran_inner(*_args, **_kwargs):
+        return True
+
+    agent._run_patrol_once_inner = ran_inner
+    asyncio.run(agent._run_patrol_once("p", "C-PATROL"))
+    assert cooldown.strikes == 0

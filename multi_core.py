@@ -1882,6 +1882,43 @@ class ProviderCooldown:
         }
 
 
+DEFAULT_OPENAI_ACCOUNT_URL = "https://api.openai.com/v1"
+
+
+def provider_account_key(
+    runtime: str,
+    *,
+    openai_base_url: str = "",
+    openai_api_key_env: str = "",
+) -> str:
+    """Identity of the provider account a turn is billed and limited against.
+
+    Every local Claude agent runs on the process's one Claude login, and
+    every Codex agent on the one Codex login, so a rate limit on one is a
+    rate limit on all of them. OpenAI agents are separate accounts per
+    endpoint + key variable.
+    """
+    if runtime == "openai":
+        base_url = (openai_base_url or DEFAULT_OPENAI_ACCOUNT_URL).rstrip("/")
+        return f"openai:{base_url}:{openai_api_key_env}"
+    return f"{runtime or 'claude'}:local"
+
+
+class ProviderCooldownRegistry:
+    """One ``ProviderCooldown`` per provider account, shared by local agents."""
+
+    def __init__(self, factory: Callable[[], ProviderCooldown]) -> None:
+        self._factory = factory
+        self._cooldowns: dict[str, ProviderCooldown] = {}
+
+    def get(self, account_key: str) -> ProviderCooldown:
+        cooldown = self._cooldowns.get(account_key)
+        if cooldown is None:
+            cooldown = self._factory()
+            self._cooldowns[account_key] = cooldown
+        return cooldown
+
+
 class AdaptivePacer:
     """Node-wide adaptive spacing between provider turn starts.
 

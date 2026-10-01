@@ -54,6 +54,7 @@ from multi_core import (
     EventDeduper,
     ProjectPolicy,
     ProviderCooldown,
+    ProviderCooldownRegistry,
     ProviderRateLimitedError,
     TurnBudget,
     TurnSignals,
@@ -89,6 +90,7 @@ from multi_core import (
     parse_codex_events,
     parse_command,
     parse_freshness_decision,
+    provider_account_key,
     parse_handoff,
     next_patrol_deadline,
     registered_agent_mentions,
@@ -2665,6 +2667,7 @@ class SlackAgent:
         patrol_index: int = 0,
         patrol_count: int = 1,
         turn_pacer: AdaptivePacer | None = None,
+        provider_cooldowns: ProviderCooldownRegistry | None = None,
     ) -> None:
         self.cfg = cfg
         self.budget = budget
@@ -2719,9 +2722,14 @@ class SlackAgent:
         # thread_key → previous session summary (injected into new session after rollover)
         self.thread_summaries: dict[str, str] = {}
         self.deduper = EventDeduper()
-        # Per-agent AI-provider back-off; armed on rate-limited turns,
-        # reset by a clean turn (Slack and patrol turns share it).
-        self._provider_cooldown = provider_cooldown_from_env()
+        # AI-provider back-off per provider account; armed on rate-limited
+        # turns, reset by a clean turn. Production shares one registry across
+        # local agents (they share the Claude / Codex login), so the first
+        # 429 cools every agent on that account instead of each re-hitting it.
+        self._provider_cooldowns = (
+            provider_cooldowns
+            or ProviderCooldownRegistry(provider_cooldown_from_env)
+        )
         # Node-wide turn pacer: production injects one shared instance into
         # every local agent so their provider turn starts are staggered; the
         # fallback keeps isolated/programmatic construction usable.
@@ -2830,6 +2838,21 @@ class SlackAgent:
     def _active_execution_path(self) -> str:
         plan = self._active_execution_plan()
         return plan.execution_path if plan is not None else self.cfg.workspace
+
+    def _cooldown_for(
+        self, config: AgentConfig | ExecutionConfig | None = None
+    ) -> ProviderCooldown:
+        """The cooldown of the provider account ``config`` runs against."""
+        active = config or self._active_execution_config()
+        return self._provider_cooldowns.get(
+            provider_account_key(
+                active.runtime,
+                openai_base_url=getattr(active, "openai_base_url", "") or "",
+                openai_api_key_env=(
+                    getattr(active, "openai_api_key_env", "") or ""
+                ),
+            )
+        )
 
     async def _pace_turn_start(self) -> None:
         """Reserve a slot on the node-wide turn timeline and wait for it.
@@ -5233,7 +5256,11 @@ class SlackAgent:
 
     async def _run_patrol_once(self, prompt: str, channel: str) -> None:
         """Run patrol and consume a deferred snapshot on every exit path."""
-        cooldown_wait = self._provider_cooldown.remaining()
+        config_snapshot = replace(
+            self.cfg, allowed_tools=list(self.cfg.allowed_tools)
+        )
+        cooldown = self._cooldown_for(config_snapshot)
+        cooldown_wait = cooldown.remaining()
         if cooldown_wait > 0:
             # Unlike a Slack mention, a skipped patrol round retries at the
             # next epoch anyway; do not hold node capacity to wait it out.
@@ -5243,9 +5270,6 @@ class SlackAgent:
                 cooldown_wait,
             )
             return
-        config_snapshot = replace(
-            self.cfg, allowed_tools=list(self.cfg.allowed_tools)
-        )
         repo_snapshot = self.github_repo
         quota_reservation: QuotaReservation | None = None
         if config_snapshot.owner:
@@ -5275,7 +5299,7 @@ class SlackAgent:
             quota_reservation
         )
         try:
-            await self._run_patrol_once_inner(
+            provider_ran = await self._run_patrol_once_inner(
                 prompt,
                 channel,
                 config_snapshot=config_snapshot,
@@ -5287,21 +5311,25 @@ class SlackAgent:
                 classify_provider_rate_limit(exc)
             )
             if rate_limited:
-                delay = self._provider_cooldown.note_rate_limited(retry_after)
+                delay = cooldown.note_rate_limited(retry_after)
                 self._turn_pacer.note_rate_limited()
                 logger.warning(
                     "agent %s patrol provider rate-limited (strike %d, "
                     "cooldown %.0fs, pacer interval %.2fs): %s",
                     self.name,
-                    self._provider_cooldown.strikes,
+                    cooldown.strikes,
                     delay,
                     self._turn_pacer.interval,
                     str(exc)[:300],
                 )
             raise
         else:
-            self._provider_cooldown.note_success()
-            self._turn_pacer.note_clean_turn()
+            # A patrol skipped before any provider call (ACL, runtime, repo,
+            # membership) proves nothing about the provider; it must not
+            # reset the strike streak.
+            if provider_ran:
+                cooldown.note_success()
+                self._turn_pacer.note_clean_turn()
         finally:
             _CURRENT_QUOTA_RESERVATION.reset(quota_token)
             if quota_reservation is not None:
@@ -5332,8 +5360,11 @@ class SlackAgent:
         config_snapshot: AgentConfig,
         repo_snapshot: str | None,
         admission: RuntimeAdmission,
-    ) -> None:
-        """Run one patrol from one immutable admitted config snapshot."""
+    ) -> bool:
+        """Run one patrol from one immutable admitted config snapshot.
+
+        Returns True only when a provider turn actually ran.
+        """
         async with self.runtime_limiter.slot(
             self.name,
             config_snapshot.workspace,
@@ -5464,6 +5495,7 @@ class SlackAgent:
                 logger.debug("agent %s patrol idle", self.name)
             else:
                 await self._post_result(channel, None, result)
+            return True
 
     async def _maybe_rollover(
         self, thread_key: str, thread_ts: str, say: Any
@@ -5823,8 +5855,9 @@ class SlackAgent:
         node slot handed back. Timeouts and other errors keep their existing
         single-attempt behavior.
         """
+        cooldown = self._cooldown_for()
         for attempt in (0, 1):
-            wait = self._provider_cooldown.remaining()
+            wait = cooldown.remaining()
             if wait > 0:
                 await self._wait_out_cooldown(wait, thread_key)
             try:
@@ -5843,13 +5876,13 @@ class SlackAgent:
                 ) = classify_provider_rate_limit(exc)
                 if not rate_limited:
                     raise
-                delay = self._provider_cooldown.note_rate_limited(retry_after)
+                delay = cooldown.note_rate_limited(retry_after)
                 self._turn_pacer.note_rate_limited()
                 logger.warning(
                     "agent %s provider rate-limited (strike %d, cooldown "
                     "%.0fs, pacer interval %.2fs) thread=%s: %s",
                     self.name,
-                    self._provider_cooldown.strikes,
+                    cooldown.strikes,
                     delay,
                     self._turn_pacer.interval,
                     thread_key,
@@ -5858,7 +5891,7 @@ class SlackAgent:
                 if (
                     attempt == 0
                     and replay_safe
-                    and not self._provider_cooldown.exceeds_cap(retry_after)
+                    and not cooldown.exceeds_cap(retry_after)
                     and gen == self._turn_generation(thread_key)
                 ):
                     continue
@@ -5869,7 +5902,7 @@ class SlackAgent:
                     retry_after=retry_after,
                     replay_safe=replay_safe,
                 ) from exc
-            self._provider_cooldown.note_success()
+            cooldown.note_success()
             self._turn_pacer.note_clean_turn()
             return result
         raise AssertionError("unreachable: _run_turn retry loop exhausted")
@@ -7045,7 +7078,7 @@ class SlackAgent:
                 else None
             ),
             **runtime_status,
-            "provider_cooldown": self._provider_cooldown.snapshot(),
+            "provider_cooldown": self._cooldown_for(self.cfg).snapshot(),
             "turn_pacer": self._turn_pacer.snapshot(),
             "busy_threads": sum(1 for t in threads if t["busy"]),
             "session_count": len(self.sessions),
@@ -8461,6 +8494,8 @@ async def main() -> None:
     # One node-wide pacer: all local agents share the provider account, so
     # their turn starts are staggered on one timeline.
     turn_pacer = provider_pacer_from_env()
+    # One cooldown per provider account across all local agents.
+    provider_cooldowns = ProviderCooldownRegistry(provider_cooldown_from_env)
     agents = [
         SlackAgent(
             cfg,
@@ -8487,6 +8522,7 @@ async def main() -> None:
             patrol_index=patrol_positions.get(cfg.name, 0),
             patrol_count=patrol_count,
             turn_pacer=turn_pacer,
+            provider_cooldowns=provider_cooldowns,
         )
         for cfg in configs
     ]

@@ -211,8 +211,10 @@ def _build_agent(tmp_path, monkeypatch):
         roster=Roster(),
         allowed_humans=set(),
     )
-    agent._provider_cooldown = ProviderCooldown(
-        base_seconds=0.01, max_seconds=0.02
+    from multi_core import ProviderCooldownRegistry
+
+    agent._provider_cooldowns = ProviderCooldownRegistry(
+        lambda: ProviderCooldown(base_seconds=0.01, max_seconds=0.02)
     )
     return agent
 
