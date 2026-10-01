@@ -27,6 +27,7 @@ import os
 import pty
 import re
 import shutil
+import sys
 import tempfile
 from contextvars import ContextVar
 from pathlib import Path
@@ -705,6 +706,125 @@ async def _inspect_workspace(path: str) -> dict[str, Any]:
         "branch": branch,
         "origin_repo": (github_repo_from_remote(origin) or "") if origin else "",
     }
+
+
+# Folder picking for the workspace editor. A browser cannot hand back an
+# absolute directory path, so the local console either shows the OS folder
+# dialog itself or lists directories for an in-page browser.
+_PICK_LOCK = asyncio.Lock()
+_DIR_LIST_LIMIT = 300
+_MAC_PICK_SCRIPT = (
+    "on run argv",
+    "tell application (path to frontmost application as text)",
+    "activate",
+    "set picked to choose folder with prompt (item 2 of argv) "
+    "default location (POSIX file (item 1 of argv))",
+    "end tell",
+    "return POSIX path of picked",
+    "end run",
+)
+
+
+def _home_dir() -> str:
+    return os.path.realpath(os.path.expanduser("~"))
+
+
+def _display_path(path: str) -> str:
+    """``~/…`` for paths under the home directory, as agents.yaml writes them."""
+    home = _home_dir()
+    if path == home:
+        return "~"
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
+def _start_dir(raw: str) -> str:
+    """An existing directory to open a picker at (falls back to home)."""
+    candidate = os.path.realpath(os.path.expanduser(str(raw or "").strip() or "~"))
+    while candidate and not os.path.isdir(candidate):
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            break
+        candidate = parent
+    return candidate if os.path.isdir(candidate) else _home_dir()
+
+
+def _folder_dialog_argv(start: str, prompt: str) -> list[str] | None:
+    """Command that shows the OS folder dialog, or None when there is none."""
+    if sys.platform == "darwin" and shutil.which("osascript"):
+        argv = ["osascript"]
+        for line in _MAC_PICK_SCRIPT:
+            argv += ["-e", line]
+        return argv + [start, prompt]
+    if sys.platform.startswith("linux") and os.environ.get("DISPLAY"):
+        if shutil.which("zenity"):
+            return ["zenity", "--file-selection", "--directory",
+                    f"--title={prompt}", f"--filename={start}/"]
+        if shutil.which("kdialog"):
+            return ["kdialog", "--getexistingdirectory", start, "--title", prompt]
+    return None
+
+
+async def h_pick_dir(request: web.Request) -> web.Response:
+    """Show the OS folder dialog on this machine and return the chosen path."""
+    body = await request.json() if request.can_read_body else {}
+    start = _start_dir(str((body or {}).get("start") or ""))
+    argv = _folder_dialog_argv(start, "Choose the agent workspace")
+    if argv is None:
+        return web.json_response({"ok": False, "error": "unavailable"})
+    if _PICK_LOCK.locked():
+        return web.json_response({"ok": False, "error": "busy"})
+    async with _PICK_LOCK:
+        rc, out, _err = await _run(argv, timeout=300)
+    path = out.strip().rstrip(os.sep) or ""
+    if rc != 0 or not path:
+        # cancel (osascript -128 / zenity 1) or timeout
+        return web.json_response({"ok": False, "error": "cancelled"})
+    path = os.path.realpath(path)
+    return web.json_response({"ok": True, "path": _display_path(path)})
+
+
+async def h_list_dirs(request: web.Request) -> web.Response:
+    """Subdirectories of one directory under home, for the in-page browser.
+
+    Names only, never file contents; hidden directories are skipped and
+    anything outside the home directory is refused.
+    """
+    home = _home_dir()
+    path = os.path.realpath(os.path.expanduser(request.query.get("path") or "~"))
+    if path != home and not path.startswith(home + os.sep):
+        return web.json_response({"ok": False, "error": "outside home directory"})
+    if not os.path.isdir(path):
+        return web.json_response({"ok": False, "error": "directory does not exist"})
+    dirs: list[dict[str, Any]] = []
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.name.startswith(".") or not entry.is_dir(follow_symlinks=False):
+                    continue
+                dirs.append(
+                    {
+                        "name": entry.name,
+                        "path": _display_path(entry.path),
+                        "git": os.path.exists(os.path.join(entry.path, ".git")),
+                    }
+                )
+    except OSError:
+        return web.json_response({"ok": False, "error": "directory is not readable"})
+    dirs.sort(key=lambda item: item["name"].lower())
+    parent = os.path.dirname(path)
+    return web.json_response(
+        {
+            "ok": True,
+            "path": _display_path(path),
+            "parent": _display_path(parent) if path != home else "",
+            "git": os.path.exists(os.path.join(path, ".git")),
+            "dirs": dirs[:_DIR_LIST_LIMIT],
+            "truncated": len(dirs) > _DIR_LIST_LIMIT,
+            "picker": _folder_dialog_argv(path, "") is not None,
+        }
+    )
 
 
 async def _repo_reachable(repo: str) -> bool | None:
@@ -2645,6 +2765,22 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
 .wsedit{margin-top:12px;padding:16px;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--bg)}
 .wsedit[hidden]{display:none}
 .ctl .wsedit{grid-column:1/-1;margin-top:0}
+.wspick{display:flex;gap:6px;align-items:center}
+.wspick input{flex:1;min-width:0}
+.wspick .btn{padding:8px 11px}
+.dirbrowser{margin-top:10px;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--surface);overflow:hidden}
+.dirbrowser[hidden]{display:none}
+.dirbrowser .dirbar{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid var(--line)}
+.dirbrowser .dirpath{flex:1;min-width:0;font-family:var(--mono);font-size:.76rem;color:var(--ink);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.dirbrowser .dirlist{max-height:240px;overflow:auto;padding:4px}
+.dirbrowser .dir{appearance:none;display:flex;align-items:center;gap:8px;width:100%;border:0;background:transparent;
+  padding:7px 10px;border-radius:var(--r);font-family:var(--mono);font-size:.78rem;color:var(--ink-2);cursor:pointer;text-align:left}
+.dirbrowser .dir:hover,.dirbrowser .dir:focus-visible{background:var(--tile);color:var(--ink)}
+.dirbrowser .dir::before{content:"";width:12px;height:9px;flex:none;border:1.5px solid var(--faint);border-radius:2px}
+.dirbrowser .dir.git::before{border-color:var(--accent);background:var(--accent-wash)}
+.dirbrowser .dir .chip{margin-left:auto}
+.dirbrowser .empty{padding:10px 12px}
 .wsedit.open{animation:rise .35s var(--out) both}
 .wsinfo{display:flex;align-items:center;gap:6px 10px;flex-wrap:wrap;font-family:var(--mono);font-size:.74rem;color:var(--muted);margin-top:12px}
 .wsinfo:empty{display:none}
@@ -3296,7 +3432,7 @@ const I18N={
    'cfg.save':'保存','cfg.setup':'设置','cfg.retoken':'重设 token','cfg.required':'必需','cfg.optional':'可选',
    'wz.s1':'1. 点「用此 manifest 在 Slack 创建」（或打开 api.slack.com/apps →「From a manifest」贴入下方）→ 选择 workspace → Create → Install to Workspace',
    'wz.copy':'复制 manifest','wz.create':'用此 manifest 在 Slack 创建','wz.s2':'2. 粘贴 Bot Token (xoxb-) 与 App-Level Token (xapp-, connections:write)：',
-   'wz.save':'验证并写入 .env','tok.copied':'manifest 已复制','saved':'✓ 已保存','savefail':'保存失败','unlock.title':'需要控制令牌','unlock.hint':'这个节点启用了控制认证。输入 .env 里为你（owner）配置的控制 Bearer 令牌；只保存在本标签页的会话里。','unlock.save':'解锁','unlock.bad':'令牌不正确，请重新输入。','ws.title':'本地 workspace','ws.edit':'修改','ws.path':'目录（绝对路径或 ~/…）','ws.repo':'GitHub 仓库（OWNER/REPO，留空沿用默认）','ws.check':'检查','ws.unset':'未设置（使用 CLAUDE_WORKSPACE 或启动目录）','ws.nogit':'不是 git 仓库，GitHub 协作不可用','ws.branch':'分支','ws.mismatch':'origin 与 GitHub 仓库不一致，GitHub 协作会被禁用','ws.useorigin':'改用 {r}','ws.setup':'设置 workspace','ws.ok':'就绪','ws.missing':'目录不存在','ws.unsetshort':'未设置','ws.nogitshort':'不是 git 仓库','ws.mismatchshort':'origin 不一致','ws.badreposhort':'GitHub 仓库不可用','ws.badrepo':'GitHub 上找不到 {r}，或当前 gh 账号无权访问；GitHub 协作会被禁用','ws.checking':'检查中…','guide.local.ws':'workspace 是 agent 读写代码的本机目录，必须是目标 GitHub 仓库的 clone（origin 指向 agent 的 OWNER/REPO）。在「团队构成」每张 agent 卡片里设置；打开时会自动检查目录、git、origin 和仓库能否访问。','guide.local.ev4':'每张 agent 卡片的 workspace 显示「就绪」','guide.goto.ws':'去设置 workspace','ws.ghoff':'{r} 的 GitHub 协作已禁用','cfg.editpersona':'编辑内容','cfg.restarthint':'重启 multi_app 生效','cfg.worktreerootrestart':'worktree root 仅在重启后生效；重启前请先用旧 root clean remove 仍存活的映射',
+   'wz.save':'验证并写入 .env','tok.copied':'manifest 已复制','saved':'✓ 已保存','savefail':'保存失败','unlock.title':'需要控制令牌','unlock.hint':'这个节点启用了控制认证。输入 .env 里为你（owner）配置的控制 Bearer 令牌；只保存在本标签页的会话里。','unlock.save':'解锁','unlock.bad':'令牌不正确，请重新输入。','ws.title':'本地 workspace','ws.edit':'修改','ws.path':'目录（绝对路径或 ~/…）','ws.repo':'GitHub 仓库（OWNER/REPO，留空沿用默认）','ws.check':'检查','ws.unset':'未设置（使用 CLAUDE_WORKSPACE 或启动目录）','ws.nogit':'不是 git 仓库，GitHub 协作不可用','ws.branch':'分支','ws.mismatch':'origin 与 GitHub 仓库不一致，GitHub 协作会被禁用','ws.useorigin':'改用 {r}','ws.setup':'设置 workspace','ws.ok':'就绪','ws.missing':'目录不存在','ws.unsetshort':'未设置','ws.nogitshort':'不是 git 仓库','ws.mismatchshort':'origin 不一致','ws.badreposhort':'GitHub 仓库不可用','ws.badrepo':'GitHub 上找不到 {r}，或当前 gh 账号无权访问；GitHub 协作会被禁用','ws.checking':'检查中…','guide.local.ws':'workspace 是 agent 读写代码的本机目录，必须是目标 GitHub 仓库的 clone（origin 指向 agent 的 OWNER/REPO）。在「团队构成」每张 agent 卡片里设置；打开时会自动检查目录、git、origin 和仓库能否访问。','guide.local.ev4':'每张 agent 卡片的 workspace 显示「就绪」','guide.goto.ws':'去设置 workspace','ws.ghoff':'{r} 的 GitHub 协作已禁用','ws.pick':'选择…','ws.browse':'浏览','ws.pickfail':'这台机器无法弹出系统对话框，已改用页面内浏览','ws.up':'上一级','ws.choose':'选择此目录','ws.close':'收起','ws.nodirs':'这里没有子目录','cfg.editpersona':'编辑内容','cfg.restarthint':'重启 multi_app 生效','cfg.worktreerootrestart':'worktree root 仅在重启后生效；重启前请先用旧 root clean remove 仍存活的映射',
       'nav.auth':'认证','auth.title':'认证','auth.sub':'智能体实际运行环境（优先 Docker 容器，否则本机）的登录凭据。',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
    'auth.signin':'开始登录','auth.openurl':'打开下方链接完成授权，再把页面给出的 code 粘贴回来。',
@@ -3365,7 +3501,7 @@ const I18N={
    'cfg.save':'保存','cfg.setup':'セットアップ','cfg.retoken':'token 再設定','cfg.required':'必須','cfg.optional':'任意',
    'wz.s1':'1.「この manifest で Slack に作成」を押す（または api.slack.com/apps →「From a manifest」に下記を貼付）→ workspace を選択 → Create → Install to Workspace',
    'wz.copy':'manifest をコピー','wz.create':'この manifest で Slack に作成','wz.s2':'2. Bot Token (xoxb-) と App-Level Token (xapp-, connections:write) を貼付:',
-   'wz.save':'検証して .env に保存','tok.copied':'manifest コピー','saved':'✓ 保存','savefail':'保存に失敗しました','unlock.title':'コントロールトークンが必要です','unlock.hint':'このノードはコントロール認証が有効です。.env に自分（owner）用に設定したコントロール Bearer トークンを入力してください。このタブのセッションにだけ保存されます。','unlock.save':'ロック解除','unlock.bad':'トークンが正しくありません。もう一度入力してください。','ws.title':'ローカル workspace','ws.edit':'変更','ws.path':'ディレクトリ（絶対パスまたは ~/…）','ws.repo':'GitHub リポジトリ（OWNER/REPO、空欄なら既定を使用）','ws.check':'確認','ws.unset':'未設定（CLAUDE_WORKSPACE または起動ディレクトリ）','ws.nogit':'git リポジトリではないため GitHub 連携は使えません','ws.branch':'ブランチ','ws.mismatch':'origin と GitHub リポジトリが一致しないため GitHub 連携は無効になります','ws.useorigin':'{r} を使う','ws.setup':'workspace を設定','ws.ok':'準備完了','ws.missing':'ディレクトリなし','ws.unsetshort':'未設定','ws.nogitshort':'git リポジトリではない','ws.mismatchshort':'origin 不一致','ws.badreposhort':'GitHub リポジトリ不可','ws.badrepo':'GitHub に {r} が見つからないか、現在の gh アカウントに権限がありません。GitHub 連携は無効になります','ws.checking':'確認中…','guide.local.ws':'workspace は agent がコードを読み書きするローカルディレクトリで、対象 GitHub リポジトリの clone（origin が agent の OWNER/REPO）である必要があります。「チーム構成」の各 agent カードで設定し、開くとディレクトリ・git・origin・リポジトリへのアクセスを自動で確認します。','guide.local.ev4':'各 agent カードの workspace が「準備完了」','guide.goto.ws':'workspace を設定','ws.ghoff':'{r} の GitHub 連携は無効','cfg.editpersona':'内容を編集','cfg.restarthint':'multi_app 再起動で反映','cfg.worktreerootrestart':'worktree root は再起動時だけ反映されます。稼働中の mapping は先に旧 root 設定で clean remove してください',
+   'wz.save':'検証して .env に保存','tok.copied':'manifest コピー','saved':'✓ 保存','savefail':'保存に失敗しました','unlock.title':'コントロールトークンが必要です','unlock.hint':'このノードはコントロール認証が有効です。.env に自分（owner）用に設定したコントロール Bearer トークンを入力してください。このタブのセッションにだけ保存されます。','unlock.save':'ロック解除','unlock.bad':'トークンが正しくありません。もう一度入力してください。','ws.title':'ローカル workspace','ws.edit':'変更','ws.path':'ディレクトリ（絶対パスまたは ~/…）','ws.repo':'GitHub リポジトリ（OWNER/REPO、空欄なら既定を使用）','ws.check':'確認','ws.unset':'未設定（CLAUDE_WORKSPACE または起動ディレクトリ）','ws.nogit':'git リポジトリではないため GitHub 連携は使えません','ws.branch':'ブランチ','ws.mismatch':'origin と GitHub リポジトリが一致しないため GitHub 連携は無効になります','ws.useorigin':'{r} を使う','ws.setup':'workspace を設定','ws.ok':'準備完了','ws.missing':'ディレクトリなし','ws.unsetshort':'未設定','ws.nogitshort':'git リポジトリではない','ws.mismatchshort':'origin 不一致','ws.badreposhort':'GitHub リポジトリ不可','ws.badrepo':'GitHub に {r} が見つからないか、現在の gh アカウントに権限がありません。GitHub 連携は無効になります','ws.checking':'確認中…','guide.local.ws':'workspace は agent がコードを読み書きするローカルディレクトリで、対象 GitHub リポジトリの clone（origin が agent の OWNER/REPO）である必要があります。「チーム構成」の各 agent カードで設定し、開くとディレクトリ・git・origin・リポジトリへのアクセスを自動で確認します。','guide.local.ev4':'各 agent カードの workspace が「準備完了」','guide.goto.ws':'workspace を設定','ws.ghoff':'{r} の GitHub 連携は無効','ws.pick':'選択…','ws.browse':'参照','ws.pickfail':'このマシンではシステムのダイアログを開けないため、画面内で参照します','ws.up':'上へ','ws.choose':'このフォルダを選択','ws.close':'閉じる','ws.nodirs':'サブフォルダはありません','cfg.editpersona':'内容を編集','cfg.restarthint':'multi_app 再起動で反映','cfg.worktreerootrestart':'worktree root は再起動時だけ反映されます。稼働中の mapping は先に旧 root 設定で clean remove してください',
       'nav.auth':'認証','auth.title':'認証','auth.sub':'エージェントが実際に動く環境（優先：Docker コンテナ／なければこのホスト）のログイン情報です。',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
    'auth.signin':'ログイン開始','auth.openurl':'下のリンクで承認し、表示された code を貼り付けてください。',
@@ -3434,7 +3570,7 @@ const I18N={
    'cfg.save':'Save','cfg.setup':'Set up','cfg.retoken':'Reset tokens','cfg.required':'required','cfg.optional':'optional',
    'wz.s1':'1. Click "Create in Slack from this manifest" (or open api.slack.com/apps → "From a manifest" and paste below) → pick the workspace → Create → Install to Workspace',
    'wz.copy':'Copy manifest','wz.create':'Create in Slack from this manifest','wz.s2':'2. Paste Bot Token (xoxb-) and App-Level Token (xapp-, connections:write):',
-   'wz.save':'Verify & save to .env','tok.copied':'manifest copied','saved':'✓ Saved','savefail':'save failed','unlock.title':'Control token required','unlock.hint':'This node requires control authentication. Enter the control bearer token configured for you (the owner) in .env; it is kept in this tab session only.','unlock.save':'Unlock','unlock.bad':'That token was rejected. Try again.','ws.title':'Local workspace','ws.edit':'Change','ws.path':'Directory (absolute path or ~/…)','ws.repo':'GitHub repo (OWNER/REPO; empty inherits the default)','ws.check':'Check','ws.unset':'not set (falls back to CLAUDE_WORKSPACE or the launch directory)','ws.nogit':'not a git repo; GitHub collaboration is unavailable','ws.branch':'branch','ws.mismatch':'origin differs from the GitHub repo; GitHub collaboration will be disabled','ws.useorigin':'Use {r}','ws.setup':'Set workspace','ws.ok':'ready','ws.missing':'directory missing','ws.unsetshort':'not set','ws.nogitshort':'not a git repo','ws.mismatchshort':'origin mismatch','ws.badreposhort':'repo unreachable','ws.badrepo':'{r} was not found on GitHub, or the current gh account cannot access it; GitHub collaboration will be disabled','ws.checking':'checking…','guide.local.ws':'The workspace is the local directory where an agent reads and writes code. It must be a clone of the target GitHub repository (origin points at the agent OWNER/REPO). Set it on each agent card under Setup; opening it checks the directory, git, origin, and repo access automatically.','guide.local.ev4':'Every agent card shows its workspace as ready','guide.goto.ws':'Set up workspaces','ws.ghoff':'GitHub disabled for {r}','cfg.editpersona':'Edit content','cfg.restarthint':'restart multi_app to apply','cfg.worktreerootrestart':'worktree root applies only after restart; clean-remove live mappings with the old root first',
+   'wz.save':'Verify & save to .env','tok.copied':'manifest copied','saved':'✓ Saved','savefail':'save failed','unlock.title':'Control token required','unlock.hint':'This node requires control authentication. Enter the control bearer token configured for you (the owner) in .env; it is kept in this tab session only.','unlock.save':'Unlock','unlock.bad':'That token was rejected. Try again.','ws.title':'Local workspace','ws.edit':'Change','ws.path':'Directory (absolute path or ~/…)','ws.repo':'GitHub repo (OWNER/REPO; empty inherits the default)','ws.check':'Check','ws.unset':'not set (falls back to CLAUDE_WORKSPACE or the launch directory)','ws.nogit':'not a git repo; GitHub collaboration is unavailable','ws.branch':'branch','ws.mismatch':'origin differs from the GitHub repo; GitHub collaboration will be disabled','ws.useorigin':'Use {r}','ws.setup':'Set workspace','ws.ok':'ready','ws.missing':'directory missing','ws.unsetshort':'not set','ws.nogitshort':'not a git repo','ws.mismatchshort':'origin mismatch','ws.badreposhort':'repo unreachable','ws.badrepo':'{r} was not found on GitHub, or the current gh account cannot access it; GitHub collaboration will be disabled','ws.checking':'checking…','guide.local.ws':'The workspace is the local directory where an agent reads and writes code. It must be a clone of the target GitHub repository (origin points at the agent OWNER/REPO). Set it on each agent card under Setup; opening it checks the directory, git, origin, and repo access automatically.','guide.local.ev4':'Every agent card shows its workspace as ready','guide.goto.ws':'Set up workspaces','ws.ghoff':'GitHub disabled for {r}','ws.pick':'Choose…','ws.browse':'Browse','ws.pickfail':'No system folder dialog on this machine; browsing in the page instead','ws.up':'Up','ws.choose':'Use this folder','ws.close':'Close','ws.nodirs':'No subfolders here','cfg.editpersona':'Edit content','cfg.restarthint':'restart multi_app to apply','cfg.worktreerootrestart':'worktree root applies only after restart; clean-remove live mappings with the old root first',
       'nav.auth':'Auth','auth.title':'Authentication','auth.sub':'Sign-in for the runtime agents actually use (Docker when up, otherwise this host).',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
    'auth.signin':'Start sign-in','auth.openurl':'Open the link below to authorize, then paste the code it shows.',
@@ -4118,10 +4254,13 @@ function workspaceEditor(workspace,explicitRepo,effectiveRepo){
   return `<div class="wsedit" hidden>
       <div class="grid2">
         <div><span class="lbl">${t('ws.path')}</span>
-          <input class="ws-input" value="${esc(workspace||'')}" placeholder="~/workspace/my-repo" spellcheck="false" autocomplete="off"></div>
+          <div class="wspick"><input class="ws-input" value="${esc(workspace||'')}" placeholder="~/workspace/my-repo" spellcheck="false" autocomplete="off">
+            <button class="btn line" type="button" data-action="pick-dir">${t('ws.pick')}</button>
+            <button class="btn text" type="button" data-action="browse-dir">${t('ws.browse')}</button></div></div>
         <div><span class="lbl">${t('ws.repo')}</span>
           <input class="repo-input" value="${esc(explicitRepo||'')}" placeholder="${esc(effectiveRepo||'OWNER/REPO')}" spellcheck="false" autocomplete="off"></div>
       </div>
+      <div class="dirbrowser" hidden></div>
       <div class="wsinfo"></div>
       <div class="rowbtns" style="margin-top:12px">
         <button class="btn line" data-action="check-workspace">${t('ws.check')}</button>
@@ -4147,6 +4286,31 @@ async function editWorkspace(card){
   card.querySelector('.ws-input').focus();
   checkWorkspace(n,card);
 }
+// folder picking: the OS dialog when this machine has one, else in-page browsing
+async function pickDir(n,card){
+  const input=card.querySelector('.ws-input');
+  let r;try{r=await j('/api/fs/pick-dir',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({start:input.value})});}catch(e){r={ok:false,error:'unavailable'};}
+  if(r.ok){input.value=r.path;closeDirs(card);checkWorkspace(n,card);return;}
+  if(r.error==='cancelled'||r.error==='busy')return;
+  toast(t('ws.pickfail'));browseDirs(card,input.value||'~');
+}
+async function browseDirs(card,path){
+  const box=card.querySelector('.dirbrowser');
+  let r;try{r=await j('/api/fs/dirs?path='+encodeURIComponent(path||'~'));}catch(e){r={ok:false,error:'fetch failed'};}
+  if(!r.ok&&path!=='~'){return browseDirs(card,'~');}
+  box.hidden=false;
+  if(!r.ok){box.innerHTML=`<div class="empty">✕ ${esc(r.error||'')}</div>`;return;}
+  const rows=(r.dirs||[]).map(d=>`<button class="dir${d.git?' git':''}" type="button" data-action="dir-open" data-path="${esc(d.path)}">${esc(d.name)}${d.git?'<span class="chip">git</span>':''}</button>`).join('');
+  box.innerHTML=`<div class="dirbar">
+      <button class="btn text" type="button" data-action="dir-open" data-path="${esc(r.parent||'')}" ${r.parent?'':'disabled'}>↑ ${t('ws.up')}</button>
+      <span class="dirpath" title="${esc(r.path)}">${esc(r.path)}</span>
+      <button class="btn solid" type="button" data-action="dir-choose" data-path="${esc(r.path)}">${t('ws.choose')}</button>
+      <button class="btn text" type="button" data-action="dir-close" aria-label="${esc(t('ws.close'))}">✕</button>
+    </div>
+    <div class="dirlist">${rows||`<div class="empty">${t('ws.nodirs')}</div>`}</div>`;
+}
+function closeDirs(card){const box=card.querySelector('.dirbrowser');if(box){box.hidden=true;box.innerHTML='';}}
 function workspaceBody(card,dryRun){
   return JSON.stringify({workspace:card.querySelector('.ws-input').value,
     github_repo:card.querySelector('.repo-input').value,dry_run:!!dryRun});
@@ -4266,6 +4430,11 @@ document.addEventListener('click',event=>{
   else if(action==='setup')toggle(n,root);
   else if(action==='edit-persona')editP(root);
   else if(action==='edit-workspace')editWorkspace(root);
+  else if(action==='pick-dir')pickDir(n,root);
+  else if(action==='browse-dir')browseDirs(root,root.querySelector('.ws-input').value||'~');
+  else if(action==='dir-open'){if(control.dataset.path)browseDirs(root,control.dataset.path);}
+  else if(action==='dir-choose'){root.querySelector('.ws-input').value=control.dataset.path||'';closeDirs(root);checkWorkspace(n,root);}
+  else if(action==='dir-close')closeDirs(root);
   else if(action==='check-workspace')checkWorkspace(n,root);
   else if(action==='save-workspace')saveWorkspace(n,root);
   else if(action==='use-origin'){root.querySelector('.repo-input').value=control.dataset.repo||'';checkWorkspace(n,root);}
@@ -4633,6 +4802,8 @@ def make_app(
     app.router.add_post("/api/agents", h_save_agent)
     app.router.add_post("/api/agents/{name}/persona", h_update_persona)
     app.router.add_post("/api/agents/{name}/workspace", h_update_workspace)
+    app.router.add_post("/api/fs/pick-dir", h_pick_dir)
+    app.router.add_get("/api/fs/dirs", h_list_dirs)
     app.router.add_get("/api/issues", h_issues)
     app.router.add_get("/api/channel-rules", h_channel_rules)
     app.router.add_get("/api/live/state", h_live_state)

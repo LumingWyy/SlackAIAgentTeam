@@ -220,7 +220,7 @@ Four tabs:
 
 - Agent list, token status (bot / app), runtime, role summary
 - **Setup wizard**: generate per-agent manifest → **Create in Slack from this manifest** (opens Slack's create page already filled in; copying the manifest by hand still works) → paste tokens → verify (`auth.test` + `apps.connections.open`) → write `.env`
-- **Local workspace**: each agent card edits `workspace` and `github_repo`. **Check** confirms the directory exists, whether it is a git repo, its branch and origin, and warns when origin differs from the repo (GitHub collaboration would be disabled), with one click to adopt origin's repo; saving hot-reloads, and an empty `github_repo` inherits the default
+- **Local workspace**: each agent card edits `workspace` and `github_repo`. **Check** confirms the directory exists, whether it is a git repo, its branch and origin, and warns when origin differs from the repo (GitHub collaboration would be disabled), with one click to adopt origin's repo; saving hot-reloads, and an empty `github_repo` inherits the default. Type the directory, click **Choose…** for the machine's own folder dialog (macOS, or a Linux desktop with zenity / kdialog), or **Browse** to walk folders in the page (home directory only, git repos marked)
 - **Edit persona** / **Add agent**
 
 **Auth** verifies the Claude, Codex, and GitHub login in the environment that

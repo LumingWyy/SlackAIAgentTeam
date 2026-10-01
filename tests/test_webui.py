@@ -1893,3 +1893,90 @@ def test_monitor_cards_can_set_the_workspace_without_losing_input():
     for key in ("ws.setup", "ws.ok", "ws.badrepo", "ws.ghoff", "guide.local.ws", "guide.goto.ws"):
         assert script.count(f"'{key}':") >= 3, key
     assert "function openWorkspaceSettings()" in script
+
+
+# ---------------------------------------------------------------------------
+# Folder picking for the workspace editor
+# ---------------------------------------------------------------------------
+
+
+def _fs_get(path_query):
+    async def _run():
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async with TestClient(TestServer(webui.make_app())) as client:
+            return await (await client.get("/api/fs/dirs", params={"path": path_query})).json()
+
+    return asyncio.run(_run())
+
+
+def _fs_pick(body=None):
+    async def _run():
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async with TestClient(TestServer(webui.make_app())) as client:
+            return await (await client.post("/api/fs/pick-dir", json=body or {})).json()
+
+    return asyncio.run(_run())
+
+
+def test_dir_browser_lists_folders_under_home_only(tmp_path, monkeypatch):
+    _workspace_app(tmp_path, monkeypatch, "agents:\n- name: a\n  persona: p\n")
+    home = tmp_path / "home"
+    (home / "workspace" / "widgets" / ".git").mkdir(parents=True)
+    (home / "workspace" / "notes").mkdir()
+    (home / "workspace" / ".cache").mkdir()
+    (home / "workspace" / "README.txt").write_text("x")
+    monkeypatch.setenv("HOME", str(home))
+    data = _fs_get("~/workspace")
+    assert data["ok"] is True
+    assert data["path"] == "~/workspace" and data["parent"] == "~"
+    assert [(d["name"], d["git"]) for d in data["dirs"]] == [("notes", False), ("widgets", True)]
+    assert data["dirs"][1]["path"] == "~/workspace/widgets"
+    assert _fs_get("~")["parent"] == ""
+    assert _fs_get("/")["ok"] is False
+    assert _fs_get(str(tmp_path))["ok"] is False  # the parent of home
+    assert _fs_get("~/missing")["ok"] is False
+
+
+def test_folder_dialog_returns_the_picked_path(tmp_path, monkeypatch):
+    _workspace_app(tmp_path, monkeypatch, "agents:\n- name: a\n  persona: p\n")
+    home = tmp_path / "home"
+    (home / "workspace" / "widgets").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(webui, "_folder_dialog_argv", lambda start, prompt: ["dialog", start])
+    outcomes = iter([(0, f"{home}/workspace/widgets/\n", ""), (1, "", "User canceled. (-128)")])
+    seen = []
+
+    async def fake_run(argv, timeout=15.0):
+        seen.append(argv)
+        return next(outcomes)
+
+    monkeypatch.setattr(webui, "_run", fake_run)
+    assert _fs_pick({"start": "~/workspace/nope"}) == {"ok": True, "path": "~/workspace/widgets"}
+    # the dialog opens at the nearest existing folder
+    assert seen[0] == ["dialog", str(home / "workspace")]
+    assert _fs_pick() == {"ok": False, "error": "cancelled"}
+    monkeypatch.setattr(webui, "_folder_dialog_argv", lambda start, prompt: None)
+    assert _fs_pick() == {"ok": False, "error": "unavailable"}
+
+
+def test_macos_folder_dialog_passes_paths_as_arguments(monkeypatch):
+    monkeypatch.setattr(webui.sys, "platform", "darwin")
+    monkeypatch.setattr(webui.shutil, "which", lambda name: "/usr/bin/" + name)
+    argv = webui._folder_dialog_argv('/tmp/a "b"', "Choose")
+    assert argv[0] == "osascript"
+    # paths reach AppleScript through argv, never spliced into the script text
+    assert argv[-2:] == ['/tmp/a "b"', "Choose"]
+    assert not any('a "b"' in arg for arg in argv[:-2])
+    monkeypatch.setattr(webui.sys, "platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    assert webui._folder_dialog_argv("/tmp", "x") is None
+
+
+def test_workspace_editor_offers_pick_and_browse():
+    script = _main_script(webui.INDEX_HTML)
+    assert 'data-action="pick-dir"' in script and 'data-action="browse-dir"' in script
+    assert "/api/fs/pick-dir" in script and "/api/fs/dirs?path=" in script
+    for key in ("ws.pick", "ws.browse", "ws.pickfail", "ws.up", "ws.choose", "ws.close", "ws.nodirs"):
+        assert script.count(f"'{key}':") >= 3, key
