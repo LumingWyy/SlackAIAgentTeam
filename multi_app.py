@@ -79,6 +79,7 @@ from multi_core import (
     classify_runtime_failure,
     codex_usage_delta,
     context_window_tokens,
+    format_stopped_notice,
     classify_sender,
     constrain_handoff_targets,
     default_slack_token_env_names,
@@ -3018,6 +3019,14 @@ class SlackAgent:
         self._slack_files_prepare_lock = threading.Lock()
         # Strong refs for fire-and-forget tasks so GC does not drop them mid-flight
         self._tasks: set[asyncio.Task] = set()
+        # activation task → (trigger event, client, say), so an operator stop
+        # can tell each interrupted thread what happened
+        self._task_triggers: dict[asyncio.Task, tuple[dict, Any, Any]] = {}
+        # Operator stop (console): refuse new work until resumed. Kept in the
+        # state store so a stopped agent stays stopped across restarts.
+        self.paused = bool(self._store is not None and self._store.agent_paused(self.name))
+        self._paused_notified: set[str] = set()
+        self._patrol_round: asyncio.Task | None = None
         # Bumped whenever this agent's sessions are cleared wholesale (runtime /
         # workspace change, session restart); in-flight turns discard session writes
         # if the generation no longer matches (a stale engine session id must not be
@@ -4117,6 +4126,17 @@ class SlackAgent:
                 )
             return
 
+        # 6b. Stopped by the operator: acknowledge, start nothing
+        if self.paused:
+            await self._set_reaction(
+                client, channel, ts, add="double_vertical_bar"
+            )
+            if thread_key not in self._paused_notified:
+                self._paused_notified.add(thread_key)
+                await say(text=format_stopped_notice(self.name), thread_ts=thread_ts)
+            logger.info("agent %s skip: stopped by the operator", self.name)
+            return
+
         # 7. Reserve owner quota before reserving node/queue capacity. The
         # provider's exact usage is known only after completion, so concurrent
         # agents reserve a configured conservative amount atomically.
@@ -4212,11 +4232,13 @@ class SlackAgent:
             thread_key,
         )
         self._tasks.add(task)
+        self._task_triggers[task] = (event, client, say)
         self._register_pending_trigger(execution_plan.thread_key, event)
         self._ledger_record(event, execution_plan)
 
         def _release(completed: asyncio.Task) -> None:
             self._tasks.discard(completed)
+            self._task_triggers.pop(completed, None)
             self._forget_trigger(execution_plan.thread_key, event)
             self._ledger_clear(event)
             self.runtime_limiter.release_admission(admission)
@@ -5732,10 +5754,25 @@ class SlackAgent:
                 # A patrol-enabled but initially repo-less agent can become
                 # active after a verified per-agent repo reload.
                 await self.consume_pending_config()
-                if self.github_repo:
+                if self.github_repo and not self.paused:
                     # Host-claim patrol: the claim tool picks and claims one
                     # issue before any provider turn is spent.
-                    await self._run_patrol_once(None, channel)
+                    round_task = asyncio.create_task(
+                        self._run_patrol_once(None, channel)
+                    )
+                    self._patrol_round = round_task
+                    try:
+                        await round_task
+                    except asyncio.CancelledError:
+                        current = asyncio.current_task()
+                        if current is not None and current.cancelling():
+                            raise  # the loop itself is shutting down
+                        logger.info(
+                            "agent %s patrol round stopped by the operator",
+                            self.name,
+                        )
+                    finally:
+                        self._patrol_round = None
             except Exception:
                 logger.warning(
                     "agent %s patrol_loop iteration failed",
@@ -6015,6 +6052,14 @@ class SlackAgent:
                         f"作業を中止しました（{exc.status}）。"
                         "issue の状態を確認してください。",
                     )
+                    raise
+                except asyncio.CancelledError:
+                    if self.paused:
+                        # Operator stop: return the issue to todo now rather
+                        # than leaving it claimed until the lease lapses.
+                        await self._release_stopped_claim(
+                            repo_snapshot, issue, config_snapshot, channel
+                        )
                     raise
             result = result_text or (
                 "(runtime からテキストの応答がありませんでした)"
@@ -7520,6 +7565,95 @@ class SlackAgent:
             {"reply_language": self.cfg.reply_language}
         )
 
+    def set_paused(self, paused: bool) -> None:
+        self.paused = paused
+        if not paused:
+            self._paused_notified.clear()
+        if self._store is not None:
+            self._store.set_agent_paused(self.name, paused)
+        logger.info(
+            "agent %s %s by the operator",
+            self.name,
+            "stopped" if paused else "resumed",
+        )
+
+    async def stop(self) -> dict[str, int]:
+        """Operator stop: refuse new work, then cancel what is running.
+
+        Pausing first means a trigger arriving mid-cancel is refused rather
+        than started. Interrupted threads are told why; a patrol round hands
+        its issue back. Stays stopped, across restarts, until ``resume``.
+        """
+        self.set_paused(True)
+        running = [task for task in self._tasks if not task.done()]
+        triggers = [self._task_triggers.get(task) for task in running]
+        patrol = self._patrol_round
+        cancelled = running + ([patrol] if patrol and not patrol.done() else [])
+        for task in cancelled:
+            task.cancel()
+        await asyncio.gather(*cancelled, return_exceptions=True)
+        told: set[tuple[str, str]] = set()
+        for trigger in triggers:
+            if trigger is None:
+                continue
+            event, client, say = trigger
+            channel = str(event.get("channel") or "")
+            ts = str(event.get("ts") or "")
+            thread_ts = str(event.get("thread_ts") or ts)
+            for working in ("hourglass_flowing_sand", "inbox_tray"):
+                await self._set_reaction(client, channel, ts, remove=working)
+            await self._set_reaction(
+                client, channel, ts, add="black_square_for_stop"
+            )
+            if (channel, thread_ts) in told:
+                continue
+            told.add((channel, thread_ts))
+            self._paused_notified.add(f"{channel}:{thread_ts}")
+            try:
+                await say(
+                    text=format_stopped_notice(self.name, interrupted=True),
+                    thread_ts=thread_ts,
+                )
+            except Exception:
+                logger.warning(
+                    "agent %s could not post the stop notice", self.name,
+                    exc_info=True,
+                )
+        return {
+            "cancelled": len(running),
+            "patrol_cancelled": int(len(cancelled) > len(running)),
+        }
+
+    def resume(self) -> None:
+        self.set_paused(False)
+
+    async def _release_stopped_claim(
+        self, repo: str | None, issue: int, config: AgentConfig, channel: str
+    ) -> None:
+        try:
+            result = await self._run_claim_tool(
+                "release", repo=repo, issue=issue, config=config
+            )
+            released = result.get("status") == "released"
+        except Exception:
+            logger.warning(
+                "agent %s could not release issue #%s after a stop",
+                self.name,
+                issue,
+                exc_info=True,
+            )
+            released = False
+        await self._post_result(
+            channel,
+            None,
+            f"⏹ {self.name} の巡回作業を停止しました。"
+            + (
+                f"issue #{issue} は todo に戻しました。"
+                if released
+                else f"issue #{issue} の claim を戻せませんでした。状態を確認してください。"
+            ),
+        )
+
     def restart_sessions(self) -> int:
         """Clear all thread sessions for this agent (clean restart after model switch). Returns count cleared.
 
@@ -8031,6 +8165,7 @@ class SlackAgent:
             "openai_base_url": self.cfg.openai_base_url,
             "reply_language": self.cfg.reply_language,
             "effort": self.cfg.effort,
+            "paused": self.paused,
             "user_id": self.user_id,
             "workspace": self.cfg.workspace,
             "workspace_mode": self.cfg.workspace_mode,
@@ -8926,6 +9061,17 @@ def build_admin_app(
         cleared = agent.restart_sessions()
         return aio_web.json_response({"ok": True, "cleared_sessions": cleared})
 
+    async def h_stop(request: aio_web.Request) -> aio_web.Response:
+        """Stop this agent: cancel running work, refuse new work until resumed."""
+        agent = request_agent(request)
+        result = await agent.stop()
+        return aio_web.json_response({"ok": True, "paused": True, **result})
+
+    async def h_resume(request: aio_web.Request) -> aio_web.Response:
+        agent = request_agent(request)
+        agent.resume()
+        return aio_web.json_response({"ok": True, "paused": False})
+
     async def h_set_reply_language(request: aio_web.Request) -> aio_web.Response:
         agent = request_agent(request)
         body = await request.json()
@@ -8989,6 +9135,8 @@ def build_admin_app(
     app.router.add_post("/agents/{name}/model", h_set_model)
     app.router.add_post("/agents/{name}/runtime", h_set_runtime)
     app.router.add_post("/agents/{name}/restart", h_restart)
+    app.router.add_post("/agents/{name}/stop", h_stop)
+    app.router.add_post("/agents/{name}/resume", h_resume)
     app.router.add_post("/agents/{name}/reply_language", h_set_reply_language)
     app.router.add_post("/agents/{name}/effort", h_set_effort)
     return app

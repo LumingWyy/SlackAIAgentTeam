@@ -1704,6 +1704,24 @@ async def h_live_restart(request: web.Request) -> web.Response:
     return web.json_response(data, status=status)
 
 
+async def _live_agent_action(request: web.Request, action: str) -> web.Response:
+    name = request.match_info["name"]
+    if not NAME_RE.match(name):
+        raise web.HTTPBadRequest(text="invalid name")
+    _require_agent_access(request, name, read_yaml())
+    data, status = await _admin_post(f"/agents/{name}/{action}", {})
+    return web.json_response(data, status=status)
+
+
+async def h_live_stop(request: web.Request) -> web.Response:
+    """Stop an agent: running work is cancelled, new work refused until resumed."""
+    return await _live_agent_action(request, "stop")
+
+
+async def h_live_resume(request: web.Request) -> web.Response:
+    return await _live_agent_action(request, "resume")
+
+
 async def h_live_remove_worktree(request: web.Request) -> web.Response:
     identity_digest = request.match_info["identity_digest"]
     if not re.fullmatch(r"[0-9a-f]{64}", identity_digest):
@@ -2800,6 +2818,9 @@ a:hover{text-decoration-color:var(--accent)}
 @keyframes rail{from{background-position:100% 0}to{background-position:-100% 0}}
 .state.idle{color:var(--good);background:oklch(0.6 0.13 152 / 0.12)}.state.idle::before{background:var(--good)}
 .state.off{color:var(--crit);background:oklch(0.59 0.2 27 / 0.12)}.state.off::before{background:var(--crit)}
+.state.paused{color:var(--ink-2);background:var(--tile)}.state.paused::before{border-radius:1.5px;background:var(--ink-2)}
+.btn.line.stop{color:var(--crit)}
+.btn.line.stop:hover{border-color:color-mix(in oklch,var(--crit) 45%,var(--line-2))}
 .rtline{font-family:var(--mono);font-size:.76rem;color:var(--ink-2)}
 .node .aux{margin-left:auto;font-family:var(--mono);font-size:.72rem;color:var(--faint)}
 
@@ -3602,7 +3623,7 @@ const I18N={
    'empty.noagents':'没有智能体。请在「构成」添加并启动 multi_app。',
    'st.busy':'运行中','st.idle':'待机','st.off':'未连接','model.def':'既定模型',
    'model.custom':'自定义模型 id','model.custom.hint':'任意模型名，如 grok-4.5 / Antigravity 转出模型；回车确认',
-   'lbl.runtime':'runtime','lbl.model':'模型','lbl.replylang':'回复语言','toast.lang':'✓ {n} 回复语言 → {l}','lbl.effort':'推理强度','toast.effort':'✓ {n} 推理强度 → {e}','btn.restart':'会话重启',
+   'lbl.runtime':'runtime','lbl.model':'模型','lbl.replylang':'回复语言','toast.lang':'✓ {n} 回复语言 → {l}','lbl.effort':'推理强度','toast.effort':'✓ {n} 推理强度 → {e}','btn.restart':'会话重启','btn.stop':'停止','btn.resume':'恢复','st.paused':'已停止','stop.confirm':'停止 {n}：中断进行中的 {c} 个任务（巡检领取的 issue 退回 todo），之后不接新任务，直到点「恢复」。','toast.stop':'⏹ {n} 已停止（中断 {c} 个任务）','toast.resume':'▶ {n} 已恢复',
    'confirm.q':'{n} 切换到 {m}？','btn.apply':'应用','btn.cancel':'取消',
    'threads.cap':'线程 {a} / {b}','th.run':'运行中','th.wait':'待机','th.left':'剩余',
    'aux':'会话 {s} · 巡逻 {p}','tk':'tok',
@@ -3671,7 +3692,7 @@ const I18N={
    'empty.noagents':'エージェントがありません。「構成」で追加し multi_app を起動してください。',
    'st.busy':'実行中','st.idle':'待機','st.off':'未接続','model.def':'既定モデル',
    'model.custom':'カスタムモデル id','model.custom.hint':'任意のモデル名（例: grok-4.5 / Antigravity）。Enter で確定',
-   'lbl.runtime':'runtime','lbl.model':'モデル','lbl.replylang':'返信言語','toast.lang':'✓ {n} 返信言語 → {l}','lbl.effort':'推論強度','toast.effort':'✓ {n} 推論強度 → {e}','btn.restart':'セッション再起動',
+   'lbl.runtime':'runtime','lbl.model':'モデル','lbl.replylang':'返信言語','toast.lang':'✓ {n} 返信言語 → {l}','lbl.effort':'推論強度','toast.effort':'✓ {n} 推論強度 → {e}','btn.restart':'セッション再起動','btn.stop':'停止','btn.resume':'再開','st.paused':'停止中','stop.confirm':'{n} を停止します：実行中の {c} 件を中断し（巡回で取った issue は todo に戻します）、「再開」するまで新しい依頼を受けません。','toast.stop':'⏹ {n} を停止（{c} 件中断）','toast.resume':'▶ {n} を再開',
    'confirm.q':'{n} を {m} に切り替えますか？','btn.apply':'適用','btn.cancel':'取消',
    'threads.cap':'スレッド {a} / {b}','th.run':'実行中','th.wait':'待機','th.left':'残',
    'aux':'セッション {s} · 巡回 {p}','tk':'tok',
@@ -3740,7 +3761,7 @@ const I18N={
    'empty.noagents':'No agents. Add one under Setup and start multi_app.',
    'st.busy':'Running','st.idle':'Idle','st.off':'Offline','model.def':'default model',
    'model.custom':'custom model id','model.custom.hint':'Any model id (e.g. grok-4.5 / Antigravity). Press Enter',
-   'lbl.runtime':'runtime','lbl.model':'model','lbl.replylang':'Reply language','toast.lang':'✓ {n} reply language → {l}','lbl.effort':'Reasoning effort','toast.effort':'✓ {n} effort → {e}','btn.restart':'Restart session',
+   'lbl.runtime':'runtime','lbl.model':'model','lbl.replylang':'Reply language','toast.lang':'✓ {n} reply language → {l}','lbl.effort':'Reasoning effort','toast.effort':'✓ {n} effort → {e}','btn.restart':'Restart session','btn.stop':'Stop','btn.resume':'Resume','st.paused':'Stopped','stop.confirm':'Stop {n}: interrupt {c} running task(s) (a patrol issue goes back to todo) and take no new work until you click Resume.','toast.stop':'⏹ {n} stopped ({c} task(s) interrupted)','toast.resume':'▶ {n} resumed',
    'confirm.q':'Switch {n} to {m}?','btn.apply':'Apply','btn.cancel':'Cancel',
    'threads.cap':'threads {a} / {b}','th.run':'running','th.wait':'idle','th.left':'left',
    'aux':'sessions {s} · patrol {p}','tk':'tok',
@@ -4147,6 +4168,7 @@ const ICON_CROSS='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" str
 function armQuestion(a){
   if(a.kind==='runtime')return t('rt.confirm',{n:a.agent,r:a.value});
   if(a.kind==='restart')return t('rs.confirm',{n:a.agent});
+  if(a.kind==='stop')return t('stop.confirm',{n:a.agent,c:a.value||0});
   return t('worktree.confirm');
 }
 function armBar(key){
@@ -4174,6 +4196,7 @@ async function fireArmed(key,bar){
   await new Promise(done=>setTimeout(done,reducedMotion()?0:420));
   if(a.kind==='runtime')await switchRuntime(a.agent,a.value);
   else if(a.kind==='restart')await restartSessions(a.agent);
+  else if(a.kind==='stop')await stopAgent(a.agent);
   else if(a.kind==='worktree')await doRemoveWorktree(a.digest);
 }
 document.addEventListener('click',event=>{
@@ -4328,8 +4351,8 @@ async function loadLive(){
     .map(([l,n])=>`<span class="metric">${t(l)} <b>${n}</b></span>`).join('');
   if(!ags.length){$('#roster').innerHTML=`<div class="node"><div class="empty">${t('empty.noagents')}</div></div>`;return;}
   $('#roster').innerHTML=ags.map((a,i)=>{
-    const c=a.busy_threads>0?'work':(a.connected?'idle':'off');
-    const s=a.busy_threads>0?t('st.busy'):(a.connected?t('st.idle'):t('st.off'));
+    const c=a.paused?'paused':(a.busy_threads>0?'work':(a.connected?'idle':'off'));
+    const s=a.paused?t('st.paused'):(a.busy_threads>0?t('st.busy'):(a.connected?t('st.idle'):t('st.off')));
     const dispModel=a.model?esc(a.model):((MODELS.current||{})[a.runtime]?esc((MODELS.current)[a.runtime]):t('model.def'));
     const pend=PENDING[a.name];
     const cfgPending=((a.config_reload||{}).pending||null);
@@ -4354,7 +4377,9 @@ async function loadLive(){
           <button class="rt ${a.runtime==='codex'?'on':''}" data-action="runtime" data-value="codex">codex</button>
           <button class="rt ${a.runtime==='openai'?'on':''}" data-action="runtime" data-value="openai">openai api</button>
         </div>
-        <div class="rowbtns"><button class="btn line" data-action="restart">${t('btn.restart')}</button></div>
+        <div class="rowbtns"><button class="btn line" data-action="restart">${t('btn.restart')}</button>
+          ${a.paused?`<button class="btn solid" data-action="resume">${t('btn.resume')}</button>`
+            :`<button class="btn line stop" data-action="stop" data-busy="${a.busy_threads||0}">${t('btn.stop')}</button>`}</div>
         <span class="lbl">${t('lbl.model')}</span>
         <div class="field">
           <select data-action="model">${modelOpts(a.runtime,a.model||'')}</select>
@@ -4397,6 +4422,13 @@ async function applyModel(n){const m=PENDING[n]||'';
 function askRuntime(n,rt,cur,root){if(rt===cur)return;
   arm('agent:'+n,{kind:'runtime',agent:n,value:rt},root&&root.querySelector('.arm-slot'));}
 function askRestart(n,root){arm('agent:'+n,{kind:'restart',agent:n},root&&root.querySelector('.arm-slot'));}
+function askStop(n,busy,root){arm('agent:'+n,{kind:'stop',agent:n,value:busy},root&&root.querySelector('.arm-slot'));}
+async function stopAgent(n){
+  const r=await j('/api/live/'+encodeURIComponent(n)+'/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  if(r.ok){toast(t('toast.stop',{n:n,c:r.cancelled||0}));loadLive();}else toast('✕ '+(r.error||t('toast.fail')),1);}
+async function resumeAgent(n){
+  const r=await j('/api/live/'+encodeURIComponent(n)+'/resume',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  if(r.ok){toast(t('toast.resume',{n:n}));loadLive();}else toast('✕ '+(r.error||t('toast.fail')),1);}
 async function switchRuntime(n,rt){
   const r=await j('/api/live/'+encodeURIComponent(n)+'/runtime',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runtime:rt})});
   if(r.ok){toast(t('toast.rt',{n:n,r:r.runtime}));loadLive();}else toast('✕ '+(r.error||t('toast.fail')),1);}
@@ -4706,6 +4738,8 @@ document.addEventListener('click',event=>{
   const n=root.dataset.agent, action=control.dataset.action;
   if(action==='runtime')askRuntime(n,control.dataset.value,root.dataset.runtime,root);
   else if(action==='restart')askRestart(n,root);
+  else if(action==='stop')askStop(n,Number(control.dataset.busy)||0,root);
+  else if(action==='resume')resumeAgent(n);
   else if(action==='model-apply')applyModel(n);
   else if(action==='model-cancel')cancelModel(n,root);
   else if(action==='setup')toggle(n,root);
@@ -5110,6 +5144,8 @@ def make_app(
     app.router.add_post("/api/live/{name}/model", h_live_set_model)
     app.router.add_post("/api/live/{name}/runtime", h_live_set_runtime)
     app.router.add_post("/api/live/{name}/restart", h_live_restart)
+    app.router.add_post("/api/live/{name}/stop", h_live_stop)
+    app.router.add_post("/api/live/{name}/resume", h_live_resume)
     app.router.add_post("/api/live/{name}/reply_language", h_live_set_reply_language)
     app.router.add_post("/api/live/{name}/effort", h_live_set_effort)
     app.router.add_get("/api/auth/state", h_auth_state)

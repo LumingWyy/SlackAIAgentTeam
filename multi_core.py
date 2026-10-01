@@ -2381,6 +2381,19 @@ def is_side_effect_tool(name: str) -> bool:
     return str(name or "") not in READ_ONLY_TOOL_NAMES
 
 
+def format_stopped_notice(agent: str, *, interrupted: bool = False) -> str:
+    """Slack notice for a thread that reached an agent its operator stopped."""
+    if interrupted:
+        return (
+            f"⏹ {agent} は操作者が停止しました。このスレッドの作業は中断しています。"
+            "再開はコンソールの「監視」から行えます。"
+        )
+    return (
+        f"⏸️ {agent} は停止中のため、このメッセージには応答しません。"
+        "再開はコンソールの「監視」から行えます。"
+    )
+
+
 def context_window_tokens(usage: dict | None) -> int:
     """Prompt tokens of ONE API call: fresh + cache read + cache write.
 

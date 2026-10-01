@@ -698,3 +698,96 @@ def test_batched_turn_clears_ledger_rows_of_absorbed_triggers(
     # Only the holder's own row remains until its task callback clears it.
     assert [row["trigger_ts"] for row in rows] == ["101.0"]
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# Operator stop (console)
+# ---------------------------------------------------------------------------
+
+def test_stop_cancels_running_work_and_tells_each_thread(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    started = asyncio.Event()
+
+    async def endless():
+        started.set()
+        await asyncio.sleep(3600)
+
+    rec = _wire(agent, [endless])
+
+    async def fake_run_turn(prompt, thread_key, gen, **kwargs):
+        rec.turns.append(prompt)
+        await endless()
+
+    agent._run_turn = fake_run_turn
+    notices = []
+
+    async def say(**kwargs):
+        notices.append(kwargs)
+
+    async def scenario():
+        events = [_event(ts="101.0"), _event(ts="102.0")]  # one thread, two triggers
+        for event in events:
+            task = asyncio.create_task(agent._activate_inner(event, object(), say))
+            agent._tasks.add(task)
+            agent._task_triggers[task] = (event, object(), say)
+        await started.wait()
+        result = await agent.stop()
+        return result, events
+
+    result, _events = asyncio.run(scenario())
+    assert result == {"cancelled": 2, "patrol_cancelled": 0}
+    assert agent.paused is True
+    assert rec.posts == []  # nothing half-finished was posted
+    assert len(notices) == 1 and notices[0]["thread_ts"] == "100.0"
+    assert "中断" in notices[0]["text"]
+    assert {"add": "black_square_for_stop", "remove": None} in rec.reactions
+    assert {"add": None, "remove": "hourglass_flowing_sand"} in rec.reactions
+
+
+def test_stop_survives_a_restart_until_resumed(tmp_path, monkeypatch):
+    from multi_app import Roster, SlackAgent, load_agents_config
+    from multi_core import TurnBudget
+    from state_store import StateStore
+
+    yaml_path = tmp_path / "agents.yaml"
+    yaml_path.write_text("agents:\n  - name: dev\n    persona: x\n", encoding="utf-8")
+    monkeypatch.setenv("DEV_SLACK_BOT_TOKEN", "xoxb-dev")
+    monkeypatch.setenv("DEV_SLACK_APP_TOKEN", "xapp-dev")
+    configs, _ = load_agents_config(str(yaml_path))
+
+    def boot(store):
+        return SlackAgent(
+            configs[0], budget=TurnBudget(8), roster=Roster(),
+            allowed_humans=set(), store=store,
+        )
+
+    store = StateStore(str(tmp_path / "state.db"))
+    boot(store).set_paused(True)
+    store.close()
+    store = StateStore(str(tmp_path / "state.db"))
+    agent = boot(store)
+    assert agent.paused is True
+    agent.resume()
+    store.close()
+    store = StateStore(str(tmp_path / "state.db"))
+    assert boot(store).paused is False
+    store.close()
+
+
+def test_stopped_patrol_round_hands_the_issue_back(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    calls, posts = [], []
+
+    async def claim_tool(action, *, repo, issue, config, stale_only=False):
+        calls.append((action, issue))
+        return {"status": "released"}
+
+    async def fake_post(_channel, _thread_ts, text):
+        posts.append(text)
+
+    agent._run_claim_tool = claim_tool
+    agent._post_result = fake_post
+    agent.paused = True
+    asyncio.run(agent._release_stopped_claim("acme/widgets", 7, agent.cfg, "C-PATROL"))
+    assert calls == [("release", 7)]
+    assert "#7" in posts[0] and "todo" in posts[0]

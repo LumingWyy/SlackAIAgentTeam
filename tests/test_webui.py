@@ -193,6 +193,38 @@ def test_issues_mirror_startup_for_remote_and_openai_agents(monkeypatch):
     assert fetch()["repos"] == ["acme/live", "acme/openai"]
 
 
+def test_monitor_card_can_stop_and_resume_an_agent():
+    html = webui.INDEX_HTML
+    script = _main_script(html)
+    assert 'data-action="stop" data-busy=' in script
+    assert 'data-action="resume"' in script
+    assert "if(a.kind==='stop')return t('stop.confirm'" in script  # inline confirm first
+    assert "else if(a.kind==='stop')await stopAgent(a.agent);" in script
+    assert "'/stop'" in script and "'/resume'" in script
+    for key in ("btn.stop", "btn.resume", "st.paused", "stop.confirm", "toast.stop", "toast.resume"):
+        assert script.count(f"'{key}':") == 3, key
+
+
+def test_stop_and_resume_proxy_to_the_admin_api(monkeypatch):
+    sent = []
+
+    async def fake_admin_post(path, body):
+        sent.append(path)
+        return {"ok": True, "paused": path.endswith("/stop")}, 200
+
+    monkeypatch.setattr(webui, "_admin_post", fake_admin_post)
+    monkeypatch.setattr(webui, "read_yaml", lambda: {"agents": [{"name": "dev"}]})
+    for handler, path in ((webui.h_live_stop, "/agents/dev/stop"), (webui.h_live_resume, "/agents/dev/resume")):
+        request = _IssuesRequest()
+        request.match_info = {"name": "dev"}
+        response = asyncio.run(handler(request))
+        assert response.status == 200
+        assert sent[-1] == path
+    routes = {(r.method, r.resource.canonical) for r in webui.make_app().router.routes() if r.resource}
+    assert ("POST", "/api/live/{name}/stop") in routes
+    assert ("POST", "/api/live/{name}/resume") in routes
+
+
 def test_gh_issues_timeout_kills_and_reaps_process(monkeypatch):
     class Process:
         returncode = None
