@@ -15,6 +15,7 @@ Multiple agents run Socket Mode in one Python process. In channels, an agent spe
 | `multi_app.py` | Multi-agent entry: config load, Roster, SlackAgent, Socket Mode |
 | `multi_core.py` | Pure logic layer (no slack/claude package deps) |
 | `state_store.py` | SQLite thread-state persistence (sessions / summaries survive restarts) |
+| `issue_claim.py` | Host-side GitHub issue claim tool (v2 lease: `claim` / `renew` / `release` / `verify`) |
 | `agents.yaml` | Agent definitions (`card` / persona, ownership, node, projects) |
 | `agents.distributed.example.yaml` | Two humans × two local agents distributed example |
 | `slack-app-manifest-agent.yaml` | Slack App manifest template (one App per agent) |
@@ -265,7 +266,11 @@ Manifest includes **`agent_view`** (Agent messaging UX). Requires `slack-bolt>=1
 
 - `trusted_feed_bots: [B0XXXXXXX]` in `agents.yaml` — allowlisted Slack app bots (e.g. GitHub) become read-only `[feed]` context; they never activate agents.
 - Human-attached files on the triggering message are downloaded to `<workspace>/.slack-files/` (max 3 files, 10MB each; swept after 48h). Agents read them with local tools.
-- Status uses reactions on the trigger message (⏳ while working → ✅ done / ❌ failed); no "working…" placeholder post.
+- Status uses reactions on the trigger message (📥 queued behind a busy thread or full node → ⏳ while working → ✅ done / ❌ failed / 🤐 reply withdrawn by the freshness recheck); no "working…" placeholder post. A provider cooldown wait of 30s+ posts one notice with the expected resume time.
+- Failures get an actionable notice by category (context too long → `!reset`; auth / billing → node owner). Patrol stops after 3 consecutive failures of one category, posts one notice to its channel, probes every 6th round, and resumes on the first success (`/state`: `patrol_fence`, `last_failure`).
+- A restart no longer leaves ⏳ forever: admitted activations are recorded in the state DB (`activation_ledger`), and on startup each one the previous process left unfinished gets ⚠️ and a thread notice asking the requester to check and re-mention. It is never re-run automatically, because the cut-off turn may already have pushed or commented.
+- Triggers that queue in one thread (e.g. "@dev add X", then "@dev also Y" while it is busy) are answered together in one turn, with every trigger listed in order, instead of a second turn re-answering what the first already saw as context.
+- A registered agent written as plain-text `@name` notifies nobody; the post gets a one-line warning instead of a silently stalled handoff.
 
 ## .env
 
@@ -361,7 +366,11 @@ When an agent’s latest turn input context (input + cache tokens) exceeds the t
 | Hard timeout | `claude_timeout` (default **900**s); releases lock and notifies thread |
 | Slack 429 | `AsyncRateLimitErrorRetryHandler` (Retry-After, up to 2 retries) |
 | Memory reclaim | Thread state idle **48h** reclaimed (scan ~every 10 min) |
-| Long threads | Shared bounded local transcript; only cold/incomplete threads backfill with cursor pages of at most 15 |
+| Long threads | Shared bounded local transcript; only cold/incomplete threads backfill with cursor pages of at most 15. When the context block must be truncated, the thread root (usually the task definition) is kept and the middle is dropped |
+| Reply freshness gate | Before posting, peer/allowed-human messages that arrived mid-turn trigger exactly one re-decide pass (`POST_ORIGINAL` / revised text / `NO_REPLY`); a verbatim duplicate of the latest non-self message is never posted. Reads only the local transcript (zero extra Slack API calls) and fails open on any gate error. Disable with `FRESHNESS_RECHECK=0` |
+| Provider rate-limit cooldown | A rate-limited AI turn (429 / usage-limit / overloaded signals from Claude, Codex, or the OpenAI API; `Retry-After` honored) arms a cooldown shared by every local agent on the same provider account (all Claude agents share the local Claude login, all Codex agents the Codex login; OpenAI is per endpoint + key variable) — base **60s**, doubling per consecutive strike up to **480s**. The turn is retried once after it expires only when that is provably safe: no side-effecting tool (shell, edit, MCP) ran, the provider's reset time fits within 15 minutes, and the thread was not reset; otherwise the thread gets a specific notice instead of a silent replay. A cooldown wait hands its node slot back so other agents keep running. Turns starting during a cooldown wait first; patrol rounds are skipped instead (next epoch retries). A clean turn resets the streak. State appears in `/state` as `provider_cooldown`; tune with `PROVIDER_COOLDOWN_BASE_SECONDS` / `PROVIDER_COOLDOWN_MAX_SECONDS` |
+| Adaptive turn pacer | All local agents share one node-wide timeline of provider turn starts, spaced by an adaptive interval — base **0.5s**, doubling on each rate-limited turn up to **8s**, halving back toward base after **5** consecutive clean turns — so 2-3 agents on one shared provider account never fire in lockstep. Applies to Slack, freshness-recheck, and patrol turns; the wait happens before the per-turn timeout window opens and does not reduce total concurrency. State appears in `/state` as `turn_pacer`; tune with `PROVIDER_PACER_BASE_SECONDS` (0 disables) / `PROVIDER_PACER_MAX_SECONDS` / `PROVIDER_PACER_CLEAN_TURNS` |
+| Socket delivery gap | A Socket Mode link that stays down (or a host that sleeps) for **120s+** may outlast Slack's redelivery window, so every warm shared transcript is revalidated from the thread root on its next read instead of serving the hole as context. Tune with `SOCKET_GAP_REVALIDATE_SECONDS` |
 
 ## Security
 
@@ -658,7 +667,7 @@ Expected path:
 
 ### Patrol
 
-Agents can periodically scan `status:todo` issues, atomically claim one with an issue-specific Git-ref lease, and progress; idle rounds emit `PATROL_IDLE` (no post). The lease is 30 minutes, is renewed at least every 15 minutes, and becomes takeover-eligible only after a 5-minute grace measured from GitHub's server `Date`. Create, renewal, stale takeover, and release use `--force-with-lease` against an absent or exactly observed ref SHA. Before work, the ref, metadata commit, and marker comment must agree on issue, agent, node, nonce, timestamps, and SHA. Any read failure, missing/mismatched marker, failed command, timeout, or uncertain result is fail-closed. Operators should inspect and conditionally recover stale refs; never delete them unconditionally. The shared GitHub assignee is not ownership.
+Agents can periodically scan `status:todo` issues, atomically claim one with an issue-specific Git-ref lease, and progress. The lease protocol runs in `issue_claim.py` (`claim` / `renew` / `release` / `verify`, one JSON verdict; only `claimed` / `renewed` is ownership), not in the model: patrol lists todo issues and claims the oldest claimable one on the host, so an idle round spends no provider turn, and the host renews the lease while the turn works — a failed or unknown renewal cancels the turn. Interactive turns call the same tool; refs and markers are unchanged, so nodes on the previous prompt-driven protocol interoperate. The lease is 30 minutes, is renewed at least every 15 minutes, and becomes takeover-eligible only after a 5-minute grace measured from GitHub's server `Date`. Create, renewal, stale takeover, and release use `--force-with-lease` against an absent or exactly observed ref SHA. Before work, the ref, metadata commit, and marker comment must agree on issue, agent, node, nonce, timestamps, and SHA. Any read failure, missing/mismatched marker, failed command, timeout, or uncertain result is fail-closed. Operators should inspect and conditionally recover stale refs; never delete them unconditionally. The shared GitHub assignee is not ownership.
 
 Patrol phases use epoch-aligned absolute deadlines and the globally stable logical-agent roster, so different nodes share the same wall-clock schedule. A long run skips missed periods instead of catching up in a burst. Patrol and Slack turns share the same node concurrency limiter and realpath workspace lock.
 

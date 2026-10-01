@@ -15,6 +15,7 @@
 | `multi_app.py` | マルチ agent 入口：設定読込、Roster、SlackAgent、Socket Mode |
 | `multi_core.py` | 純粋ロジック層（slack/claude パッケージ非依存） |
 | `state_store.py` | SQLite スレッド状態永続化（セッション/要約が再起動をまたいで残る） |
+| `issue_claim.py` | ホスト側の GitHub issue claim ツール（v2 lease: `claim` / `renew` / `release` / `verify`） |
 | `agents.yaml` | agent 定義（`card` / persona、所有者、node、project） |
 | `agents.distributed.example.yaml` | 2 人 × 各 2 ローカル agent の分散構成例 |
 | `slack-app-manifest-agent.yaml` | agent ごとの Slack App 用 manifest テンプレート |
@@ -231,7 +232,11 @@ webui は **127.0.0.1 のみ**（DNS rebinding 対策の Host 検査付き）。
 
 - `agents.yaml` の `trusted_feed_bots: [B0XXXXXXX]` — 許可した Slack App（例: GitHub）の投稿を読み取り専用の `[feed]` コンテキストにする（agent は起動しない）。
 - トリガーメッセージの添付ファイルは `<workspace>/.slack-files/` に取得（最大 3 件・各 10MB・48h 後に掃除）。agent がローカルツールで読む。
-- 進行状況はトリガーへの reaction（⏳ 対応中 → ✅ 完了 / ❌ 失敗）。「対応中…」プレースホルダ投稿は出さない。
+- 進行状況はトリガーへの reaction（📥 混雑したスレッドや満杯のノードで待機中 → ⏳ 対応中 → ✅ 完了 / ❌ 失敗 / 🤐 新鮮度チェックで返信を取り下げ）。「対応中…」プレースホルダ投稿は出さない。provider cooldown の待機が 30 秒以上なら、再開見込みを1回だけ通知する。
+- 失敗はカテゴリ別に次の行動を示す（文脈が長すぎる → `!reset`、認証・請求 → ノード所有者）。patrol は同じカテゴリの失敗が3回続くと停止してチャンネルに1回通知し、6 回に 1 回だけ試行、成功すると自動再開（`/state` の `patrol_fence` / `last_failure`）。
+- 再起動で ⏳ が残り続けることはない：受け付けたアクティベーションは state DB（`activation_ledger`）に記録し、起動時に前プロセスが終えられなかったものへ ⚠️ を付け、確認と再メンションを促す通知をスレッドに出す。中断されたターンが push やコメントを済ませている可能性があるため、自動では再実行しない。
+- 同じスレッドで待機中のトリガー（処理中に「@dev X を追加」「@dev Y も」と続いた場合など）は、古い順にまとめて1回のターンで返信する。1回目が文脈として見た内容を2回目がもう一度答えることはない。
+- 登録済み agent をテキストだけの `@name` で書くと誰にも通知されないため、投稿に1行の警告を付ける。
 
 ## .env
 
@@ -305,7 +310,11 @@ DM では人間は `@` なしで会話可能（peer の DM 引き継ぎはしな
 | ハードタイムアウト | `claude_timeout` 既定 900 秒 |
 | Slack 429 | Retry-After 自動リトライ（最大 2） |
 | メモリ回収 | スレッド状態 idle 48h で回収 |
-| 長いスレッド | 共有 bounded local transcript。cold/incomplete のみ cursor、最大 15 件/page で backfill |
+| 長いスレッド | 共有 bounded local transcript。cold/incomplete のみ cursor、最大 15 件/page で backfill。文脈ブロックを切り詰めるときはスレッド先頭（通常はタスク定義）を残し、途中を省略する |
+| 返信 freshness gate | 投稿直前に、ターン実行中へ届いた peer/許可済み人間のメッセージを検出し、ちょうど1回だけ再判断（`POST_ORIGINAL` 原文投稿 / 修正全文 / `NO_REPLY` 取り下げ）。最新の非自分メッセージと逐語一致する返信は投稿しない。ローカル transcript のみ参照（追加 Slack API 呼び出しゼロ）、gate 自体の失敗は fail-open。`FRESHNESS_RECHECK=0` で無効化 |
+| Provider rate-limit cooldown | AI ターンがレート制限された場合（Claude / Codex / OpenAI の 429・usage limit・overloaded シグナル、`Retry-After` 尊重）、同じ provider アカウントを使うローカル agent 全員で共有する cooldown を作動（Claude agent はローカルの Claude ログイン、Codex agent は Codex ログインを共有。OpenAI はエンドポイント + キー変数ごと）——基本 **60 秒**、連続時は倍増で最大 **480 秒**。終了後の再試行は安全が確認できる場合だけ1回行う：副作用のあるツール（シェル・編集・MCP）が未実行、provider の解除時刻が 15 分以内、スレッドが未リセット。それ以外は黙って再実行せず、スレッドに理由を通知する。cooldown の待機中はノードのスロットを手放すため、他の agent は止まらない。cooldown 中に始まるターンは先に待機、patrol はスキップ（次の epoch で再試行）。成功ターンで streak リセット。状態は `/state` の `provider_cooldown`。`PROVIDER_COOLDOWN_BASE_SECONDS` / `PROVIDER_COOLDOWN_MAX_SECONDS` で調整 |
+| Adaptive turn pacer | 全ローカル agent がノード共通の provider ターン開始タイムラインを共有し、適応間隔で開始をずらす——基本 **0.5 秒**、レート制限ごとに倍増で最大 **8 秒**、連続 **5** クリーンターンで半減して基本値へ回帰——共有 provider アカウントの 2-3 agent が同時発火しない。Slack・freshness recheck・patrol の全ターンに適用；待機はターン timeout 窓の外で行われ、総並列度は下げない。状態は `/state` の `turn_pacer`。`PROVIDER_PACER_BASE_SECONDS`（0 で無効）/ `PROVIDER_PACER_MAX_SECONDS` / `PROVIDER_PACER_CLEAN_TURNS` で調整 |
+| Socket 配信ギャップ | Socket Mode の切断（またはホストのスリープ）が **120 秒以上**続くと Slack の再配信期間を過ぎた可能性があるため、共有 transcript は次回読み込み時にスレッド先頭から再検証し、欠落を文脈として使い続けない。`SOCKET_GAP_REVALIDATE_SECONDS` で調整 |
 
 ## セキュリティ
 
@@ -561,7 +570,7 @@ managed branch を切り替えずに review します。
 
 `status:todo` issue を周期スキャンし、issue 固有の Git-ref lease を原子的に作成して 1 件 claim。lease は 30 分、15 分以内ごとに更新し、GitHub server の `Date` で期限後 5 分の grace を過ぎた場合だけ stale takeover 可能です。作成・更新・takeover・解放は、ref 不在または観測済み SHA を条件に `--force-with-lease` で行います。作業前に ref・metadata commit・marker comment の issue/agent/node/nonce/timestamp/SHA が完全一致することを再確認します。読み取り失敗、marker 欠落/不一致、command 失敗、timeout、結果不明はすべて fail-closed です。運用者も stale ref を無条件削除せず、観測済み SHA を条件に回復してください。共有 GitHub assignee は所有権を表しません。
 
-巡回位相は epoch 基準の絶対 deadline と全 node 共通の安定した logical-agent roster を使います。異なる node も同じ wall-clock schedule となり、長時間実行後は missed period を飛ばして追いつき burst を起こしません。GitHub 有効時は workspace の `origin` fetch/push URL がすべて設定済み canonical `OWNER/REPO` と一致しない限り、その workspace の GitHub workflow と巡回を無効化します。lease CAS push は変更可能な remote 名を使わず、明示的な canonical `https://github.com/OWNER/REPO.git` に固定するため、非対話 HTTPS 認証（例: `gh auth setup-git`）を事前設定してください。巡回と Slack turn は同じ node concurrency limiter と realpath workspace lock を共有します。暇なら `PATROL_IDLE`（投稿なし）。
+巡回位相は epoch 基準の絶対 deadline と全 node 共通の安定した logical-agent roster を使います。異なる node も同じ wall-clock schedule となり、長時間実行後は missed period を飛ばして追いつき burst を起こしません。GitHub 有効時は workspace の `origin` fetch/push URL がすべて設定済み canonical `OWNER/REPO` と一致しない限り、その workspace の GitHub workflow と巡回を無効化します。lease CAS push は変更可能な remote 名を使わず、明示的な canonical `https://github.com/OWNER/REPO.git` に固定するため、非対話 HTTPS 認証（例: `gh auth setup-git`）を事前設定してください。巡回と Slack turn は同じ node concurrency limiter と realpath workspace lock を共有します。暇なら `PATROL_IDLE`（投稿なし）。lease プロトコルはモデルではなく `issue_claim.py`（`claim` / `renew` / `release` / `verify`、JSON の判定を1つ出力し、`claimed` / `renewed` だけが所有）が実行する。巡回はホストが todo issue を列挙して最も古い claim 可能な issue を先に claim するため、暇な回は provider ターンを消費しない。作業中はホストが lease を更新し、更新の失敗・不明時はそのターンを取り消す。対話ターンも同じツールを使う。ref と marker の形式は変わらないので、従来の prompt 駆動プロトコルの node と混在できる。
 
 ```yaml
 github:

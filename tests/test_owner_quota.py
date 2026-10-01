@@ -348,10 +348,11 @@ def test_codex_turn_records_completed_input_usage(tmp_path, monkeypatch):
             "thread-id",
             37,
             ProviderTokenUsage(
+                # Codex input already includes the cached part.
                 input_tokens=20,
                 output_tokens=5,
                 cache_tokens=17,
-                total_tokens=42,
+                total_tokens=25,
                 complete=True,
             ),
         )
@@ -378,10 +379,86 @@ def test_codex_turn_records_completed_input_usage(tmp_path, monkeypatch):
 
     assert result == "done"
     snapshot = tracker.snapshot("U01ALICE")
-    assert snapshot["total_tokens"] == 42
+    assert snapshot["total_tokens"] == 25
     assert snapshot["input_tokens"] == 20
     assert snapshot["output_tokens"] == 5
     assert snapshot["cache_tokens"] == 17
+
+
+def _codex_usage(input_tokens, cache_tokens, output_tokens):
+    from multi_app import ProviderTokenUsage
+
+    return ProviderTokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_tokens=cache_tokens,
+        total_tokens=input_tokens + output_tokens,
+        complete=True,
+    )
+
+
+def _run_codex_turns(agent, tracker, usages, *, thread_key="C1:1.0"):
+    """Run resumed codex turns reporting the given cumulative usages."""
+    from multi_app import _CURRENT_QUOTA_RESERVATION
+
+    pending = list(usages)
+
+    async def run_exec(*_args, **_kwargs):
+        agent._mark_quota_runtime_started()
+        usage = pending.pop(0)
+        return ("done", "codex-thread", usage.input_tokens, usage)
+
+    agent._run_codex_exec = run_exec
+    for _ in usages:
+        reservation = tracker.reserve("U01ALICE", agent_name="alice")
+        assert reservation is not None
+
+        async def scenario():
+            token = _CURRENT_QUOTA_RESERVATION.set(reservation)
+            try:
+                return await agent._run_codex(
+                    "prompt", thread_key, agent._turn_generation(thread_key)
+                )
+            finally:
+                _CURRENT_QUOTA_RESERVATION.reset(token)
+
+        asyncio.run(scenario())
+
+
+def test_resumed_codex_turns_bill_only_the_delta(tmp_path):
+    # Measured with codex-cli 0.158: resume reports session-cumulative usage
+    # (19556 -> 39175 -> 58857 input). Each turn must bill only its own part.
+    tracker = _finite_tracker(
+        tmp_path, {"U01ALICE": 10_000_000}, {"U01ALICE": 20}
+    )
+    agent = _agent(tmp_path, quota_tracker=tracker)
+    agent.cfg.runtime = "codex"
+    _run_codex_turns(
+        agent,
+        tracker,
+        [
+            _codex_usage(19556, 1408, 35),
+            _codex_usage(39175, 20224, 63),
+            _codex_usage(58857, 39040, 83),
+        ],
+    )
+    snapshot = tracker.snapshot("U01ALICE")
+    assert snapshot["input_tokens"] == 58857
+    assert snapshot["cache_tokens"] == 39040
+    assert snapshot["output_tokens"] == 83
+    assert snapshot["total_tokens"] == 58857 + 83
+
+
+def test_codex_usage_baseline_survives_restart(tmp_path):
+    from state_store import StateStore
+
+    store = StateStore(str(tmp_path / "baseline.db"))
+    store.save_codex_usage_baseline(
+        "codex-thread", input_tokens=19556, cache_tokens=1408, output_tokens=35
+    )
+    assert store.load_codex_usage_baseline("codex-thread") == (19556, 1408, 35)
+    assert store.load_codex_usage_baseline("other") is None
+    store.close()
 
 
 def test_admin_state_aggregates_usage_by_visible_owner(tmp_path):

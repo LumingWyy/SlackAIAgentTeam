@@ -10,10 +10,14 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import json
 import logging
+import math
 import os
 import re
+import shlex
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -27,14 +31,23 @@ from typing import Any
 import aiohttp
 import yaml
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError as OpenAIRateLimitError
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
+from slack_sdk.errors import SlackApiError
 from slack_sdk.http_retry.builtin_async_handlers import (
     AsyncRateLimitErrorRetryHandler,
 )
 
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, SystemMessage, query
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    RateLimitEvent,
+    ResultMessage,
+    SystemMessage,
+    ToolUseBlock,
+    query,
+)
 
 from control_auth import (
     ControlAuthenticator,
@@ -42,11 +55,26 @@ from control_auth import (
     require_slack_human_id,
 )
 from multi_core import (
+    AdaptivePacer,
     EventDeduper,
+    FailureFence,
+    LiveCoverageMonitor,
     ProjectPolicy,
+    ProviderCooldown,
+    ProviderCooldownRegistry,
+    ProviderRateLimitedError,
+    RUNTIME_FAILURE_NOTICES,
     TurnBudget,
+    TurnSignals,
     build_activation_prompt,
+    build_batched_instruction,
+    build_patrol_work_prompt,
+    build_freshness_recheck_prompt,
+    CLAIM_RENEW_SECONDS,
     canonical_github_repo,
+    claim_tool_command,
+    classify_runtime_failure,
+    codex_usage_delta,
     classify_sender,
     constrain_handoff_targets,
     default_slack_token_env_names,
@@ -55,7 +83,14 @@ from multi_core import (
     filter_context_messages,
     flatten_event_text,
     format_github_claim_protocol,
+    format_plain_mention_notice,
+    format_rate_limit_notice,
+    is_rate_limit_signal,
+    is_side_effect_tool,
     is_slack_file_url,
+    is_verbatim_duplicate,
+    latest_message_ts,
+    latest_non_self_text,
     tag_continuation_lines,
     format_channel_guidance,
     format_roles,
@@ -69,12 +104,17 @@ from multi_core import (
     neutralize_handoff_envelopes,
     parse_codex_events,
     parse_command,
+    parse_freshness_decision,
+    provider_account_key,
     parse_handoff,
+    plain_agent_mentions,
     next_patrol_deadline,
     registered_agent_mentions,
     safe_filename,
     scrub_slack_token_env,
+    select_freshness_messages,
     should_activate,
+    slack_ts_sort_key,
     split_markdown,
     split_message,
     strip_leading_mention,
@@ -102,6 +142,288 @@ _ALL_EFFORTS = CLAUDE_EFFORTS | CODEX_EFFORTS | OPENAI_EFFORTS
 DEFAULT_OPENAI_MODEL = "gpt-5.6-sol"
 # Placeholder so the OpenAI SDK can talk to a local CLI Proxy that may not need a real key.
 LOCAL_OPENAI_API_KEY_PLACEHOLDER = "sk-local"
+# Posted in place of an empty provider reply. The freshness recheck treats
+# them as "no decision" so a placeholder never replaces a real draft.
+CLAUDE_EMPTY_REPLY = "(Claude からテキストの応答がありませんでした)"
+CODEX_EMPTY_REPLY = "(Codex からテキストの応答がありませんでした)"
+OPENAI_EMPTY_REPLY = "(OpenAI API からテキストの応答がありませんでした)"
+EMPTY_REPLY_PLACEHOLDERS = frozenset(
+    {CLAUDE_EMPTY_REPLY, CODEX_EMPTY_REPLY, OPENAI_EMPTY_REPLY}
+)
+CODEX_USAGE_BASELINE_LIMIT = 4096
+# A provider cooldown wait at least this long is announced in the thread.
+COOLDOWN_NOTICE_SECONDS = 30.0
+# Host-side issue claim tool (slack-agent-claim v2 lease protocol).
+ISSUE_CLAIM_TOOL = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "issue_claim.py"
+)
+ISSUE_CLAIM_TOOL_PREFIX = shlex.join([sys.executable, ISSUE_CLAIM_TOOL])
+CLAIM_TOOL_TIMEOUT_SECONDS = 300.0
+# Todo issues one patrol round tries to claim before giving up as idle.
+PATROL_CLAIM_ATTEMPTS = 5
+# Restart reconciliation reports at most this many recent cut-off
+# activations per agent; older or excess rows are dropped silently.
+INTERRUPTED_ACTIVATION_MAX_AGE_SECONDS = 24 * 3600.0
+INTERRUPTED_ACTIVATION_NOTICE_LIMIT = 20
+
+
+def provider_cooldown_from_env() -> ProviderCooldown:
+    """Build the per-agent provider cooldown from env; invalid values fail startup."""
+
+    def read(name: str, default: float) -> float:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return default
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{name} must be a number of seconds (got: {raw!r})"
+            ) from exc
+        if value <= 0:
+            raise RuntimeError(f"{name} must be positive (got: {raw!r})")
+        return value
+
+    base = read("PROVIDER_COOLDOWN_BASE_SECONDS", 60.0)
+    max_seconds = read("PROVIDER_COOLDOWN_MAX_SECONDS", 480.0)
+    if max_seconds < base:
+        raise RuntimeError(
+            "PROVIDER_COOLDOWN_MAX_SECONDS must be >= "
+            "PROVIDER_COOLDOWN_BASE_SECONDS"
+        )
+    return ProviderCooldown(base_seconds=base, max_seconds=max_seconds)
+
+
+def provider_pacer_from_env() -> AdaptivePacer:
+    """Build the node-wide turn pacer from env; invalid values fail startup.
+
+    ``PROVIDER_PACER_BASE_SECONDS=0`` disables pacing.
+    """
+
+    def read_float(name: str, default: float, *, minimum: float) -> float:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return default
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{name} must be a number of seconds (got: {raw!r})"
+            ) from exc
+        if value < minimum:
+            raise RuntimeError(
+                f"{name} must be >= {minimum:g} (got: {raw!r})"
+            )
+        return value
+
+    base = read_float("PROVIDER_PACER_BASE_SECONDS", 0.5, minimum=0.0)
+    max_seconds = read_float("PROVIDER_PACER_MAX_SECONDS", 8.0, minimum=0.0)
+    raw_threshold = os.environ.get("PROVIDER_PACER_CLEAN_TURNS", "").strip()
+    if raw_threshold:
+        try:
+            clean_threshold = int(raw_threshold)
+        except ValueError as exc:
+            raise RuntimeError(
+                "PROVIDER_PACER_CLEAN_TURNS must be an integer "
+                f"(got: {raw_threshold!r})"
+            ) from exc
+    else:
+        clean_threshold = 5
+    if base > 0 and max_seconds < base:
+        raise RuntimeError(
+            "PROVIDER_PACER_MAX_SECONDS must be >= PROVIDER_PACER_BASE_SECONDS"
+        )
+    if clean_threshold < 1:
+        raise RuntimeError("PROVIDER_PACER_CLEAN_TURNS must be >= 1")
+    return AdaptivePacer(
+        base_seconds=base,
+        max_seconds=max_seconds,
+        clean_threshold=clean_threshold,
+    )
+
+
+def _provider_error_retry_after(exc: BaseException) -> float | None:
+    """Retry-after seconds from an API error's HTTP response, when present."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        raw = headers.get("retry-after")
+    except Exception:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+class ClaimLeaseLostError(RuntimeError):
+    """The host could not renew an issue lease; the turn was cancelled."""
+
+    def __init__(self, issue: int, status: str) -> None:
+        super().__init__(f"issue #{issue} lease renewal {status}")
+        self.issue = issue
+        self.status = status
+
+
+async def run_host_command(
+    cmd: list[str], *, cwd: str, timeout: float
+) -> tuple[int, str, str]:
+    """Run one host command; a timeout or cancellation kills and reaps it.
+
+    A timeout returns ``(-1, "", "timed out")`` so callers treat the outcome
+    as unknown instead of crashing the patrol loop.
+    """
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GH_PROMPT_DISABLED="1")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=cwd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        return 127, "", str(exc)
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout
+        )
+    except BaseException as exc:
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        await asyncio.shield(proc.wait())
+        if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+            return -1, "", "timed out"
+        raise
+    return (
+        proc.returncode if proc.returncode is not None else -1,
+        stdout.decode(errors="replace"),
+        stderr.decode(errors="replace"),
+    )
+
+
+SOCKET_GAP_SAMPLE_SECONDS = 10.0
+
+
+def socket_gap_threshold_from_env() -> float:
+    """``SOCKET_GAP_REVALIDATE_SECONDS`` (default 120); invalid fails startup."""
+    raw = os.environ.get("SOCKET_GAP_REVALIDATE_SECONDS", "").strip()
+    if not raw:
+        return 120.0
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            "SOCKET_GAP_REVALIDATE_SECONDS must be a number of seconds "
+            f"(got: {raw!r})"
+        ) from exc
+    if value <= SOCKET_GAP_SAMPLE_SECONDS:
+        raise RuntimeError(
+            "SOCKET_GAP_REVALIDATE_SECONDS must exceed the "
+            f"{SOCKET_GAP_SAMPLE_SECONDS:g}s sample interval (got: {raw!r})"
+        )
+    return value
+
+
+async def watch_live_coverage(
+    handlers: list[Any],
+    transcript_store: TranscriptStore,
+    *,
+    threshold_seconds: float,
+    sample_seconds: float = SOCKET_GAP_SAMPLE_SECONDS,
+    clock: Any = time.time,
+) -> None:
+    """Revalidate shared transcripts after any Socket Mode delivery gap.
+
+    Slack redelivers unacknowledged events only for a few minutes, so a
+    longer disconnect or host sleep loses live events for good; without
+    this, a thread marked complete would keep serving the hole as context.
+    """
+    monitors = [LiveCoverageMonitor(threshold_seconds) for _ in handlers]
+    while True:
+        for handler, monitor in zip(handlers, monitors):
+            try:
+                connected = bool(await handler.client.is_connected())
+            except Exception:
+                connected = False
+            if monitor.observe(clock(), connected):
+                flagged = transcript_store.mark_coverage_gap()
+                logger.warning(
+                    "socket delivery gap >= %.0fs detected; %d transcript "
+                    "thread(s) will be revalidated",
+                    threshold_seconds,
+                    flagged,
+                )
+        await asyncio.sleep(sample_seconds)
+
+
+def classify_provider_rate_limit(
+    exc: BaseException,
+) -> tuple[bool, float | None, bool]:
+    """``(is_rate_limit, retry_after_seconds, replay_safe)`` for a failed turn.
+
+    Timeouts are never rate limits (retrying immediately against a slow
+    provider is the caller's existing behavior to keep). Claude and Codex
+    turns raise a typed error carrying their own replay safety; an untyped
+    match comes from the tool-less OpenAI path and is safe to replay.
+    """
+    if isinstance(exc, ProviderRateLimitedError):
+        return True, exc.retry_after, exc.replay_safe
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return False, None, False
+    if isinstance(exc, OpenAIRateLimitError):
+        return True, _provider_error_retry_after(exc), True
+    if is_rate_limit_signal(str(exc)):
+        return True, _provider_error_retry_after(exc), True
+    return False, None, False
+
+
+def observe_claude_message(signals: TurnSignals, message: Any) -> None:
+    """Fold one Claude SDK stream message into the turn's signals.
+
+    The CLI exits non-zero right after an error result, so the SDK raises a
+    generic exception on the next read; these structured fields are the only
+    reliable rate-limit evidence once that happens.
+    """
+    if isinstance(message, AssistantMessage):
+        if getattr(message, "error", None) == "rate_limit":
+            signals.rate_limit_seen = True
+        for block in getattr(message, "content", None) or []:
+            if isinstance(block, ToolUseBlock) and is_side_effect_tool(
+                block.name
+            ):
+                signals.tool_activity = True
+    elif isinstance(message, RateLimitEvent):
+        info = message.rate_limit_info
+        if info.status == "rejected":
+            signals.rate_limit_seen = True
+            resets = [
+                float(value)
+                for value in (
+                    info.resets_at,
+                    info.overage_resets_at
+                    if info.overage_status == "rejected"
+                    else None,
+                )
+                if value
+            ]
+            if resets:
+                signals.resets_at = max(resets)
+    elif isinstance(message, ResultMessage):
+        if getattr(message, "is_error", False):
+            signals.error_text = (
+                getattr(message, "result", None)
+                or "; ".join(getattr(message, "errors", None) or [])
+                or str(getattr(message, "subtype", "") or "error")
+            )
+            if getattr(message, "api_error_status", None) in (429, 529):
+                signals.rate_limit_seen = True
 
 
 def normalize_openai_base_url(value: str, *, agent_name: str = "") -> str:
@@ -1801,6 +2123,24 @@ class ProviderTokenUsage:
         )
 
 
+def claude_result_usage(usage: dict | None) -> ProviderTokenUsage:
+    """Provider usage from a Claude ``ResultMessage.usage`` mapping."""
+    usage = usage or {}
+    direct_input = int(usage.get("input_tokens") or 0)
+    cache_tokens = sum(
+        int(usage.get(key) or 0)
+        for key in ("cache_read_input_tokens", "cache_creation_input_tokens")
+    )
+    output_tokens = int(usage.get("output_tokens") or 0)
+    return ProviderTokenUsage(
+        input_tokens=direct_input + cache_tokens,
+        output_tokens=output_tokens,
+        cache_tokens=cache_tokens,
+        total_tokens=direct_input + cache_tokens + output_tokens,
+        complete="input_tokens" in usage and "output_tokens" in usage,
+    )
+
+
 @dataclass
 class QuotaReservation:
     reservation_id: str
@@ -2239,6 +2579,11 @@ _CURRENT_QUOTA_RESERVATION: ContextVar[QuotaReservation | None] = ContextVar(
 _CURRENT_EXECUTION_PLAN: ContextVar[ExecutionPlan | None] = ContextVar(
     "current_execution_plan", default=None
 )
+# The admission whose slot the current activation is running in; lets a
+# provider cooldown wait hand the slot back instead of sleeping on it.
+_HELD_RUNTIME_ADMISSION: ContextVar[RuntimeAdmission | None] = ContextVar(
+    "held_runtime_admission", default=None
+)
 
 
 class NodeRuntimeLimiter:
@@ -2366,9 +2711,43 @@ class NodeRuntimeLimiter:
             await reservation.ready.wait()
             if reservation.released:
                 raise RuntimeError("runtime admission released before execution")
-            yield
+            yield reservation
         finally:
             self.release_admission(reservation)
+
+    async def sleep_released(
+        self, admission: RuntimeAdmission, seconds: float
+    ) -> None:
+        """Sleep without holding node capacity, then wait to run again.
+
+        A running admission hands its slot and workspace back for the sleep
+        and rejoins the head of the waiting line afterwards (outside
+        ``max_queue``: it was already admitted), so one agent's provider
+        cooldown cannot starve the other agents on the node.
+        """
+        if (
+            admission.released
+            or admission.state != "running"
+            or self._admissions.get(admission.token) is not admission
+        ):
+            await asyncio.sleep(seconds)
+            return
+        self._running_total = max(0, self._running_total - 1)
+        self._active_workspaces.discard(admission.workspace)
+        admission.state = "paused"
+        admission.ready.clear()
+        self._promote_waiters()
+        await asyncio.sleep(seconds)
+        if admission.released:
+            raise RuntimeError("runtime admission released while paused")
+        if self._can_run(admission.workspace):
+            self._mark_running(admission)
+        else:
+            admission.state = "queued"
+            self._waiting.insert(0, admission)
+        await admission.ready.wait()
+        if admission.released:
+            raise RuntimeError("runtime admission released while paused")
 
     def snapshot(self, agent_name: str) -> dict[str, int]:
         queued = sum(
@@ -2381,9 +2760,15 @@ class NodeRuntimeLimiter:
             and admission.state == "running"
             for admission in self._admissions.values()
         )
+        paused = sum(
+            admission.agent_name == agent_name
+            and admission.state == "paused"
+            for admission in self._admissions.values()
+        )
         return {
             "queued": queued,
             "running": running,
+            "paused": paused,
             "node_max_concurrency": self.max_concurrency,
             "node_max_queue": self.max_queue,
             "node_admitted": len(self._admissions),
@@ -2417,6 +2802,8 @@ class SlackAgent:
         repo_spec: RepoSpec | None = None,
         patrol_index: int = 0,
         patrol_count: int = 1,
+        turn_pacer: AdaptivePacer | None = None,
+        provider_cooldowns: ProviderCooldownRegistry | None = None,
     ) -> None:
         self.cfg = cfg
         self.budget = budget
@@ -2471,6 +2858,31 @@ class SlackAgent:
         # thread_key → previous session summary (injected into new session after rollover)
         self.thread_summaries: dict[str, str] = {}
         self.deduper = EventDeduper()
+        # Patrol stops repeating a failure only a human can fix (auth,
+        # billing, ...), probing occasionally until one round succeeds.
+        self._patrol_fence = FailureFence()
+        # Last runtime failure category, for /state (never the error text).
+        self._last_failure: dict[str, Any] | None = None
+        # (channel, trigger ts) currently showing the 📥 queued reaction.
+        self._inbox_marked: set[tuple[str, str]] = set()
+        # thread_key → admitted triggers not yet claimed by a turn, and the
+        # (channel, ts) of triggers a batched turn already answered.
+        self._pending_triggers: dict[str, list[dict]] = {}
+        self._absorbed_triggers: set[tuple[str, str]] = set()
+        # codex thread id → last cumulative (input, cache, output) counters.
+        self._codex_usage_baselines: dict[str, tuple[int, int, int]] = {}
+        # AI-provider back-off per provider account; armed on rate-limited
+        # turns, reset by a clean turn. Production shares one registry across
+        # local agents (they share the Claude / Codex login), so the first
+        # 429 cools every agent on that account instead of each re-hitting it.
+        self._provider_cooldowns = (
+            provider_cooldowns
+            or ProviderCooldownRegistry(provider_cooldown_from_env)
+        )
+        # Node-wide turn pacer: production injects one shared instance into
+        # every local agent so their provider turn starts are staggered; the
+        # fallback keeps isolated/programmatic construction usable.
+        self._turn_pacer = turn_pacer or provider_pacer_from_env()
         # channel → (monotonic time, guidance text); TTL cache to avoid API on every message
         self._channel_guidance_cache: dict[str, tuple[float, str]] = {}
         # (Slack team, channel) → (monotonic time, member IDs or failed lookup)
@@ -2576,6 +2988,45 @@ class SlackAgent:
         plan = self._active_execution_plan()
         return plan.execution_path if plan is not None else self.cfg.workspace
 
+    def _note_failure(self, category: str) -> None:
+        self._last_failure = {"category": category, "at": time.time()}
+
+    def _cooldown_for(
+        self, config: AgentConfig | ExecutionConfig | None = None
+    ) -> ProviderCooldown:
+        """The cooldown of the provider account ``config`` runs against."""
+        active = config or self._active_execution_config()
+        return self._provider_cooldowns.get(
+            provider_account_key(
+                active.runtime,
+                openai_base_url=getattr(active, "openai_base_url", "") or "",
+                openai_api_key_env=(
+                    getattr(active, "openai_api_key_env", "") or ""
+                ),
+            )
+        )
+
+    async def _pace_turn_start(self) -> None:
+        """Reserve a slot on the node-wide turn timeline and wait for it.
+
+        Called immediately before every provider call (Slack, freshness
+        recheck, and patrol turns) so 2-3 local agents never start turns in
+        lockstep against the shared provider account. reserve() is atomic on
+        the event loop; the sleep happens outside any lock and before the
+        per-turn provider timeout window opens.
+        """
+        delay = self._turn_pacer.reserve()
+        if delay <= 0:
+            return
+        log = logger.info if delay >= 1.0 else logger.debug
+        log(
+            "agent %s pacing turn start: %.2fs (interval %.2fs)",
+            self.name,
+            delay,
+            self._turn_pacer.interval,
+        )
+        await asyncio.sleep(delay)
+
     def _mark_quota_runtime_started(self) -> QuotaReservation | None:
         reservation = _CURRENT_QUOTA_RESERVATION.get()
         if reservation is not None:
@@ -2584,8 +3035,25 @@ class SlackAgent:
 
     def _settle_quota_usage(self, usage: ProviderTokenUsage) -> None:
         reservation = _CURRENT_QUOTA_RESERVATION.get()
-        if reservation is not None:
-            self.quota_tracker.settle(reservation, usage)
+        if reservation is None:
+            return
+        if reservation.done:
+            # A second runtime turn inside one admitted activation (the
+            # freshness recheck) lands after the reservation settled; charge
+            # it to the same owner ledger instead of dropping the usage.
+            normalized = usage.normalized()
+            self.quota_tracker.record(
+                reservation.owner,
+                total_tokens=normalized.total_tokens,
+                input_tokens=normalized.input_tokens,
+                output_tokens=normalized.output_tokens,
+                cache_tokens=normalized.cache_tokens,
+                agent_name=reservation.agent_name,
+                runtime=reservation.runtime,
+                estimated=not normalized.complete,
+            )
+            return
+        self.quota_tracker.settle(reservation, usage)
 
     def _project_policy(self, channel: str) -> ProjectPolicy | None:
         return self.projects_by_channel.get(channel)
@@ -3625,9 +4093,13 @@ class SlackAgent:
             thread_key,
         )
         self._tasks.add(task)
+        self._register_pending_trigger(execution_plan.thread_key, event)
+        self._ledger_record(event, execution_plan)
 
         def _release(completed: asyncio.Task) -> None:
             self._tasks.discard(completed)
+            self._forget_trigger(execution_plan.thread_key, event)
+            self._ledger_clear(event)
             self.runtime_limiter.release_admission(admission)
             # A task cancelled before its coroutine receives a first timeslice
             # never enters _activate(), so its ``finally`` cannot release the
@@ -4309,25 +4781,30 @@ class SlackAgent:
         )
         context_token = _CURRENT_RUNTIME_ADMISSION.set(None)
         plan_token = _CURRENT_EXECUTION_PLAN.set(execution_plan)
+        await self._mark_queued(event, client, execution_plan, admission)
         try:
             async with self.runtime_limiter.slot(
                 self.name,
                 execution_plan.execution_path,
                 admission=admission,
-            ):
-                if execution_plan.worktree_plan is None:
-                    await self._activate_inner(event, client, say)
-                else:
-                    manager = self.worktree_manager
-                    if manager is None:
-                        raise WorktreeError(
-                            "thread worktree manager is unavailable"
-                        )
-                    async with manager.lease(
-                        execution_plan.worktree_plan,
-                        owner=execution_plan.config.owner,
-                    ):
+            ) as held_admission:
+                held_token = _HELD_RUNTIME_ADMISSION.set(held_admission)
+                try:
+                    if execution_plan.worktree_plan is None:
                         await self._activate_inner(event, client, say)
+                    else:
+                        manager = self.worktree_manager
+                        if manager is None:
+                            raise WorktreeError(
+                                "thread worktree manager is unavailable"
+                            )
+                        async with manager.lease(
+                            execution_plan.worktree_plan,
+                            owner=execution_plan.config.owner,
+                        ):
+                            await self._activate_inner(event, client, say)
+                finally:
+                    _HELD_RUNTIME_ADMISSION.reset(held_token)
         except WorktreeError as exc:
             logger.warning(
                 "agent %s worktree activation failed thread=%s: %s",
@@ -4368,6 +4845,145 @@ class SlackAgent:
                     exc_info=True,
                 )
 
+    def _ledger_record(self, event: dict, plan: ExecutionPlan) -> None:
+        """Note an admitted activation so a restart can report it as cut off."""
+        if self._store is None:
+            return
+        channel, ts = self._trigger_key(event)
+        try:
+            self._store.record_activation(
+                self.name,
+                team_id=self.team_id or "",
+                channel_id=channel,
+                trigger_ts=ts,
+                thread_ts=plan.root_thread_ts or "",
+            )
+        except Exception:
+            logger.warning(
+                "agent %s activation ledger write failed", self.name, exc_info=True
+            )
+
+    def _ledger_clear(self, event: dict) -> None:
+        if self._store is None:
+            return
+        channel, ts = self._trigger_key(event)
+        try:
+            self._store.clear_activation(
+                self.name, channel_id=channel, trigger_ts=ts
+            )
+        except Exception:
+            logger.warning(
+                "agent %s activation ledger clear failed", self.name, exc_info=True
+            )
+
+    async def reconcile_interrupted_activations(self) -> int:
+        """Report activations the previous process left unfinished.
+
+        Their ⏳/📥 would otherwise stay forever and the requester would never
+        learn the work stopped. They are not re-run: the cut-off turn may
+        already have pushed or commented, so a human decides.
+        """
+        if self._store is None or self.app is None:
+            return 0
+        rows = self._store.take_interrupted_activations(
+            self.name,
+            team_id=self.team_id or "",
+            max_age_seconds=INTERRUPTED_ACTIVATION_MAX_AGE_SECONDS,
+            limit=INTERRUPTED_ACTIVATION_NOTICE_LIMIT,
+        )
+        client = self.app.client
+        for row in rows:
+            channel, ts = row["channel_id"], row["trigger_ts"]
+            await self._set_reaction(
+                client, channel, ts, remove="hourglass_flowing_sand"
+            )
+            await self._set_reaction(
+                client, channel, ts, add="warning", remove="inbox_tray"
+            )
+            try:
+                await client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=row["thread_ts"] or ts,
+                    text=(
+                        f"⚠️ {self.name} の再起動により、この依頼の処理が"
+                        "中断されました。途中まで実行された操作がある"
+                        "可能性があります。状態を確認し、必要なら"
+                        "もう一度 @メンションしてください。"
+                    ),
+                )
+            except Exception:
+                logger.warning(
+                    "agent %s failed to report an interrupted activation",
+                    self.name,
+                    exc_info=True,
+                )
+        if rows:
+            logger.warning(
+                "agent %s reported %d activation(s) interrupted by restart",
+                self.name,
+                len(rows),
+            )
+        return len(rows)
+
+    @staticmethod
+    def _trigger_key(event: dict) -> tuple[str, str]:
+        return (str(event.get("channel") or ""), str(event.get("ts") or ""))
+
+    def _register_pending_trigger(self, thread_key: str, event: dict) -> None:
+        self._pending_triggers.setdefault(thread_key, []).append(event)
+
+    def _forget_trigger(self, thread_key: str, event: dict) -> None:
+        """Drop a finished (or never-run) trigger's batching bookkeeping."""
+        pending = self._pending_triggers.get(thread_key)
+        if pending is not None:
+            key = self._trigger_key(event)
+            pending[:] = [e for e in pending if self._trigger_key(e) != key]
+            if not pending:
+                self._pending_triggers.pop(thread_key, None)
+        self._absorbed_triggers.discard(self._trigger_key(event))
+
+    def _claim_trigger_batch(self, thread_key: str, event: dict) -> list[dict]:
+        """Every queued trigger this turn answers, oldest first.
+
+        Returns [] when an earlier turn in this thread already answered
+        ``event`` as part of its batch; the caller then has nothing to do.
+        """
+        key = self._trigger_key(event)
+        if key in self._absorbed_triggers:
+            self._absorbed_triggers.discard(key)
+            return []
+        pending = self._pending_triggers.pop(thread_key, [])
+        batch = [e for e in pending if self._trigger_key(e) != key]
+        for other in batch:
+            self._absorbed_triggers.add(self._trigger_key(other))
+        batch.append(event)
+        batch.sort(key=lambda e: slack_ts_sort_key(str(e.get("ts") or "")))
+        return batch
+
+    async def _mark_queued(
+        self,
+        event: dict,
+        client: Any,
+        execution_plan: ExecutionPlan,
+        admission: RuntimeAdmission | None,
+    ) -> None:
+        """📥 on a trigger that must wait (node queue or a busy thread).
+
+        Added by the activation task itself before it waits, so the later
+        ⏳ swap in _activate_inner can never race it.
+        """
+        lock = self.locks.get(execution_plan.thread_key)
+        waits = (admission is not None and admission.state == "queued") or (
+            lock is not None and lock.locked()
+        )
+        if not waits or self._trigger_key(event) in self._absorbed_triggers:
+            return
+        ts = str(event.get("ts") or "")
+        self._inbox_marked.add((execution_plan.channel_id, ts))
+        await self._set_reaction(
+            client, execution_plan.channel_id, ts, add="inbox_tray"
+        )
+
     async def _activate_inner(
         self, event: dict, client: Any, say: Any
     ) -> None:
@@ -4401,33 +5017,96 @@ class SlackAgent:
             # Snapshot before the turn: !reset / session restart / runtime switch can
             # land while it runs, and must not be undone by this turn's write-back.
             gen = self._turn_generation(thread_key)
+            # Triggers that queued in this thread are answered by one turn:
+            # a second turn would re-answer what the first saw as context.
+            batch = self._claim_trigger_batch(thread_key, event)
+            if not batch:
+                logger.info(
+                    "agent %s trigger already answered by a batched turn "
+                    "thread=%s",
+                    self.name,
+                    thread_key,
+                )
+                return
+            trigger_ts = [str(trigger["ts"]) for trigger in batch]
+            # The newest trigger is the context cursor and freshness anchor.
+            ts = trigger_ts[-1]
             # Outermost: log exit failures from post/reaction so Tasks do not fail silently
             try:
                 # ⏳ up-front so context fetch / file downloads are visibly in progress
-                await self._set_reaction(
-                    client, channel, ts, add="hourglass_flowing_sand"
-                )
+                for trigger_mark_ts in trigger_ts:
+                    queued_mark = (channel, trigger_mark_ts)
+                    was_queued = queued_mark in self._inbox_marked
+                    self._inbox_marked.discard(queued_mark)
+                    await self._set_reaction(
+                        client,
+                        channel,
+                        trigger_mark_ts,
+                        add="hourglass_flowing_sand",
+                        remove="inbox_tray" if was_queued else None,
+                    )
                 # ok means "result delivered to the thread and the turn succeeded";
                 # the finally below turns it into ✅/❌ even when posting itself fails.
                 ok = False
+                skip_post = False
                 try:
                     context_block = await self._fetch_context(
                         client,
                         channel,
                         thread_ts,
-                        exclude_ts=ts,
+                        exclude_ts=frozenset(trigger_ts),
                         thread_key=thread_key,
                         allowed_agent_names=allowed_agent_names,
+                    )
+                    # Freshness baseline from the same transcript state the
+                    # context was just built from (no await in between):
+                    # backfilled history is not a mid-turn arrival, and a
+                    # message landing during guidance/file fetches below is
+                    # unseen, so it must still trigger the recheck.
+                    freshness_baseline = self._freshness_baseline(
+                        channel, thread_ts, ts
                     )
                     channel_guidance = await self._fetch_channel_guidance(
                         client, channel
                     )
-                    attachment_note = await self._ingest_files(event)
+                    attachment_notes = [
+                        note
+                        for note in [
+                            await self._ingest_files(trigger)
+                            for trigger in batch
+                        ]
+                        if note
+                    ]
+                    attachment_note = "\n".join(attachment_notes)
 
                     turn_ok = True
                     try:
-                        sender_name = self._display_name_of(event)
-                        instruction = strip_leading_mention(event.get("text", ""))
+                        if len(batch) == 1:
+                            sender_name = self._display_name_of(event)
+                            instruction = strip_leading_mention(
+                                event.get("text", "")
+                            )
+                        else:
+                            senders = [
+                                self._display_name_of(trigger)
+                                for trigger in batch
+                            ]
+                            sender_name = (
+                                senders[-1]
+                                if len(set(senders)) == 1
+                                else "スレッドの参加者"
+                            )
+                            instruction = build_batched_instruction(
+                                [
+                                    (
+                                        sender,
+                                        strip_leading_mention(
+                                            trigger.get("text", "")
+                                        ),
+                                    )
+                                    for sender, trigger in zip(senders, batch)
+                                ]
+                            )
                         prompt = build_activation_prompt(
                             context_block=context_block,
                             sender_name=sender_name,
@@ -4491,18 +5170,70 @@ class SlackAgent:
                             f"⏱️ 処理が {active_config.claude_timeout} 秒でタイムアウト"
                             "しました。依頼を分割するか、もう一度お試しください。"
                         )
-                    except Exception:
+                    except ProviderRateLimitedError as exc:
+                        turn_ok = False
+                        logger.warning(
+                            "agent %s _activate gave up on a rate-limited "
+                            "turn (replay_safe=%s retry_after=%s): %s",
+                            self.name,
+                            exc.replay_safe,
+                            exc.retry_after,
+                            str(exc)[:300],
+                        )
+                        result = format_rate_limit_notice(
+                            retry_after=exc.retry_after,
+                            replay_safe=exc.replay_safe,
+                        )
+                    except Exception as exc:
                         turn_ok = False
                         logger.exception(
                             "agent %s _activate runtime failed", self.name
                         )
-                        result = "⚠️ エラーが発生しました。サーバーログを確認してください。"
+                        category = classify_runtime_failure(str(exc))
+                        self._note_failure(category)
+                        result = RUNTIME_FAILURE_NOTICES[category]
 
-                    # last_seen is in-process redelivery bookkeeping and always applies;
-                    # persistence is skipped when the thread was cleared mid-turn, or the
-                    # deleted row would come straight back with this turn's state.
-                    self.last_seen[thread_key] = ts
-                    if gen == self._turn_generation(thread_key):
+                    # Post-time freshness gate: messages that arrived while
+                    # the turn ran get one re-decide pass; a verbatim
+                    # duplicate of the latest non-self message never posts.
+                    skip_post = False
+                    if (
+                        turn_ok
+                        and thread_ts
+                        and self._freshness_recheck_enabled()
+                        # A thread reset mid-turn has no session to recheck in.
+                        and gen == self._turn_generation(thread_key)
+                    ):
+                        result, skip_post = await self._freshness_gate(
+                            result,
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            baseline_ts=freshness_baseline,
+                            thread_key=thread_key,
+                            gen=gen,
+                            allowed_agent_names=allowed_agent_names,
+                            project_id=(
+                                policy.project_id if policy is not None else ""
+                            ),
+                        )
+
+                    # last_seen is the context cursor: _fetch_context drops
+                    # messages at or before it because the session already
+                    # holds them. Only a successful turn wrote its session, so
+                    # a failed turn must not advance it — otherwise a retry
+                    # ("@agent try again") would lose the original question.
+                    # Persistence is also skipped when the thread was cleared
+                    # mid-turn, or the deleted row would come straight back;
+                    # the cursor stays cleared too, since the fresh session
+                    # that follows a reset holds none of the earlier messages.
+                    if not turn_ok:
+                        logger.info(
+                            "agent %s keep context cursor (turn failed) thread=%s",
+                            self.name,
+                            thread_key,
+                        )
+                    elif gen == self._turn_generation(thread_key):
+                        self.last_seen[thread_key] = ts
                         self.persist_thread(
                             thread_key, ts, execution_plan
                         )
@@ -4515,16 +5246,30 @@ class SlackAgent:
 
                     # Post results as new messages (not chat_update): message_changed is classified
                     # as system and ignored, so peers would never see mentions.
-                    await self._post_result(channel, thread_ts, result)
+                    if not skip_post:
+                        await self._post_result(channel, thread_ts, result)
                     ok = turn_ok
                 finally:
-                    await self._set_reaction(
-                        client,
-                        channel,
-                        ts,
-                        add="white_check_mark" if ok else "x",
-                        remove="hourglass_flowing_sand",
-                    )
+                    if not ok:
+                        done_reaction = "x"
+                    elif skip_post:
+                        # Withdrawn on purpose; ✅ would claim a reply exists.
+                        done_reaction = "zipper_mouth_face"
+                    else:
+                        done_reaction = "white_check_mark"
+                    for trigger_mark_ts in trigger_ts:
+                        await self._set_reaction(
+                            client,
+                            channel,
+                            trigger_mark_ts,
+                            add=done_reaction,
+                            remove="hourglass_flowing_sand",
+                        )
+                    # Batched triggers are answered now; a crash before their
+                    # own (no-op) tasks run must not report them as cut off.
+                    for trigger in batch:
+                        if trigger is not event:
+                            self._ledger_clear(trigger)
 
                 # After all result chunks are posted, check whether context rollover is needed (still under lock)
                 await self._maybe_rollover(
@@ -4619,6 +5364,16 @@ class SlackAgent:
                 channel,
                 ",".join(removed),
             )
+        plain = plain_agent_mentions(
+            result,
+            {
+                name: uid
+                for name in self.roster.names()
+                if name != self.name and (uid := self.roster.user_id_of(name))
+            },
+        )
+        if plain:
+            result += "\n\n" + format_plain_mention_notice(plain)
         chunks = split_markdown(result)
         for chunk in chunks:
             posted_text = ""
@@ -4631,8 +5386,12 @@ class SlackAgent:
             try:
                 resp = await self.app.client.chat_postMessage(**post_kwargs)
                 posted_text = (resp.get("message") or {}).get("text") or ""
-            except Exception:
-                # Fall back to plain text when markdown_text is unavailable/fails, to guarantee delivery
+            except SlackApiError:
+                # Slack answered and refused markdown_text, so nothing was
+                # posted: plain text is a safe second attempt. Any other
+                # failure (timeout, dropped connection) may have delivered the
+                # chunk already; re-posting would duplicate the reply and its
+                # handoff mention, so it propagates instead.
                 logger.warning(
                     "agent %s markdown_text post failed, fallback to text",
                     self.name,
@@ -4657,6 +5416,161 @@ class SlackAgent:
                 if thread_ts is not None:
                     mention_kwargs["thread_ts"] = thread_ts
                 await self.app.client.chat_postMessage(**mention_kwargs)
+
+    @staticmethod
+    def _freshness_recheck_enabled() -> bool:
+        """Reply freshness gate toggle (`FRESHNESS_RECHECK`, default on)."""
+        value = os.environ.get("FRESHNESS_RECHECK", "1").strip().lower()
+        return value not in {"0", "false", "no", "off"}
+
+    def _thread_snapshot_messages(
+        self,
+        channel: str,
+        thread_ts: str,
+        allowed_agent_names: set[str] | frozenset[str] | None,
+    ) -> list[dict]:
+        """Authority-filtered local transcript read (zero Slack API calls)."""
+        snapshot = self.transcript_store.read_thread(
+            self._transcript_team_id(), channel, thread_ts
+        )
+        policy = self._project_policy(channel)
+        allowed_humans, allow_any_human = self._allowed_humans_for(policy)
+        peer_bot_ids = self.roster.peer_bot_ids(self.name, allowed_agent_names)
+        return filter_context_messages(
+            snapshot.messages,
+            self_bot_id=self.bot_id,
+            self_user_id=self.user_id,
+            peer_bot_ids=peer_bot_ids,
+            allowed_humans=allowed_humans,
+            feed_bot_ids=self.feed_bot_ids,
+            allow_any_human=allow_any_human,
+        )
+
+    def _freshness_baseline(
+        self, channel: str, thread_ts: str | None, trigger_ts: str
+    ) -> str:
+        """Newest locally-known ts before the turn starts.
+
+        Arrivals newer than this gate posting; local read only, degrading to
+        the trigger ts so a transcript failure can never block the turn.
+        """
+        if not thread_ts:
+            return trigger_ts
+        latest = ""
+        try:
+            snapshot = self.transcript_store.read_thread(
+                self._transcript_team_id(), channel, thread_ts
+            )
+            latest = latest_message_ts(snapshot.messages)
+        except Exception:
+            logger.warning(
+                "agent %s freshness baseline read failed (using trigger ts)",
+                self.name,
+                exc_info=True,
+            )
+        try:
+            if latest and float(latest) > float(trigger_ts):
+                return latest
+        except ValueError:
+            pass
+        return trigger_ts
+
+    async def _freshness_gate(
+        self,
+        result: str,
+        *,
+        channel: str,
+        thread_ts: str,
+        baseline_ts: str,
+        thread_key: str,
+        gen: tuple[int, int],
+        allowed_agent_names: set[str] | frozenset[str] | None,
+        project_id: str,
+    ) -> tuple[str, bool]:
+        """Post-time freshness gate. Returns ``(final_result, skip_post)``.
+
+        One local re-read of the shared transcript: peer/allowed-human
+        messages that arrived while the turn ran trigger exactly one
+        re-decide pass (keep / revise / withdraw); a verbatim duplicate of
+        the latest non-self message is suppressed. Every failure fails open
+        so an already-computed reply is never lost to the gate itself.
+        """
+        try:
+            messages = self._thread_snapshot_messages(
+                channel, thread_ts, allowed_agent_names
+            )
+        except Exception:
+            logger.warning(
+                "agent %s freshness gate transcript read failed (fail-open)",
+                self.name,
+                exc_info=True,
+            )
+            return result, False
+        peer_bot_ids = self.roster.peer_bot_ids(self.name, allowed_agent_names)
+        newer = select_freshness_messages(
+            messages,
+            baseline_ts=baseline_ts,
+            self_user_id=self.user_id,
+            self_bot_id=self.bot_id,
+            peer_bot_ids=peer_bot_ids,
+            feed_bot_ids=self.feed_bot_ids,
+        )
+        final = result
+        if newer:
+            block = format_thread_context(
+                newer,
+                name_of=self._display_name_of,
+                self_user_id=self.user_id,
+            )
+            if block:
+                logger.info(
+                    "agent %s freshness recheck: %d mid-turn message(s) thread=%s",
+                    self.name,
+                    len(newer),
+                    thread_key,
+                )
+                try:
+                    decision_raw = await self._run_turn(
+                        build_freshness_recheck_prompt(result, block),
+                        thread_key,
+                        gen,
+                        allowed_agent_names=allowed_agent_names,
+                        project_id=project_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "agent %s freshness recheck turn failed (fail-open)",
+                        self.name,
+                        exc_info=True,
+                    )
+                    decision_raw = ""
+                if decision_raw.strip() in EMPTY_REPLY_PLACEHOLDERS:
+                    # An empty recheck is no decision; never post the
+                    # placeholder in place of the draft.
+                    decision_raw = ""
+                decision, revised = parse_freshness_decision(decision_raw)
+                if decision == "skip":
+                    logger.info(
+                        "agent %s freshness recheck withdrew the reply thread=%s",
+                        self.name,
+                        thread_key,
+                    )
+                    return final, True
+                if decision == "revise":
+                    final = revised
+        latest_peer = latest_non_self_text(
+            messages,
+            self_user_id=self.user_id,
+            self_bot_id=self.bot_id,
+        )
+        if is_verbatim_duplicate(final, latest_peer):
+            logger.warning(
+                "agent %s suppressed verbatim duplicate reply thread=%s",
+                self.name,
+                thread_key,
+            )
+            return final, True
+        return final, False
 
     async def patrol_loop(self) -> None:
         """Patrol heartbeat: periodically acquire todo issue leases and report.
@@ -4696,21 +5610,10 @@ class SlackAgent:
                 # A patrol-enabled but initially repo-less agent can become
                 # active after a verified per-agent repo reload.
                 await self.consume_pending_config()
-                repo = self.github_repo
-                if repo:
-                    prompt = (
-                        f"巡回タスク: `gh issue list --repo {repo} "
-                        f'--label "status:todo" --json number,title,labels` を実行し、'
-                        "候補があれば system prompt の v2 lease protocol で"
-                        "**1件だけ**認領する。absent-ref `--force-with-lease` create が"
-                        "known exit 0 で成功し、ref・metadata commit・issue comment を"
-                        "全量再読して所有者・nonce・時刻・SHA の一致を検証できた場合だけ"
-                        "作業を進める。failure・timeout・unknown・不一致は fail-closed とし、"
-                        "issue 状態やコードを変更しない。"
-                        "進捗と結果を報告してください。"
-                        "認領できる issue が無ければ本文を PATROL_IDLE とだけしてください。"
-                    )
-                    await self._run_patrol_once(prompt, channel)
+                if self.github_repo:
+                    # Host-claim patrol: the claim tool picks and claims one
+                    # issue before any provider turn is spent.
+                    await self._run_patrol_once(None, channel)
             except Exception:
                 logger.warning(
                     "agent %s patrol_loop iteration failed",
@@ -4724,11 +5627,33 @@ class SlackAgent:
                 count=self.patrol_count,
             )
 
-    async def _run_patrol_once(self, prompt: str, channel: str) -> None:
-        """Run patrol and consume a deferred snapshot on every exit path."""
+    async def _run_patrol_once(self, prompt: str | None, channel: str) -> None:
+        """Run patrol and consume a deferred snapshot on every exit path.
+
+        ``prompt=None`` runs the host-claim patrol (see _run_patrol_once_inner).
+        """
         config_snapshot = replace(
             self.cfg, allowed_tools=list(self.cfg.allowed_tools)
         )
+        cooldown = self._cooldown_for(config_snapshot)
+        if self._patrol_fence.should_skip():
+            logger.warning(
+                "agent %s patrol paused: %d consecutive %s failures",
+                self.name,
+                self._patrol_fence.streak,
+                self._patrol_fence.category,
+            )
+            return
+        cooldown_wait = cooldown.remaining()
+        if cooldown_wait > 0:
+            # Unlike a Slack mention, a skipped patrol round retries at the
+            # next epoch anyway; do not hold node capacity to wait it out.
+            logger.warning(
+                "agent %s patrol skipped: provider cooldown %.1fs remaining",
+                self.name,
+                cooldown_wait,
+            )
+            return
         repo_snapshot = self.github_repo
         quota_reservation: QuotaReservation | None = None
         if config_snapshot.owner:
@@ -4758,13 +5683,44 @@ class SlackAgent:
             quota_reservation
         )
         try:
-            await self._run_patrol_once_inner(
+            outcome = await self._run_patrol_once_inner(
                 prompt,
                 channel,
                 config_snapshot=config_snapshot,
                 repo_snapshot=repo_snapshot,
                 admission=admission,
             )
+        except Exception as exc:
+            rate_limited, retry_after, _replay_safe = (
+                classify_provider_rate_limit(exc)
+            )
+            if rate_limited:
+                delay = cooldown.note_rate_limited(retry_after)
+                self._turn_pacer.note_rate_limited()
+                logger.warning(
+                    "agent %s patrol provider rate-limited (strike %d, "
+                    "cooldown %.0fs, pacer interval %.2fs): %s",
+                    self.name,
+                    cooldown.strikes,
+                    delay,
+                    self._turn_pacer.interval,
+                    str(exc)[:300],
+                )
+            else:
+                category = classify_runtime_failure(str(exc))
+                self._note_failure(category)
+                if self._patrol_fence.note_failure(category):
+                    await self._post_patrol_pause_notice(channel, category)
+            raise
+        else:
+            # A patrol skipped before any provider call (ACL, runtime, repo,
+            # membership) proves nothing about the provider or GitHub; it must
+            # not reset the strike streak or close the fence.
+            if outcome == "ran":
+                cooldown.note_success()
+                self._turn_pacer.note_clean_turn()
+            if outcome in ("ran", "idle"):
+                self._patrol_fence.note_success()
         finally:
             _CURRENT_QUOTA_RESERVATION.reset(quota_token)
             if quota_reservation is not None:
@@ -4787,16 +5743,50 @@ class SlackAgent:
                     exc_info=True,
                 )
 
+    async def _post_patrol_pause_notice(
+        self, channel: str, category: str
+    ) -> None:
+        """Tell the patrol channel once that patrol stopped repeating a failure."""
+        if self.app is None:
+            return
+        try:
+            await self.app.client.chat_postMessage(
+                channel=channel,
+                text=(
+                    f"⏸️ {self.name} の巡回を一時停止しました: 同じ種類の"
+                    f"エラー（{category}）が {self._patrol_fence.streak} 回"
+                    "続いたためです。"
+                    f"{RUNTIME_FAILURE_NOTICES[category]}"
+                    "以後はときどき試行し、成功すると自動で再開します。"
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "agent %s failed to post patrol pause notice",
+                self.name,
+                exc_info=True,
+            )
+
     async def _run_patrol_once_inner(
         self,
-        prompt: str,
+        prompt: str | None,
         channel: str,
         *,
         config_snapshot: AgentConfig,
         repo_snapshot: str | None,
         admission: RuntimeAdmission,
-    ) -> None:
-        """Run one patrol from one immutable admitted config snapshot."""
+    ) -> str:
+        """Run one patrol from one immutable admitted config snapshot.
+
+        ``prompt=None`` is the host-claim patrol: the host lists todo issues
+        and claims one with the claim tool first, so an idle round costs no
+        provider turn and the model never runs the lease protocol by hand;
+        while the turn works, the host renews the lease.
+
+        Returns ``"skipped"`` (pre-checks stopped it), ``"idle"`` (GitHub was
+        reachable but nothing was claimable) or ``"ran"`` (a provider turn
+        ran).
+        """
         async with self.runtime_limiter.slot(
             self.name,
             config_snapshot.workspace,
@@ -4809,7 +5799,7 @@ class SlackAgent:
                     self.name,
                     channel,
                 )
-                return
+                return "skipped"
             runtime = config_snapshot.runtime
             if runtime == "openai":
                 logger.warning(
@@ -4817,13 +5807,13 @@ class SlackAgent:
                     "Git/shell tools",
                     self.name,
                 )
-                return
+                return "skipped"
             if not repo_snapshot:
                 logger.warning(
                     "agent %s patrol skipped: no verified GitHub repo",
                     self.name,
                 )
-                return
+                return "skipped"
             allowed_agent_names = await self._channel_agent_names(
                 self.app.client if self.app is not None else None,
                 channel,
@@ -4841,7 +5831,27 @@ class SlackAgent:
                     self.name,
                     channel,
                 )
-                return
+                return "skipped"
+            claim: dict | None = None
+            if prompt is None:
+                claim = await self._claim_patrol_issue(
+                    repo_snapshot, config_snapshot
+                )
+                if claim is None:
+                    logger.debug(
+                        "agent %s patrol idle: nothing claimable", self.name
+                    )
+                    return "idle"
+                prompt = build_patrol_work_prompt(
+                    issue=int(claim["number"]),
+                    title=str(claim.get("title") or ""),
+                    release_command=self._claim_command(
+                        "release",
+                        repo=repo_snapshot,
+                        issue=str(claim["number"]),
+                        config=config_snapshot,
+                    ),
+                )
             project_id = policy.project_id if policy is not None else ""
             system_prompt = self._system_prompt(
                 allowed_agent_names,
@@ -4849,76 +5859,35 @@ class SlackAgent:
                 config=config_snapshot,
                 github_repo=repo_snapshot,
             )
-            if runtime == "codex":
-                codex_result = await self._run_codex_exec(
-                    f"{system_prompt}\n---\n{prompt}",
-                    resume_session=None,
-                    config=config_snapshot,
-                )
-                result_text, _tid, _tok = codex_result[:3]
-                usage = (
-                    codex_result[3]
-                    if len(codex_result) > 3
-                    else ProviderTokenUsage(
-                        input_tokens=_tok,
-                        total_tokens=_tok,
-                        complete=False,
-                    )
-                )
-                self._settle_quota_usage(usage)
-            elif runtime == "claude":
-                options = ClaudeAgentOptions(
-                    cwd=config_snapshot.workspace,
-                    allowed_tools=config_snapshot.allowed_tools,
-                    permission_mode="default",
-                    max_turns=config_snapshot.max_turns,
-                    system_prompt=system_prompt,
-                    model=config_snapshot.claude_model or None,
-                    effort=(
-                        config_snapshot.effort
-                        if config_snapshot.effort in CLAUDE_EFFORTS
-                        else None
-                    ),
-                )
-                result_text = ""
-                provider_usage: ProviderTokenUsage | None = None
-                self._mark_quota_runtime_started()
-                async with asyncio.timeout(config_snapshot.claude_timeout):
-                    async for message in query(prompt=prompt, options=options):
-                        if isinstance(message, ResultMessage):
-                            result_text = message.result or ""
-                            raw_usage = getattr(message, "usage", None) or {}
-                            direct_input = int(
-                                raw_usage.get("input_tokens") or 0
-                            )
-                            cache_tokens = sum(
-                                int(raw_usage.get(key) or 0)
-                                for key in (
-                                    "cache_read_input_tokens",
-                                    "cache_creation_input_tokens",
-                                )
-                            )
-                            output_tokens = int(
-                                raw_usage.get("output_tokens") or 0
-                            )
-                            provider_usage = ProviderTokenUsage(
-                                input_tokens=direct_input + cache_tokens,
-                                output_tokens=output_tokens,
-                                cache_tokens=cache_tokens,
-                                total_tokens=(
-                                    direct_input
-                                    + cache_tokens
-                                    + output_tokens
-                                ),
-                                complete=(
-                                    "input_tokens" in raw_usage
-                                    and "output_tokens" in raw_usage
-                                ),
-                            )
-                if provider_usage is not None:
-                    self._settle_quota_usage(provider_usage)
+            work = self._patrol_provider_turn(
+                prompt,
+                system_prompt=system_prompt,
+                config_snapshot=config_snapshot,
+            )
+            if claim is None:
+                result_text = await work
             else:
-                raise RuntimeError(f"unsupported patrol runtime: {runtime}")
+                issue = int(claim["number"])
+                try:
+                    result_text = await self._with_claim_renewal(
+                        work,
+                        issue=issue,
+                        renew=lambda: self._run_claim_tool(
+                            "renew",
+                            repo=repo_snapshot,
+                            issue=issue,
+                            config=config_snapshot,
+                        ),
+                    )
+                except ClaimLeaseLostError as exc:
+                    await self._post_result(
+                        channel,
+                        None,
+                        f"⛔ issue #{issue} の claim を更新できなかったため、"
+                        f"作業を中止しました（{exc.status}）。"
+                        "issue の状態を確認してください。",
+                    )
+                    raise
             result = result_text or (
                 "(runtime からテキストの応答がありませんでした)"
             )
@@ -4926,6 +5895,263 @@ class SlackAgent:
                 logger.debug("agent %s patrol idle", self.name)
             else:
                 await self._post_result(channel, None, result)
+            return "ran"
+
+    async def _patrol_provider_turn(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str,
+        config_snapshot: AgentConfig,
+    ) -> str:
+        """One fresh-session provider turn for patrol; returns its text."""
+        runtime = config_snapshot.runtime
+        if runtime == "codex":
+            codex_result = await self._run_codex_exec(
+                f"{system_prompt}\n---\n{prompt}",
+                resume_session=None,
+                config=config_snapshot,
+            )
+            result_text, _tid, _tok = codex_result[:3]
+            usage = (
+                codex_result[3]
+                if len(codex_result) > 3
+                else ProviderTokenUsage(
+                    input_tokens=_tok,
+                    total_tokens=_tok,
+                    complete=False,
+                )
+            )
+            self._settle_quota_usage(usage)
+            return result_text
+        if runtime != "claude":
+            raise RuntimeError(f"unsupported patrol runtime: {runtime}")
+        options = ClaudeAgentOptions(
+            cwd=config_snapshot.workspace,
+            allowed_tools=config_snapshot.allowed_tools,
+            permission_mode="default",
+            max_turns=config_snapshot.max_turns,
+            system_prompt=system_prompt,
+            model=config_snapshot.claude_model or None,
+            effort=(
+                config_snapshot.effort
+                if config_snapshot.effort in CLAUDE_EFFORTS
+                else None
+            ),
+        )
+        result_text = ""
+        provider_usage: ProviderTokenUsage | None = None
+        signals = TurnSignals()
+        await self._pace_turn_start()
+        self._mark_quota_runtime_started()
+        try:
+            async with asyncio.timeout(config_snapshot.claude_timeout):
+                async for message in query(prompt=prompt, options=options):
+                    observe_claude_message(signals, message)
+                    if isinstance(message, ResultMessage):
+                        result_text = message.result or ""
+                        provider_usage = claude_result_usage(
+                            getattr(message, "usage", None)
+                        )
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            if provider_usage is not None:
+                self._settle_quota_usage(provider_usage)
+            rate_error = signals.rate_limit_error(str(exc), now=time.time())
+            if rate_error is not None:
+                raise rate_error from exc
+            if signals.error_text:
+                raise RuntimeError(
+                    "patrol claude turn returned an error result: "
+                    f"{signals.error_text[:300]}"
+                ) from exc
+            raise
+        if provider_usage is not None:
+            self._settle_quota_usage(provider_usage)
+        if signals.error_text:
+            # Never post a provider error as a top-level patrol report.
+            rate_error = signals.rate_limit_error(now=time.time())
+            if rate_error is not None:
+                raise rate_error
+            raise RuntimeError(
+                "patrol claude turn returned an error result: "
+                f"{signals.error_text[:300]}"
+            )
+        return result_text
+
+    # -- host-side issue claims (issue_claim.py) -----------------------------
+
+    def _claim_command(
+        self,
+        action: str,
+        *,
+        repo: str,
+        issue: str,
+        config: AgentConfig | ExecutionConfig,
+    ) -> str:
+        """Shell-ready claim tool command line (for prompts)."""
+        return claim_tool_command(
+            action,
+            tool=ISSUE_CLAIM_TOOL_PREFIX,
+            repo=repo,
+            issue=issue,
+            agent=self.name,
+            node=config.node_id,
+        )
+
+    async def _run_claim_tool(
+        self,
+        action: str,
+        *,
+        repo: str,
+        issue: int,
+        config: AgentConfig | ExecutionConfig,
+    ) -> dict:
+        """Run issue_claim.py; any failure to get a verdict is ``unknown``."""
+        cmd = [
+            sys.executable,
+            ISSUE_CLAIM_TOOL,
+            action,
+            "--repo",
+            repo,
+            "--issue",
+            str(int(issue)),
+            "--agent",
+            self.name,
+            "--node",
+            config.node_id or "unspecified",
+        ]
+        rc, out, err = await run_host_command(
+            cmd, cwd=config.workspace, timeout=CLAIM_TOOL_TIMEOUT_SECONDS
+        )
+        lines = [line for line in out.splitlines() if line.strip()]
+        try:
+            result = json.loads(lines[-1]) if lines else None
+        except ValueError:
+            result = None
+        if not isinstance(result, dict) or "status" not in result:
+            logger.warning(
+                "agent %s claim tool %s gave no verdict (rc=%s): %s",
+                self.name,
+                action,
+                rc,
+                err[-500:],
+            )
+            return {"status": "unknown", "issue": int(issue), "reason": "no verdict"}
+        return result
+
+    async def _patrol_candidates(
+        self, repo: str, config: AgentConfig
+    ) -> list[dict]:
+        """Open ``status:todo`` issues, oldest first; a gh failure raises."""
+        rc, out, err = await run_host_command(
+            [
+                "gh",
+                "issue",
+                "list",
+                "--repo",
+                repo,
+                "--label",
+                "status:todo",
+                "--state",
+                "open",
+                "--json",
+                "number,title",
+                "--limit",
+                "20",
+            ],
+            cwd=config.workspace,
+            timeout=CLAIM_TOOL_TIMEOUT_SECONDS,
+        )
+        if rc != 0:
+            raise RuntimeError(f"gh issue list failed: {err.strip()[-300:]}")
+        try:
+            issues = json.loads(out or "[]")
+        except ValueError as exc:
+            raise RuntimeError("gh issue list returned malformed JSON") from exc
+        candidates = [
+            item
+            for item in issues
+            if isinstance(item, dict) and isinstance(item.get("number"), int)
+        ]
+        return sorted(candidates, key=lambda item: item["number"])
+
+    async def _claim_patrol_issue(
+        self, repo: str, config: AgentConfig
+    ) -> dict | None:
+        """Claim the oldest claimable todo issue; None when nothing is claimable."""
+        for candidate in (await self._patrol_candidates(repo, config))[
+            :PATROL_CLAIM_ATTEMPTS
+        ]:
+            result = await self._run_claim_tool(
+                "claim", repo=repo, issue=candidate["number"], config=config
+            )
+            if result.get("status") == "claimed":
+                logger.info(
+                    "agent %s patrol claimed issue #%s",
+                    self.name,
+                    candidate["number"],
+                )
+                return {**candidate, **result}
+            logger.info(
+                "agent %s patrol could not claim issue #%s: %s %s",
+                self.name,
+                candidate["number"],
+                result.get("status"),
+                str(result.get("reason") or "")[:200],
+            )
+        return None
+
+    async def _with_claim_renewal(
+        self,
+        work: Any,
+        *,
+        issue: int,
+        renew: Any,
+        renew_every: float = CLAIM_RENEW_SECONDS,
+    ) -> str:
+        """Await ``work`` while renewing its issue lease; stop work if it lapses.
+
+        A failed or unknown renewal means the claim may no longer be ours, so
+        the turn is cancelled rather than allowed to keep changing code.
+        """
+        work_task = asyncio.ensure_future(work)
+
+        async def renew_loop() -> dict:
+            while True:
+                await asyncio.sleep(renew_every)
+                try:
+                    result = await renew()
+                except Exception as exc:
+                    return {"status": "unknown", "reason": str(exc)[:200]}
+                if result.get("status") != "renewed":
+                    return result
+
+        renew_task = asyncio.create_task(renew_loop())
+        try:
+            done, _pending = await asyncio.wait(
+                {work_task, renew_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if work_task in done:
+                return work_task.result()
+            lost = renew_task.result()
+            logger.warning(
+                "agent %s lost issue #%s lease (%s): cancelling the turn",
+                self.name,
+                issue,
+                lost.get("status"),
+            )
+            work_task.cancel()
+            await asyncio.gather(work_task, return_exceptions=True)
+            raise ClaimLeaseLostError(
+                issue, str(lost.get("status") or "unknown")
+            )
+        finally:
+            for task in (renew_task, work_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(renew_task, work_task, return_exceptions=True)
 
     async def _maybe_rollover(
         self, thread_key: str, thread_ts: str, say: Any
@@ -5112,11 +6338,18 @@ class SlackAgent:
         channel: str,
         thread_ts: str,
         *,
-        exclude_ts: str,
+        exclude_ts: str | frozenset[str],
         thread_key: str,
         allowed_agent_names: set[str] | frozenset[str] | None = None,
     ) -> str:
-        """Fetch recent thread messages and format as context; degrade to empty string on failure."""
+        """Fetch recent thread messages and format as context; degrade to empty string on failure.
+
+        ``exclude_ts`` are the triggers this turn answers; they appear in the
+        instruction instead.
+        """
+        excluded_ts = (
+            {exclude_ts} if isinstance(exclude_ts, str) else set(exclude_ts)
+        )
         try:
             policy = self._project_policy(channel)
             if not self._project_allows_target(policy):
@@ -5177,7 +6410,7 @@ class SlackAgent:
                 text = (msg.get("text") or "").strip()
                 if not text:
                     continue
-                if msg_ts == exclude_ts:
+                if msg_ts in excluded_ts:
                     continue
                 try:
                     if float(msg_ts) <= float(last):
@@ -5190,6 +6423,7 @@ class SlackAgent:
                 filtered,
                 name_of=self._display_name_of,
                 self_user_id=self.user_id,
+                pin_root_ts=thread_ts or "",
             )
         except Exception:
             logger.warning(
@@ -5275,7 +6509,116 @@ class SlackAgent:
         file ingestion; using it (instead of re-snapshotting here) closes the
         window where a !reset landing during preprocessing would become the new
         baseline and the cleared session would be silently recreated.
+
+        A provider rate limit arms the per-agent cooldown and the turn is
+        retried once after it expires, but only when the failed attempt is
+        provably replay-safe (no side-effecting tool ran), the provider's
+        reset fits one cooldown, and the thread was not reset meanwhile.
+        Otherwise a typed ``ProviderRateLimitedError`` reaches the caller.
+        A turn that starts while a cooldown is armed waits first, with its
+        node slot handed back. Timeouts and other errors keep their existing
+        single-attempt behavior.
         """
+        cooldown = self._cooldown_for()
+        for attempt in (0, 1):
+            wait = cooldown.remaining()
+            if wait > 0:
+                await self._wait_out_cooldown(wait, thread_key)
+            try:
+                result = await self._dispatch_turn(
+                    prompt,
+                    thread_key,
+                    gen,
+                    allowed_agent_names=allowed_agent_names,
+                    project_id=project_id,
+                )
+            except Exception as exc:
+                (
+                    rate_limited,
+                    retry_after,
+                    replay_safe,
+                ) = classify_provider_rate_limit(exc)
+                if not rate_limited:
+                    raise
+                delay = cooldown.note_rate_limited(retry_after)
+                self._turn_pacer.note_rate_limited()
+                logger.warning(
+                    "agent %s provider rate-limited (strike %d, cooldown "
+                    "%.0fs, pacer interval %.2fs) thread=%s: %s",
+                    self.name,
+                    cooldown.strikes,
+                    delay,
+                    self._turn_pacer.interval,
+                    thread_key,
+                    str(exc)[:300],
+                )
+                if (
+                    attempt == 0
+                    and replay_safe
+                    and not cooldown.exceeds_cap(retry_after)
+                    and gen == self._turn_generation(thread_key)
+                ):
+                    continue
+                if isinstance(exc, ProviderRateLimitedError):
+                    raise
+                raise ProviderRateLimitedError(
+                    str(exc)[-500:] or "provider rate limited",
+                    retry_after=retry_after,
+                    replay_safe=replay_safe,
+                ) from exc
+            cooldown.note_success()
+            self._turn_pacer.note_clean_turn()
+            return result
+        raise AssertionError("unreachable: _run_turn retry loop exhausted")
+
+    async def _wait_out_cooldown(self, wait: float, thread_key: str) -> None:
+        """Wait out the provider cooldown without occupying a node slot.
+
+        A wait long enough to look like a hang gets one thread notice.
+        """
+        logger.warning(
+            "agent %s provider cooldown active: waiting %.1fs before turn "
+            "thread=%s",
+            self.name,
+            wait,
+            thread_key,
+        )
+        plan = self._active_execution_plan()
+        if (
+            wait >= COOLDOWN_NOTICE_SECONDS
+            and plan is not None
+            and self.app is not None
+        ):
+            try:
+                await self.app.client.chat_postMessage(
+                    channel=plan.channel_id,
+                    thread_ts=plan.root_thread_ts,
+                    text=(
+                        "⏸️ AI provider のレート制限中です。"
+                        f"約 {math.ceil(wait)} 秒後に自動で再開します。"
+                    ),
+                )
+            except Exception:
+                logger.warning(
+                    "agent %s failed to post cooldown notice",
+                    self.name,
+                    exc_info=True,
+                )
+        admission = _HELD_RUNTIME_ADMISSION.get()
+        if admission is None:
+            await asyncio.sleep(wait)
+        else:
+            await self.runtime_limiter.sleep_released(admission, wait)
+
+    async def _dispatch_turn(
+        self,
+        prompt: str,
+        thread_key: str,
+        gen: tuple[int, int],
+        *,
+        allowed_agent_names: set[str] | frozenset[str] | None = None,
+        project_id: str = "",
+    ) -> str:
         active_config = self._active_execution_config()
         if active_config.runtime == "codex":
             return await self._run_codex(
@@ -5363,6 +6706,7 @@ class SlackAgent:
                 cmd += ["-c", "sandbox_workspace_write.network_access=true"]
             cmd.append(prompt)
 
+        await self._pace_turn_start()
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -5432,14 +6776,34 @@ class SlackAgent:
                         exc_info=True,
                     )
             raise
+        stderr_text = stderr.decode(errors="replace")
         if proc.returncode != 0:
             logger.warning(
                 "agent %s codex exec rc=%s stderr=%s",
                 self.name,
                 proc.returncode,
-                stderr.decode(errors="replace")[-2000:],
+                stderr_text[-2000:],
             )
         parsed = parse_codex_events(stdout.decode(errors="replace"))
+        # A rate-limited codex run reports through an error event or stderr;
+        # surface it as a typed error so _run_turn can cool down. Only a turn
+        # that actually failed counts: an ``error`` event alone can be a stream
+        # retry that later recovered into ``turn.completed``.
+        error_message = str(parsed.get("error_message") or "")
+        turn_failed = (
+            parsed["turn_failed"]
+            or proc.returncode != 0
+            or not parsed["turn_completed"]
+        )
+        if turn_failed and (
+            is_rate_limit_signal(error_message)
+            or (proc.returncode != 0 and is_rate_limit_signal(stderr_text))
+        ):
+            raise ProviderRateLimitedError(
+                (error_message or stderr_text.strip())[-500:]
+                or "codex runtime rate limited",
+                replay_safe=not parsed["tool_activity"],
+            )
         return (
             parsed["last_message"] or "",
             parsed["thread_id"],
@@ -5505,6 +6869,7 @@ class SlackAgent:
                 complete=False,
             )
         )
+        usage = self._codex_turn_usage(resume_session, thread_id, usage)
         self._settle_quota_usage(usage)
         if gen != self._turn_generation(thread_key):
             # State was cleared while this turn was in flight (!reset / restart /
@@ -5515,14 +6880,60 @@ class SlackAgent:
                 self.name,
             )
             self.sessions.pop(thread_key, None)
-            return result_text or "(Codex からテキストの応答がありませんでした)"
+            return result_text or CODEX_EMPTY_REPLY
         if thread_id:
             self.sessions[thread_key] = thread_id
         self.thread_stats[thread_key] = {
             "input_tokens": input_tokens,
             "num_turns": 0,
         }
-        return result_text or "(Codex からテキストの応答がありませんでした)"
+        return result_text or CODEX_EMPTY_REPLY
+
+    def _codex_turn_usage(
+        self,
+        resume_session: str | None,
+        thread_id: str | None,
+        usage: ProviderTokenUsage,
+    ) -> ProviderTokenUsage:
+        """Bill only this turn: codex reports session-cumulative counters.
+
+        Without the delta every resumed turn re-billed the whole session. A
+        turn that reported no usage leaves the baseline where it was.
+        """
+        session = thread_id or resume_session
+        if not session or not (usage.input_tokens or usage.output_tokens):
+            return usage
+        current = (usage.input_tokens, usage.cache_tokens, usage.output_tokens)
+        baseline = None
+        if resume_session:
+            baseline = self._codex_usage_baselines.get(resume_session)
+            if baseline is None and self._store is not None:
+                baseline = self._store.load_codex_usage_baseline(
+                    resume_session
+                )
+        delta_input, delta_cache, delta_output = codex_usage_delta(
+            current, baseline
+        )
+        self._codex_usage_baselines.pop(session, None)
+        self._codex_usage_baselines[session] = current
+        while len(self._codex_usage_baselines) > CODEX_USAGE_BASELINE_LIMIT:
+            self._codex_usage_baselines.pop(
+                next(iter(self._codex_usage_baselines))
+            )
+        if self._store is not None:
+            self._store.save_codex_usage_baseline(
+                session,
+                input_tokens=current[0],
+                cache_tokens=current[1],
+                output_tokens=current[2],
+            )
+        return ProviderTokenUsage(
+            input_tokens=delta_input,
+            output_tokens=delta_output,
+            cache_tokens=delta_cache,
+            total_tokens=delta_input + delta_output,
+            complete=usage.complete,
+        )
 
     def _openai_system_prompt(
         self,
@@ -5595,6 +7006,7 @@ class SlackAgent:
         if active_config.effort in OPENAI_EFFORTS:
             request["reasoning"] = {"effort": active_config.effort}
 
+        await self._pace_turn_start()
         self._mark_quota_runtime_started()
         async with asyncio.timeout(active_config.claude_timeout):
             response = await client.responses.create(**request)
@@ -5669,18 +7081,14 @@ class SlackAgent:
                 self.name,
             )
             self.sessions.pop(thread_key, None)
-            return result_text or (
-                "(OpenAI API からテキストの応答がありませんでした)"
-            )
+            return result_text or OPENAI_EMPTY_REPLY
         if response_id:
             self.sessions[thread_key] = response_id
         self.thread_stats[thread_key] = {
             "input_tokens": input_tokens,
             "num_turns": 1,
         }
-        return result_text or (
-            "(OpenAI API からテキストの応答がありませんでした)"
-        )
+        return result_text or OPENAI_EMPTY_REPLY
 
     async def _run_claude(
         self,
@@ -5728,64 +7136,73 @@ class SlackAgent:
         pending_session = ""
         pending_stats: dict[str, int] | None = None
         provider_usage: ProviderTokenUsage | None = None
+        signals = TurnSignals()
+        await self._pace_turn_start()
         self._mark_quota_runtime_started()
-        async with asyncio.timeout(active_config.claude_timeout):
-            async for message in query(prompt=prompt, options=options):
-                if (
-                    isinstance(message, SystemMessage)
-                    and message.subtype == "init"
-                ):
-                    pending_session = message.data.get("session_id") or ""
-                elif isinstance(message, ResultMessage):
-                    result_text = message.result or ""
-                    usage = getattr(message, "usage", None) or {}
-                    input_tokens = sum(
-                        int(usage.get(k) or 0)
-                        for k in (
-                            "input_tokens",
-                            "cache_read_input_tokens",
-                            "cache_creation_input_tokens",
+        try:
+            async with asyncio.timeout(active_config.claude_timeout):
+                async for message in query(prompt=prompt, options=options):
+                    observe_claude_message(signals, message)
+                    if (
+                        isinstance(message, SystemMessage)
+                        and message.subtype == "init"
+                    ):
+                        pending_session = message.data.get("session_id") or ""
+                    elif isinstance(message, ResultMessage):
+                        result_text = message.result or ""
+                        usage = getattr(message, "usage", None) or {}
+                        input_tokens = sum(
+                            int(usage.get(k) or 0)
+                            for k in (
+                                "input_tokens",
+                                "cache_read_input_tokens",
+                                "cache_creation_input_tokens",
+                            )
                         )
-                    )
-                    pending_stats = {
-                        "input_tokens": input_tokens,
-                        "num_turns": int(getattr(message, "num_turns", 0) or 0),
-                    }
-                    direct_input = int(usage.get("input_tokens") or 0)
-                    cache_tokens = sum(
-                        int(usage.get(key) or 0)
-                        for key in (
-                            "cache_read_input_tokens",
-                            "cache_creation_input_tokens",
-                        )
-                    )
-                    output_tokens = int(usage.get("output_tokens") or 0)
-                    provider_usage = ProviderTokenUsage(
-                        input_tokens=direct_input + cache_tokens,
-                        output_tokens=output_tokens,
-                        cache_tokens=cache_tokens,
-                        total_tokens=(
-                            direct_input + cache_tokens + output_tokens
-                        ),
-                        complete=(
-                            "input_tokens" in usage
-                            and "output_tokens" in usage
-                        ),
-                    )
+                        pending_stats = {
+                            "input_tokens": input_tokens,
+                            "num_turns": int(
+                                getattr(message, "num_turns", 0) or 0
+                            ),
+                        }
+                        provider_usage = claude_result_usage(usage)
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            # The CLI exits non-zero after an error result and the SDK raises
+            # a generic error; charge what the turn reported, then surface a
+            # typed rate limit (before any session write-back, so a retry
+            # resumes the pre-turn session).
+            if provider_usage is not None:
+                self._settle_quota_usage(provider_usage)
+            rate_error = signals.rate_limit_error(str(exc), now=time.time())
+            if rate_error is not None:
+                raise rate_error from exc
+            if signals.error_text:
+                # The SDK's replacement text is often just the subtype;
+                # keep the CLI's own message so the failure is classifiable.
+                raise RuntimeError(
+                    f"Claude error result: {signals.error_text[:500]}"
+                ) from exc
+            raise
         if provider_usage is not None:
             self._settle_quota_usage(provider_usage)
+        if signals.error_text:
+            rate_error = signals.rate_limit_error(now=time.time())
+            if rate_error is not None:
+                raise rate_error
         if gen != self._turn_generation(thread_key):
             logger.warning(
                 "agent %s discarding claude turn session (state cleared mid-turn)",
                 self.name,
             )
             self.sessions.pop(thread_key, None)
-            return result_text or "(Claude からテキストの応答がありませんでした)"
+            return result_text or CLAUDE_EMPTY_REPLY
         if pending_session:
             self.sessions[thread_key] = pending_session
         if pending_stats is not None:
             self.thread_stats[thread_key] = pending_stats
-        return result_text or "(Claude からテキストの応答がありませんでした)"
+        return result_text or CLAUDE_EMPTY_REPLY
 
     def effective_model(self) -> str:
         """Currently effective model name; returns "" when unset (= CLI/SDK default)."""
@@ -6402,6 +7819,10 @@ class SlackAgent:
                 else None
             ),
             **runtime_status,
+            "provider_cooldown": self._cooldown_for(self.cfg).snapshot(),
+            "turn_pacer": self._turn_pacer.snapshot(),
+            "patrol_fence": self._patrol_fence.snapshot(),
+            "last_failure": self._last_failure,
             "busy_threads": sum(1 for t in threads if t["busy"]),
             "session_count": len(self.sessions),
             "patrol": bool(
@@ -6507,6 +7928,14 @@ class SlackAgent:
             "- Slackで崩れるため表(テーブル)は使わない。箇条書きと短い段落で構成する。見出しよりも太字を使う。\n"
             "- 協働ルール: 依頼は1メッセージ1件。スレッドで既出の情報を繰り返さない。"
             "相槌や確認だけの返信はしない。返信は要点のみ。\n"
+            "- 協調原則: 実際に投稿済みのスレッド内容だけを前提に行動し、"
+            "役割分担や発言順の推測で先回りしない。完了条件は依頼された"
+            "タスクの消化であり、全員が一度ずつ発言することではない。"
+            "担当 agent が不在・無応答なら、待ち続けずに対応可能な者が"
+            "次のタスクを引き取る。\n"
+            "- 人間の依頼は字面の抜け穴ではなく意図に沿って実行する。"
+            "協調の都合で成果物の内容を曲げず、直前の他者の発言を"
+            "そのまま繰り返す投稿はしない。\n"
             "- 運用コマンド: `!status <@agent>` でセッション状態確認、"
             "`!reset <@agent>` でセッションリセット、"
             "`!roles <@agent>` でチーム構成と各担当の職責を表示できる"
@@ -6526,7 +7955,10 @@ class SlackAgent:
                 f'- タスク管理は GitHub Issues が唯一の正。着手前に `gh issue list --repo {repo} --label "status:todo"` で確認する。\n'
             )
             base += format_github_claim_protocol(
-                repo, self.name, active_config.node_id
+                repo,
+                self.name,
+                active_config.node_id,
+                tool_command=ISSUE_CLAIM_TOOL_PREFIX,
             )
             base += (
                 "- ローカルコードを閲覧・調査・作業する前にremote情報を取得し、最新状態を確認する。thread worktreeでは現在の管理branchを維持し、`gh issue develop --checkout` や `gh pr checkout` は使わない。\n"
@@ -7805,6 +9237,13 @@ async def main() -> None:
         name: index for index, name in enumerate(patrol_roster)
     }
     patrol_count = max(1, len(patrol_roster))
+    # One node-wide pacer: all local agents share the provider account, so
+    # their turn starts are staggered on one timeline.
+    turn_pacer = provider_pacer_from_env()
+    # One cooldown per provider account across all local agents.
+    provider_cooldowns = ProviderCooldownRegistry(provider_cooldown_from_env)
+    provider_cooldown_from_env()  # validate the env before going live
+    socket_gap_threshold = socket_gap_threshold_from_env()
     agents = [
         SlackAgent(
             cfg,
@@ -7830,6 +9269,8 @@ async def main() -> None:
             repo_spec=repo_specs.get(cfg.name),
             patrol_index=patrol_positions.get(cfg.name, 0),
             patrol_count=patrol_count,
+            turn_pacer=turn_pacer,
+            provider_cooldowns=provider_cooldowns,
         )
         for cfg in configs
     ]
@@ -7859,6 +9300,10 @@ async def main() -> None:
                     a.name,
                     restored,
                 )
+        # Before Socket Mode starts: every ledger row left now is from the
+        # previous process.
+        for a in agents:
+            await a.reconcile_interrupted_activations()
 
     for a in agents:
         logger.info(
@@ -7920,6 +9365,11 @@ async def main() -> None:
     await asyncio.gather(
         *[h.start_async() for h in handlers],
         *[a.patrol_loop() for a in patrol_agents],
+        watch_live_coverage(
+            handlers,
+            transcript_store,
+            threshold_seconds=socket_gap_threshold,
+        ),
     )
 
 
