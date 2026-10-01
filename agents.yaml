@@ -2,7 +2,6 @@ budget:
   max_agent_rounds: 12
 github:
   repo: LumingWyy/agent-sandbox
-# trusted_feed_bots: [B0XXXXXXX]   # Slack bot ids whose messages become read-only feed context
 defaults:
   allowed_tools:
   - Read
@@ -15,7 +14,6 @@ defaults:
   max_turns: 25
   context_rollover_tokens: 60000
   reply_language: English
-  # effort: high   # reasoning effort. claude: low/medium/high/xhigh/max; codex: minimal/low/medium/high/xhigh. hot-swappable via webui
 agents:
 - name: dev
   workspace: ~/workspace/agent-sandbox-dev
@@ -43,6 +41,9 @@ agents:
     per handoff.
 
     '
+  reply_language: 中文
+  effort: high
+  claude_model: opus[1m]
 - name: reviewer
   workspace: ~/workspace/agent-sandbox-reviewer
   persona: 'You are an independent code/design reviewer. Review only: no implementation,
@@ -64,6 +65,9 @@ agents:
     requests with no PR link.
 
     '
+  reply_language: 日本語
+  effort: xhigh
+  claude_model: opus[1m]
 - name: pm
   optional: true
   persona: 'You are a seasoned product manager: turn fuzzy ideas into actionable plans,
