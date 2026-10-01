@@ -1709,3 +1709,121 @@ def test_webui_security_headers_cover_generic_500_and_http_exception(caplog):
     assert forbidden_response.status == 403
     assert forbidden_body == "preserved forbidden body"
     assert "unhandled webui request path=/boom" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Local workspace settings and the on-demand control token
+# ---------------------------------------------------------------------------
+
+
+def _workspace_app(tmp_path, monkeypatch, yaml_text):
+    target = tmp_path / "agents.yaml"
+    monkeypatch.setattr(webui, "AGENTS_YAML", target)
+    monkeypatch.setattr(webui, "ENV_FILE", tmp_path / ".env")
+    target.write_text(yaml_text, encoding="utf-8")
+
+    async def _fake_reload():
+        return {"ok": False, "error": "offline"}
+
+    monkeypatch.setattr(webui, "_admin_reload", _fake_reload)
+    return target
+
+
+def _git_repo(path, origin):
+    path.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "remote", "add", "origin", origin], check=True)
+    return path
+
+
+def _post_workspace(body, name="a"):
+    async def _run():
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async with TestClient(TestServer(webui.make_app())) as client:
+            resp = await client.post(f"/api/agents/{name}/workspace", json=body)
+            if resp.content_type != "application/json":
+                return {"ok": False, "status": resp.status}
+            return await resp.json()
+
+    return asyncio.run(_run())
+
+
+def test_workspace_check_reports_git_facts_and_mismatch(tmp_path, monkeypatch):
+    _workspace_app(
+        tmp_path, monkeypatch,
+        "github:\n  repo: acme/old\nagents:\n- name: a\n  persona: p\n",
+    )
+    repo = _git_repo(tmp_path / "widgets", "https://github.com/acme/widgets.git")
+    data = _post_workspace({"workspace": str(repo), "dry_run": True})
+    assert data["ok"] is True and data["git"] is True
+    assert data["branch"] == "main"
+    assert data["origin_repo"] == "acme/widgets"
+    # The inherited github.repo disagrees with origin: preflight would disable it.
+    assert data["github_repo"] == "acme/old" and data["mismatch"] is True
+    data = _post_workspace(
+        {"workspace": str(repo), "github_repo": "acme/widgets", "dry_run": True}
+    )
+    assert data["mismatch"] is False
+
+
+def test_workspace_save_writes_path_and_repo(tmp_path, monkeypatch):
+    target = _workspace_app(
+        tmp_path, monkeypatch,
+        "github:\n  repo: acme/old\nagents:\n- name: a\n  persona: p\n  github_repo: acme/x\n",
+    )
+    repo = _git_repo(tmp_path / "widgets", "git@github.com:acme/widgets.git")
+    data = _post_workspace({"workspace": str(repo), "github_repo": "acme/widgets"})
+    assert data["ok"] is True
+    entry = yaml.safe_load(target.read_text(encoding="utf-8"))["agents"][0]
+    assert entry["workspace"] == str(repo)
+    assert entry["github_repo"] == "acme/widgets"
+    # Empty clears the agent's own repo so it inherits again; omitted keeps it.
+    _post_workspace({"workspace": str(repo), "github_repo": ""})
+    entry = yaml.safe_load(target.read_text(encoding="utf-8"))["agents"][0]
+    assert "github_repo" not in entry
+    _post_workspace({"workspace": str(repo), "github_repo": "acme/widgets"})
+    _post_workspace({"workspace": str(repo)})
+    entry = yaml.safe_load(target.read_text(encoding="utf-8"))["agents"][0]
+    assert entry["github_repo"] == "acme/widgets"
+
+
+def test_workspace_rejects_bad_input_without_writing(tmp_path, monkeypatch):
+    target = _workspace_app(
+        tmp_path, monkeypatch, "agents:\n- name: a\n  persona: p\n  workspace: /keep\n"
+    )
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    for body, error in (
+        ({"workspace": ""}, "required"),
+        ({"workspace": "relative/dir"}, "absolute"),
+        ({"workspace": str(tmp_path / "missing")}, "does not exist"),
+        ({"workspace": str(plain), "github_repo": "not a repo"}, "OWNER/REPO"),
+    ):
+        data = _post_workspace(body)
+        assert data["ok"] is False and error in data["error"], body
+    # An agent this caller cannot see is refused before anything is read.
+    assert _post_workspace({"workspace": str(plain)}, name="ghost")["ok"] is False
+    assert yaml.safe_load(target.read_text(encoding="utf-8"))["agents"][0]["workspace"] == "/keep"
+    # A directory that is not a git repo is allowed but flagged.
+    data = _post_workspace({"workspace": str(plain), "dry_run": True})
+    assert data["ok"] is True and data["git"] is False
+
+
+def test_control_token_is_asked_in_place_only_after_a_401():
+    script = _main_script(webui.INDEX_HTML)
+    assert "window.prompt" not in script
+    assert "if(r.status===401){CONTROL_REQUIRED=true;showUnlock(!!controlToken());}" in script
+    assert "if(!CONTROL_REQUIRED||controlToken())return;" in script
+    # A rejected token is dropped so it is not resent on every poll.
+    assert "if(rejected)saveControlToken('');" in script
+    for key in ("unlock.title", "unlock.hint", "unlock.save", "unlock.bad"):
+        assert script.count(f"'{key}':") >= 3, key
+
+
+def test_workspace_editor_is_localised():
+    script = _main_script(webui.INDEX_HTML)
+    for key in ("ws.title", "ws.edit", "ws.path", "ws.repo", "ws.check", "ws.unset",
+                "ws.nogit", "ws.branch", "ws.mismatch", "ws.useorigin"):
+        assert script.count(f"'{key}':") >= 3, key
+    assert "/workspace'" in script and "dry_run" in script

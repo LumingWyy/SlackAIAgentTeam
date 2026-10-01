@@ -43,6 +43,7 @@ from control_auth import (
 from multi_core import (
     canonical_github_repo,
     default_slack_token_env_names,
+    github_repo_from_remote,
 )
 
 logger = logging.getLogger("webui")
@@ -512,6 +513,7 @@ async def h_state(request: web.Request) -> web.Response:
                 "persona": entry.get("persona") or "",
                 "card": entry.get("card") or "",
                 "workspace": entry.get("workspace") or "",
+                "github_repo_explicit": str(entry.get("github_repo") or ""),
                 "github_repo": (
                     entry.get("github_repo")
                     if "github_repo" in entry
@@ -677,6 +679,105 @@ async def h_update_persona(request: web.Request) -> web.Response:
                 entry.pop("card", None)
         write_yaml(raw)
     return web.json_response({"ok": True, "reload": await _admin_reload()})
+
+
+async def _inspect_workspace(path: str) -> dict[str, Any]:
+    """Git facts about a local directory: is it a repo, its branch and origin."""
+    rc, out, _err = await _run(
+        ["git", "-C", path, "rev-parse", "--is-inside-work-tree"], timeout=10
+    )
+    if rc != 0 or out.strip() != "true":
+        return {"git": False, "branch": "", "origin_repo": ""}
+    # symbolic-ref also names the unborn branch of a repo with no commits yet
+    rc, out, _err = await _run(
+        ["git", "-C", path, "symbolic-ref", "--quiet", "--short", "HEAD"], timeout=10
+    )
+    branch = out.strip() if rc == 0 else ""
+    rc, out, _err = await _run(
+        ["git", "-C", path, "remote", "get-url", "origin"], timeout=10
+    )
+    origin = out.strip() if rc == 0 else ""
+    return {
+        "git": True,
+        "branch": branch,
+        "origin_repo": (github_repo_from_remote(origin) or "") if origin else "",
+    }
+
+
+async def h_update_workspace(request: web.Request) -> web.Response:
+    """Check (``dry_run``) or save one agent's local workspace and GitHub repo.
+
+    ``github_repo`` omitted leaves the setting alone; an empty string clears
+    the agent's own value so it inherits defaults / github.repo again. The
+    response reports what the directory's git origin points at, and whether
+    it disagrees with the effective repo (preflight would disable GitHub).
+    """
+    name = request.match_info["name"]
+    if not NAME_RE.match(name):
+        raise web.HTTPBadRequest(text="invalid name")
+    raw = read_yaml()
+    if _require_agent_access(request, name, raw) is None:
+        return web.json_response({"ok": False, "error": "unknown agent"})
+    body = await request.json()
+    workspace = str(body.get("workspace") or "").strip()
+    if not workspace:
+        return web.json_response({"ok": False, "error": "workspace is required"})
+    expanded = os.path.expanduser(workspace)
+    if not os.path.isabs(expanded):
+        return web.json_response(
+            {"ok": False, "error": "use an absolute path or ~/…"}
+        )
+    path = os.path.realpath(expanded)
+    if not os.path.isdir(path):
+        return web.json_response(
+            {"ok": False, "error": "directory does not exist", "path": path}
+        )
+    repo_given = "github_repo" in body
+    repo = str(body.get("github_repo") or "").strip()
+    if repo:
+        try:
+            repo = canonical_github_repo(repo)
+        except ValueError:
+            return web.json_response(
+                {"ok": False, "error": "github_repo must be OWNER/REPO"}
+            )
+    entry = _require_agent_access(request, name, raw) or {}
+    defaults = raw.get("defaults") or {}
+    inherited = str(
+        defaults.get("github_repo", (raw.get("github") or {}).get("repo")) or ""
+    )
+    if repo_given:
+        effective = repo or inherited
+    else:
+        effective = str(entry.get("github_repo") or inherited)
+    facts = await _inspect_workspace(path)
+    result: dict[str, Any] = {
+        "ok": True,
+        "path": path,
+        **facts,
+        "github_repo": effective,
+        "mismatch": bool(
+            facts["origin_repo"]
+            and effective
+            and facts["origin_repo"].lower() != effective.lower()
+        ),
+    }
+    if body.get("dry_run"):
+        return web.json_response(result)
+    async with _CONFIG_LOCK:
+        raw = read_yaml()
+        entry = _require_agent_access(request, name, raw)
+        if entry is None:
+            return web.json_response({"ok": False, "error": "unknown agent"})
+        entry["workspace"] = workspace
+        if repo_given:
+            if repo:
+                entry["github_repo"] = repo
+            else:
+                entry.pop("github_repo", None)
+        write_yaml(raw)
+    result["reload"] = await _admin_reload()
+    return web.json_response(result)
 
 
 def _anthropic_key() -> str:
@@ -2516,6 +2617,24 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
 .grid2 .lbl{display:block;margin-bottom:6px}
 .foot{padding:44px 0 24px;color:var(--faint);font-family:var(--mono);font-size:.7rem;letter-spacing:.06em;text-align:center;
   text-transform:uppercase}
+/* local workspace row on each agent card */
+.wsrow{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
+.wspath{font-family:var(--mono);font-size:.8rem;color:var(--ink);overflow-wrap:anywhere}
+.wspath .faint{color:var(--faint)}
+.wsedit{margin-top:12px;padding:16px;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--bg)}
+.wsedit[hidden]{display:none}
+.wsedit.open{animation:rise .35s var(--out) both}
+.wsinfo{display:flex;align-items:center;gap:6px 10px;flex-wrap:wrap;font-family:var(--mono);font-size:.74rem;color:var(--muted);margin-top:12px}
+.wsinfo:empty{display:none}
+.wsinfo .warn{color:var(--warn)}.wsinfo .ng{color:var(--crit)}.wsinfo .ok{color:var(--good)}
+/* control token: asked in place, only after the server said it needs one */
+.unlock{display:none;margin-top:18px;padding:16px 18px;border-radius:var(--r-lg);background:var(--accent-wash);
+  border:1px solid color-mix(in oklch,var(--accent) 30%,var(--line))}
+.unlock.on{display:block;animation:armIn .5s var(--spring) both}
+.unlock .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+.unlock .row input{flex:1;min-width:220px;max-width:420px}
+.unlock b{font-family:var(--display);font-weight:600;font-size:1rem}
+.unlock .msg{margin-top:8px}
 #cx-code,#gh-code{font-family:var(--mono)!important;font-size:1.4rem!important;letter-spacing:.18em!important;
   color:var(--ink)!important;font-weight:600!important;display:inline-block;padding:8px 14px;border-radius:var(--r);
   background:var(--tile);box-shadow:var(--apple)}
@@ -2696,6 +2815,16 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
 </div></header>
 
 <main class="wrap">
+  <div class="unlock" id="unlock" role="region" aria-labelledby="unlock-title">
+    <b id="unlock-title" data-i18n="unlock.title">需要控制令牌</b>
+    <div class="sub" data-i18n="unlock.hint">这个节点启用了控制认证。</div>
+    <div class="row">
+      <input id="unlock-token" type="password" autocomplete="off" spellcheck="false" placeholder="Bearer token"
+        onkeydown="if(event.key==='Enter')unlockControl()">
+      <button class="btn solid" onclick="unlockControl()" data-i18n="unlock.save">解锁</button>
+    </div>
+    <div class="msg ng" id="unlock-msg"></div>
+  </div>
   <section id="panel-guide" class="panel on">
     <div class="guide-hero">
       <div class="guide-kicker" data-i18n="guide.kicker">START HERE · OWNER RUNBOOK</div>
@@ -3056,12 +3185,30 @@ function withControlAuth(options){
   const token=controlToken();if(token)headers.set('Authorization','Bearer '+token);
   next.headers=headers;return next;
 }
-const apiFetch=(u,o)=>fetch(u,withControlAuth(o));
+// a token is asked for only after the server answers 401: nodes without
+// control auth (local legacy mode) never show the prompt at all
+let CONTROL_REQUIRED=false;
+const apiFetch=async(u,o)=>{
+  const r=await fetch(u,withControlAuth(o));
+  if(r.status===401){CONTROL_REQUIRED=true;showUnlock(!!controlToken());}
+  return r;
+};
 const j=async(u,o)=>(await apiFetch(u,o)).json();
+function showUnlock(rejected){
+  if(rejected)saveControlToken('');
+  const bar=$('#unlock');if(!bar)return;
+  $('#unlock-msg').textContent=rejected?t('unlock.bad'):'';
+  if(!bar.classList.contains('on')){bar.classList.add('on');const input=$('#unlock-token');if(input)input.focus();}
+}
+function unlockControl(){
+  const input=$('#unlock-token'), value=(input.value||'').trim();
+  if(!value)return;
+  saveControlToken(value);input.value='';$('#unlock').classList.remove('on');
+  showTab(TABS.find(k=>$('#panel-'+k).classList.contains('on'))||'mon');
+}
 function ensureControlToken(){
-  if(controlToken())return;
-  const supplied=window.prompt('Control bearer token');
-  if(supplied)saveControlToken(supplied.trim());
+  if(!CONTROL_REQUIRED||controlToken())return;
+  showUnlock(false);
 }
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 function safeHttpUrl(value){
@@ -3123,7 +3270,7 @@ const I18N={
    'cfg.save':'保存','cfg.setup':'设置','cfg.retoken':'重设 token','cfg.required':'必需','cfg.optional':'可选',
    'wz.s1':'1. 打开 api.slack.com/apps →「From a manifest」贴入下方 → Install to Workspace',
    'wz.copy':'复制 manifest','wz.s2':'2. 粘贴 Bot Token (xoxb-) 与 App-Level Token (xapp-, connections:write)：',
-   'wz.save':'验证并写入 .env','tok.copied':'manifest 已复制','saved':'✓ 已保存','savefail':'保存失败','cfg.editpersona':'编辑内容','cfg.restarthint':'重启 multi_app 生效','cfg.worktreerootrestart':'worktree root 仅在重启后生效；重启前请先用旧 root clean remove 仍存活的映射',
+   'wz.save':'验证并写入 .env','tok.copied':'manifest 已复制','saved':'✓ 已保存','savefail':'保存失败','unlock.title':'需要控制令牌','unlock.hint':'这个节点启用了控制认证。输入 .env 里为你（owner）配置的控制 Bearer 令牌；只保存在本标签页的会话里。','unlock.save':'解锁','unlock.bad':'令牌不正确，请重新输入。','ws.title':'本地 workspace','ws.edit':'修改','ws.path':'目录（绝对路径或 ~/…）','ws.repo':'GitHub 仓库（OWNER/REPO，留空沿用默认）','ws.check':'检查','ws.unset':'未设置（使用 CLAUDE_WORKSPACE 或启动目录）','ws.nogit':'不是 git 仓库，GitHub 协作不可用','ws.branch':'分支','ws.mismatch':'origin 与 GitHub 仓库不一致，GitHub 协作会被禁用','ws.useorigin':'改用 {r}','cfg.editpersona':'编辑内容','cfg.restarthint':'重启 multi_app 生效','cfg.worktreerootrestart':'worktree root 仅在重启后生效；重启前请先用旧 root clean remove 仍存活的映射',
       'nav.auth':'认证','auth.title':'认证','auth.sub':'智能体实际运行环境（优先 Docker 容器，否则本机）的登录凭据。',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
    'auth.signin':'开始登录','auth.openurl':'打开下方链接完成授权，再把页面给出的 code 粘贴回来。',
@@ -3192,7 +3339,7 @@ const I18N={
    'cfg.save':'保存','cfg.setup':'セットアップ','cfg.retoken':'token 再設定','cfg.required':'必須','cfg.optional':'任意',
    'wz.s1':'1. api.slack.com/apps →「From a manifest」に下記を貼付 → Install to Workspace',
    'wz.copy':'manifest をコピー','wz.s2':'2. Bot Token (xoxb-) と App-Level Token (xapp-, connections:write) を貼付:',
-   'wz.save':'検証して .env に保存','tok.copied':'manifest コピー','saved':'✓ 保存','savefail':'保存に失敗しました','cfg.editpersona':'内容を編集','cfg.restarthint':'multi_app 再起動で反映','cfg.worktreerootrestart':'worktree root は再起動時だけ反映されます。稼働中の mapping は先に旧 root 設定で clean remove してください',
+   'wz.save':'検証して .env に保存','tok.copied':'manifest コピー','saved':'✓ 保存','savefail':'保存に失敗しました','unlock.title':'コントロールトークンが必要です','unlock.hint':'このノードはコントロール認証が有効です。.env に自分（owner）用に設定したコントロール Bearer トークンを入力してください。このタブのセッションにだけ保存されます。','unlock.save':'ロック解除','unlock.bad':'トークンが正しくありません。もう一度入力してください。','ws.title':'ローカル workspace','ws.edit':'変更','ws.path':'ディレクトリ（絶対パスまたは ~/…）','ws.repo':'GitHub リポジトリ（OWNER/REPO、空欄なら既定を使用）','ws.check':'確認','ws.unset':'未設定（CLAUDE_WORKSPACE または起動ディレクトリ）','ws.nogit':'git リポジトリではないため GitHub 連携は使えません','ws.branch':'ブランチ','ws.mismatch':'origin と GitHub リポジトリが一致しないため GitHub 連携は無効になります','ws.useorigin':'{r} を使う','cfg.editpersona':'内容を編集','cfg.restarthint':'multi_app 再起動で反映','cfg.worktreerootrestart':'worktree root は再起動時だけ反映されます。稼働中の mapping は先に旧 root 設定で clean remove してください',
       'nav.auth':'認証','auth.title':'認証','auth.sub':'エージェントが実際に動く環境（優先：Docker コンテナ／なければこのホスト）のログイン情報です。',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
    'auth.signin':'ログイン開始','auth.openurl':'下のリンクで承認し、表示された code を貼り付けてください。',
@@ -3261,7 +3408,7 @@ const I18N={
    'cfg.save':'Save','cfg.setup':'Set up','cfg.retoken':'Reset tokens','cfg.required':'required','cfg.optional':'optional',
    'wz.s1':'1. Open api.slack.com/apps → "From a manifest", paste below → Install to Workspace',
    'wz.copy':'Copy manifest','wz.s2':'2. Paste Bot Token (xoxb-) and App-Level Token (xapp-, connections:write):',
-   'wz.save':'Verify & save to .env','tok.copied':'manifest copied','saved':'✓ Saved','savefail':'save failed','cfg.editpersona':'Edit content','cfg.restarthint':'restart multi_app to apply','cfg.worktreerootrestart':'worktree root applies only after restart; clean-remove live mappings with the old root first',
+   'wz.save':'Verify & save to .env','tok.copied':'manifest copied','saved':'✓ Saved','savefail':'save failed','unlock.title':'Control token required','unlock.hint':'This node requires control authentication. Enter the control bearer token configured for you (the owner) in .env; it is kept in this tab session only.','unlock.save':'Unlock','unlock.bad':'That token was rejected. Try again.','ws.title':'Local workspace','ws.edit':'Change','ws.path':'Directory (absolute path or ~/…)','ws.repo':'GitHub repo (OWNER/REPO; empty inherits the default)','ws.check':'Check','ws.unset':'not set (falls back to CLAUDE_WORKSPACE or the launch directory)','ws.nogit':'not a git repo; GitHub collaboration is unavailable','ws.branch':'branch','ws.mismatch':'origin differs from the GitHub repo; GitHub collaboration will be disabled','ws.useorigin':'Use {r}','cfg.editpersona':'Edit content','cfg.restarthint':'restart multi_app to apply','cfg.worktreerootrestart':'worktree root applies only after restart; clean-remove live mappings with the old root first',
       'nav.auth':'Auth','auth.title':'Authentication','auth.sub':'Sign-in for the runtime agents actually use (Docker when up, otherwise this host).',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
    'auth.signin':'Start sign-in','auth.openurl':'Open the link below to authorize, then paste the code it shows.',
@@ -3904,6 +4051,26 @@ async function loadCfg(){loadRules();const st=await j('/api/state');
         <span class="msg persona-msg"></span></div>
       </div>
     </div>
+    <div class="wsrow">
+      <span class="lbl">${t('ws.title')}</span>
+      <span class="wspath">${a.workspace?esc(a.workspace):`<span class="faint">${t('ws.unset')}</span>`}</span>
+      ${a.github_repo?`<span class="chip">${esc(a.github_repo)}</span>`:''}
+      <button class="btn text" data-action="edit-workspace">✎ ${t('ws.edit')}</button>
+    </div>
+    <div class="wsedit" hidden>
+      <div class="grid2">
+        <div><span class="lbl">${t('ws.path')}</span>
+          <input class="ws-input" value="${esc(a.workspace||'')}" placeholder="~/workspace/my-repo" spellcheck="false" autocomplete="off"></div>
+        <div><span class="lbl">${t('ws.repo')}</span>
+          <input class="repo-input" value="${esc(a.github_repo_explicit||'')}" placeholder="${esc(a.github_repo||'OWNER/REPO')}" spellcheck="false" autocomplete="off"></div>
+      </div>
+      <div class="wsinfo"></div>
+      <div class="rowbtns" style="margin-top:12px">
+        <button class="btn line" data-action="check-workspace">${t('ws.check')}</button>
+        <button class="btn solid" data-action="save-workspace">${t('cfg.save')}</button>
+      </div>
+      <span class="msg ws-msg"></span>
+    </div>
     <div class="wiz">
       <p>${t('wz.s1')}</p>
       <pre class="manifest">…</pre>
@@ -3921,6 +4088,39 @@ async function loadCfg(){loadRules();const st=await j('/api/state');
   });
 }
 function editP(card){const e=card.querySelector('.pedit');e.style.display=e.style.display==='none'?'block':'none';}
+function editWorkspace(card){const e=card.querySelector('.wsedit');e.hidden=!e.hidden;e.classList.toggle('open',!e.hidden);
+  if(!e.hidden)card.querySelector('.ws-input').focus();}
+function workspaceBody(card,dryRun){
+  return JSON.stringify({workspace:card.querySelector('.ws-input').value,
+    github_repo:card.querySelector('.repo-input').value,dry_run:!!dryRun});
+}
+function renderWorkspaceFacts(card,r){
+  const info=card.querySelector('.wsinfo');
+  if(!r.ok){info.innerHTML=`<span class="ng">✕ ${esc(r.error||t('savefail'))}</span>`;return;}
+  const parts=[`<span class="ok">✓ ${esc(r.path)}</span>`];
+  if(!r.git)parts.push(`<span class="warn">${t('ws.nogit')}</span>`);
+  else{
+    if(r.branch)parts.push(`${t('ws.branch')} ${esc(r.branch)}`);
+    if(r.origin_repo)parts.push(`origin ${esc(r.origin_repo)}`);
+  }
+  if(r.mismatch){
+    parts.push(`<span class="warn">${t('ws.mismatch')}</span>`);
+    parts.push(`<button class="btn text" data-action="use-origin" data-repo="${esc(r.origin_repo)}">${t('ws.useorigin',{r:esc(r.origin_repo)})}</button>`);
+  }
+  info.innerHTML=parts.join(' · ');
+}
+async function checkWorkspace(n,card){
+  const r=await j('/api/agents/'+encodeURIComponent(n)+'/workspace',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:workspaceBody(card,true)});
+  renderWorkspaceFacts(card,r);
+}
+async function saveWorkspace(n,card){const m=card.querySelector('.ws-msg');m.textContent='…';m.className='msg ws-msg';
+  const r=await j('/api/agents/'+encodeURIComponent(n)+'/workspace',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:workspaceBody(card,false)});
+  renderWorkspaceFacts(card,r);
+  if(r.ok){m.className='msg '+(savedLiveOk(r,n)?'ok':'ng');m.textContent=savedMsg(r,n);
+    setTimeout(loadCfg,1200);}
+  else{m.className='msg ng';m.textContent='✕ '+(r.error||t('savefail'));}}
 function savedMsg(r,n){const rl=r.reload||{};
   const ar=((rl.agents||{})[n]||{});
   if(rl.ok&&(ar.failed||[]).length)return t('cfg.failed')+': '+ar.failed.join(', ');
@@ -3962,6 +4162,10 @@ document.addEventListener('click',event=>{
   else if(action==='model-cancel')cancelModel(n,root);
   else if(action==='setup')toggle(n,root);
   else if(action==='edit-persona')editP(root);
+  else if(action==='edit-workspace')editWorkspace(root);
+  else if(action==='check-workspace')checkWorkspace(n,root);
+  else if(action==='save-workspace')saveWorkspace(n,root);
+  else if(action==='use-origin'){root.querySelector('.repo-input').value=control.dataset.repo||'';checkWorkspace(n,root);}
   else if(action==='save-persona')saveP(n,root);
   else if(action==='copy-manifest')copyMf(root);
   else if(action==='save-tokens')saveTokens(n,root);
@@ -4325,6 +4529,7 @@ def make_app(
     app.router.add_post("/api/tokens", h_save_tokens)
     app.router.add_post("/api/agents", h_save_agent)
     app.router.add_post("/api/agents/{name}/persona", h_update_persona)
+    app.router.add_post("/api/agents/{name}/workspace", h_update_workspace)
     app.router.add_get("/api/issues", h_issues)
     app.router.add_get("/api/channel-rules", h_channel_rules)
     app.router.add_get("/api/live/state", h_live_state)
