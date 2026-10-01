@@ -385,6 +385,17 @@ class IssueClaimer:
                     "failed", issue, reason=f"existing claim unverifiable: {reason}"
                 )
             if claim_owned_by(fields, agent, node):
+                if claim_lease_live(fields, now) and stale_only:
+                    # Our own live claim means the work is already under way
+                    # (another thread or turn); recovery is for lapsed leases.
+                    return _result(
+                        "failed",
+                        issue,
+                        reason=(
+                            "this claimant's lease is still live until "
+                            f"{fields['lease_until']}"
+                        ),
+                    )
                 if claim_lease_live(fields, now):
                     return _result(
                         "claimed",

@@ -753,6 +753,26 @@ def test_stale_only_claim_needs_a_lapsed_claim():
     assert _claimer(github).claim(7, "dev", "n1", stale_only=True)["status"] == "claimed"
 
 
+def test_stale_only_claim_leaves_own_live_claim_alone():
+    """Patrol must not start a second run of work this claimant is still doing."""
+    github = FakeGitHub(now=T0 + timedelta(seconds=60))
+    _seed_claim(github, 7, "dev", "n1", now=T0)
+    before = github.refs[7]
+    result = _claimer(github).claim(7, "dev", "n1", stale_only=True)
+    assert result["status"] == "failed"
+    assert "still live" in result["reason"]
+    assert github.refs[7] == before
+    # Outside patrol recovery the same claimant may still re-enter its claim.
+    assert _claimer(github).claim(7, "dev", "n1")["status"] == "claimed"
+
+
+def test_stale_only_claim_recovers_own_lapsed_claim():
+    github = FakeGitHub(now=T0 + timedelta(seconds=1801))
+    _seed_claim(github, 7, "dev", "n1", now=T0)
+    result = _claimer(github).claim(7, "dev", "n1", stale_only=True)
+    assert result["status"] == "claimed"
+
+
 def test_claim_tool_cli_passes_stale_only(monkeypatch, capsys):
     import issue_claim
 

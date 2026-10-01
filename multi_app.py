@@ -77,6 +77,7 @@ from multi_core import (
     claim_tool_command,
     classify_runtime_failure,
     codex_usage_delta,
+    context_window_tokens,
     classify_sender,
     constrain_handoff_targets,
     default_slack_token_env_names,
@@ -478,6 +479,10 @@ def observe_claude_message(signals: TurnSignals, message: Any) -> None:
     if isinstance(message, AssistantMessage):
         if getattr(message, "error", None) == "rate_limit":
             signals.rate_limit_seen = True
+        usage = getattr(message, "usage", None)
+        if usage and getattr(message, "parent_tool_use_id", None) is None:
+            # Subagent calls (parent_tool_use_id set) run in their own window.
+            signals.context_tokens = context_window_tokens(usage)
         for block in getattr(message, "content", None) or []:
             if isinstance(block, ToolUseBlock) and is_side_effect_tool(
                 block.name
@@ -6521,8 +6526,9 @@ class SlackAgent:
                 )
             await say(
                 text=(
-                    "🧹 コンテキストが大きくなったため要約して"
-                    "新しいセッションに切り替えました"
+                    f"🧹 コンテキストが {input_tokens:,} tokens"
+                    f"(閾値 {active_config.context_rollover_tokens:,})に"
+                    "達したため要約して新しいセッションに切り替えました"
                     "(要約は次回に引き継ぎます)"
                 ),
                 thread_ts=thread_ts,
@@ -7368,13 +7374,13 @@ class SlackAgent:
                     elif isinstance(message, ResultMessage):
                         result_text = message.result or ""
                         usage = getattr(message, "usage", None) or {}
-                        input_tokens = sum(
-                            int(usage.get(k) or 0)
-                            for k in (
-                                "input_tokens",
-                                "cache_read_input_tokens",
-                                "cache_creation_input_tokens",
-                            )
+                        # The result sums every call of the turn; the context
+                        # window is the last call's prompt. The sum is only a
+                        # fallback for a stream that reported no per-call usage.
+                        input_tokens = (
+                            signals.context_tokens
+                            if signals.context_tokens is not None
+                            else context_window_tokens(usage)
                         )
                         pending_stats = {
                             "input_tokens": input_tokens,
