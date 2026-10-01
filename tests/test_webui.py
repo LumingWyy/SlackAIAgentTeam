@@ -68,6 +68,109 @@ def test_issues_cache_has_hard_limit(monkeypatch):
     assert "acme/repo-0" not in webui._issues_cache
 
 
+class _IssuesRequest(dict):
+    """Minimal aiohttp request stand-in: a principal plus query parameters."""
+
+    def __init__(self, query=None):
+        super().__init__()
+        self[webui._CONTROL_PRINCIPAL_KEY] = webui.ControlPrincipal(
+            user_id="", is_admin=True, legacy=True
+        )
+        self.query = query or {}
+
+
+def _issues_fixture(monkeypatch, raw, env=None, outcomes=None):
+    import json as _json
+
+    calls = []
+
+    async def fake_issues(repo):
+        calls.append(repo)
+        return (outcomes or {}).get(repo, ([{"number": 1, "title": repo, "url": ""}], ""))
+
+    monkeypatch.setattr(webui, "read_yaml", lambda: raw)
+    monkeypatch.setattr(webui, "read_env_file", lambda: dict(env or {}))
+    monkeypatch.setattr(webui.shutil, "which", lambda _name: "/bin/gh")
+    monkeypatch.setattr(webui, "_gh_issues", fake_issues)
+    webui._issues_cache.clear()
+
+    def fetch(query=None):
+        response = asyncio.run(webui.h_issues(_IssuesRequest(query)))
+        return _json.loads(response.text)
+
+    return fetch, calls
+
+
+def test_one_unreachable_repo_does_not_hide_the_other_issues(monkeypatch):
+    fetch, _calls = _issues_fixture(
+        monkeypatch,
+        {"agents": [
+            {"name": "a", "github_repo": "acme/live"},
+            {"name": "b", "github_repo": "acme/gone"},
+        ]},
+        outcomes={"acme/gone": ([], "GraphQL: Could not resolve to a Repository")},
+    )
+    data = fetch()
+    assert [issue["repo"] for issue in data["issues"]] == ["acme/live"]
+    assert data["errors"] == [
+        {"repo": "acme/gone", "error": "GraphQL: Could not resolve to a Repository"}
+    ]
+    assert data["error"].startswith("acme/gone: ")
+
+
+def test_issues_skip_optional_agents_multi_app_does_not_start(monkeypatch):
+    """pm/qa without tokens fall back to the global repo but never run."""
+    raw = {
+        "github": {"repo": "acme/stale-default"},
+        "agents": [
+            {"name": "dev", "github_repo": "acme/live"},
+            {"name": "pm", "optional": True},
+            {"name": "qa", "optional": True},
+        ],
+    }
+    fetch, calls = _issues_fixture(
+        monkeypatch, raw, env={"QA_SLACK_BOT_TOKEN": "x", "QA_SLACK_APP_TOKEN": "y"}
+    )
+    for name in ("PM_SLACK_BOT_TOKEN", "PM_SLACK_APP_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    data = fetch()
+    # qa has both tokens, so its fallback repo is watched; pm has none.
+    assert data["repos"] == ["acme/live", "acme/stale-default"]
+    env_less, _ = _issues_fixture(monkeypatch, raw)
+    assert env_less()["repos"] == ["acme/live"]
+
+
+def test_refresh_now_bypasses_the_cache_but_not_within_five_seconds(monkeypatch):
+    fetch, calls = _issues_fixture(
+        monkeypatch, {"agents": [{"name": "a", "github_repo": "acme/live"}]}
+    )
+    clock = {"now": 1000.0}
+    import time as _time
+
+    monkeypatch.setattr(_time, "monotonic", lambda: clock["now"])
+    fetch()
+    clock["now"] += 3
+    fetch({"refresh": "1"})
+    assert calls == ["acme/live"]  # too soon: the cached answer stands
+    clock["now"] += 3
+    fetch()
+    assert calls == ["acme/live"]  # plain polling keeps the 30s cache
+    fetch({"refresh": "1"})
+    assert calls == ["acme/live", "acme/live"]
+
+
+def test_issue_panel_renders_errors_beside_issues_and_shows_refresh_feedback():
+    script = _main_script(webui.INDEX_HTML)
+    assert 'id="issues-refresh" onclick="loadIssues(true)"' in webui.INDEX_HTML
+    assert "/api/issues'+(manual?'?refresh=1':'')" in script
+    render = script[script.index("function renderIssues(d){") :]
+    render = render[: render.index("async function copyRules")]
+    assert "if(d.error){" not in render  # the old early return hid every issue
+    assert "head+its.map(" in render
+    for key in ("tasks.loading", "tasks.updated", "tasks.notfound"):
+        assert script.count(f"'{key}':") == 3, key
+
+
 def test_gh_issues_timeout_kills_and_reaps_process(monkeypatch):
     class Process:
         returncode = None

@@ -1332,6 +1332,8 @@ async def h_live_state(request: web.Request) -> web.Response:
 
 
 ISSUES_CACHE_TTL_SECONDS = 30.0
+# "Refresh now" skips the cache, but never re-runs gh more often than this.
+ISSUES_MIN_REFRESH_SECONDS = 5.0
 ISSUES_CACHE_MAX = 64
 _issues_cache: dict[str, Any] = {}
 
@@ -1440,15 +1442,36 @@ async def _gh_issues(repo: str) -> tuple[list[dict], str]:
     return issues, ""
 
 
+def _skipped_optional_agent(
+    entry: dict[str, Any], defaults: dict[str, Any], env: dict[str, str]
+) -> bool:
+    """An optional agent missing a Slack token, which multi_app does not start."""
+    if not entry.get("optional"):
+        return False
+    return not all(
+        env.get(name) or os.environ.get(name)
+        for name in token_env_names(entry, defaults)
+    )
+
+
 async def h_issues(request: web.Request) -> web.Response:
-    """Monitor open issues across every effective per-agent repo (30s cache)."""
+    """Monitor open issues across the repos of agents this node runs (30s cache).
+
+    ``?refresh=1`` bypasses the cache (at most every 5s). One repo failing
+    never hides the others: ``errors`` lists each failure next to the issues.
+    """
     import time as _t
 
     try:
         raw = read_yaml()
-        repos = _configured_github_repos(
-            raw, _visible_entries(request, raw)
-        )
+        defaults = raw.get("defaults") or {}
+        env = read_env_file()
+        entries = [
+            entry
+            for entry in _visible_entries(request, raw)
+            if not _skipped_optional_agent(entry, defaults, env)
+        ]
+        repos = _configured_github_repos(raw, entries)
     except ValueError as exc:
         return web.json_response(
             {"repo": "", "repos": [], "issues": [], "error": str(exc)}
@@ -1472,7 +1495,9 @@ async def h_issues(request: web.Request) -> web.Response:
         _issues_cache.pop(key, None)
     cache_key = "\0".join(repos)
     c = _issues_cache.get(cache_key)
-    if c and now - c["t"] < ISSUES_CACHE_TTL_SECONDS:
+    refresh = request is not None and request.query.get("refresh") == "1"
+    max_age = ISSUES_MIN_REFRESH_SECONDS if refresh else ISSUES_CACHE_TTL_SECONDS
+    if c and now - c["t"] < max_age:
         return web.json_response(c["payload"])
     if not shutil.which("gh"):
         return web.json_response(
@@ -1485,16 +1510,18 @@ async def h_issues(request: web.Request) -> web.Response:
         )
     results = await asyncio.gather(*(_gh_issues(repo) for repo in repos))
     issues: list[dict[str, Any]] = []
-    errors: list[str] = []
+    errors: list[dict[str, str]] = []
     for repo, (repo_issues, error) in zip(repos, results):
         issues.extend({**issue, "repo": repo} for issue in repo_issues)
         if error:
-            errors.append(f"{repo}: {error}")
+            errors.append({"repo": repo, "error": error})
     payload = {
         "repo": ", ".join(repos),
         "repos": repos,
         "issues": issues,
-        "error": "; ".join(errors),
+        "error": "; ".join(f"{e['repo']}: {e['error']}" for e in errors),
+        "errors": errors,
+        "fetched_at": int(_t.time()),
     }
     _issues_cache[cache_key] = {"t": now, "payload": payload}
     while len(_issues_cache) > ISSUES_CACHE_MAX:
@@ -2721,7 +2748,12 @@ a:hover{text-decoration-color:var(--accent)}
 /* tracked issues */
 .irow{display:grid;grid-template-columns:auto 1fr auto auto;gap:14px;align-items:center;padding:9px 2px;
   border-top:1px solid var(--line);font-size:.88rem}
-.irow:first-child{border-top:0}
+.irow:first-child,.ierr+.irow{border-top:0}
+.ierr{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;padding:8px 10px;margin:2px 0 8px;font-size:.8rem;
+  color:var(--ink-2);border-radius:var(--r-sm);background:color-mix(in oklch,var(--warn) 9%,transparent);
+  border:1px solid color-mix(in oklch,var(--warn) 32%,var(--line))}
+.ierr-repo{font-family:var(--mono);font-size:.72rem;color:var(--ink)}
+#issues-refresh:disabled{cursor:progress;color:var(--faint)}
 .inum{font-family:var(--mono);font-size:.74rem;color:var(--accent-ink);padding:2px 7px;border-radius:var(--pill);
   background:var(--accent-wash);text-decoration:none}
 .ititle{color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -3323,7 +3355,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
       <div class="seccap"><span data-i18n="tasks.title">注目タスク</span>
         <span class="src" id="tasks-repo"></span>
         <span style="flex:1"></span>
-        <button class="linkbtn" onclick="loadIssues()" data-i18n="sw.now">今すぐ更新</button></div>
+        <button class="linkbtn" id="issues-refresh" onclick="loadIssues(true)" data-i18n="sw.now">今すぐ更新</button></div>
       <div id="issues"></div>
     </div>
     <div class="seccap" style="margin-top:26px"><span data-i18n="agents.title">エージェント</span></div>
@@ -3510,7 +3542,7 @@ let MODELS={claude:[''],codex:[''],openai:[''],sources:{},current:{}}, MODELS_RE
   MODELS_LOADING=null, NEWRT='claude', PENDING=Object.create(null);
 
 const I18N={
- zh:{'nav.guide':'指引','nav.mon':'监视','nav.cfg':'构成','tasks.title':'关注中的任务','agents.title':'智能体','tasks.empty':'没有开放的 issue','tasks.unassigned':'未认领','rules.title':'共通频道规则（模板）','rules.sub':'贴到 Slack 共通频道的 topic/说明，各 agent 会遵守这些规则。','rules.copy':'复制','rules.copied':'规则已复制',
+ zh:{'nav.guide':'指引','nav.mon':'监视','nav.cfg':'构成','tasks.title':'关注中的任务','agents.title':'智能体','tasks.empty':'没有开放的 issue','tasks.unassigned':'未认领','tasks.loading':'更新中…','tasks.updated':'✓ 已更新 {t}','tasks.notfound':'GitHub 上找不到这个仓库，或当前 gh 账号无权访问。到「构成」改正 github_repo（全局默认值在 agents.yaml 的 github.repo）','rules.title':'共通频道规则（模板）','rules.sub':'贴到 Slack 共通频道的 topic/说明，各 agent 会遵守这些规则。','rules.copy':'复制','rules.copied':'规则已复制',
    'guide.kicker':'从这里开始 · OWNER 运行手册','guide.title':'从本机账号，到第一次安全交接','guide.sub':'按顺序完成五步。每个人只配置自己的节点；团队通过 Slack 协调，通过 GitHub 交付代码。',
    'guide.boundary':'只共享无凭据 roster、Slack 消息与 PR URL。不要共享 AI 登录、API Key、Slack Token、GitHub Token、状态库或工作区。',
    'guide.progress':'本浏览器的上手进度','guide.map.slack':'共享 Slack 线程','guide.map.local':'每人独立本地节点','guide.map.artifact':'GitHub PR / Issue',
@@ -3579,7 +3611,7 @@ const I18N={
    'auth.ghsaved':'✓ GH_TOKEN 已写入 .env','auth.importing':'导入中…',
    'auth.verified':'✓ 验证成功','auth.verified.detail':'运行环境已可用 · {m}',
    'auth.method':'方式：{m}','auth.user':'账号：{u}'},
- ja:{'nav.guide':'ガイド','nav.mon':'監視','nav.cfg':'構成','tasks.title':'注目タスク','agents.title':'エージェント','tasks.empty':'オープンな issue はありません','tasks.unassigned':'未割り当て','rules.title':'共通チャンネルのルール（テンプレート）','rules.sub':'Slack 共通チャンネルの topic/説明に貼ると各 agent が従います。','rules.copy':'コピー','rules.copied':'ルールをコピー',
+ ja:{'nav.guide':'ガイド','nav.mon':'監視','nav.cfg':'構成','tasks.title':'注目タスク','agents.title':'エージェント','tasks.empty':'オープンな issue はありません','tasks.unassigned':'未割り当て','tasks.loading':'更新中…','tasks.updated':'✓ 更新しました {t}','tasks.notfound':'GitHub にこのリポジトリがないか、今の gh アカウントでは見られません。「構成」で github_repo を直してください（全体の既定値は agents.yaml の github.repo）','rules.title':'共通チャンネルのルール（テンプレート）','rules.sub':'Slack 共通チャンネルの topic/説明に貼ると各 agent が従います。','rules.copy':'コピー','rules.copied':'ルールをコピー',
    'guide.kicker':'ここから開始 · OWNER ランブック','guide.title':'ローカル認証から、最初の安全な引き継ぎまで','guide.sub':'5つの手順を順番に進めます。各自は自分のノードだけを構成し、Slack で調整、GitHub でコードを受け渡します。',
    'guide.boundary':'共有するのは認証情報を含まない roster、Slack メッセージ、PR URL だけです。AI ログイン、API Key、Slack/GitHub Token、状態 DB、workspace は共有しません。',
    'guide.progress':'このブラウザのセットアップ進捗','guide.map.slack':'共有 Slack スレッド','guide.map.local':'各自の独立ローカルノード','guide.map.artifact':'GitHub PR / Issue',
@@ -3648,7 +3680,7 @@ const I18N={
    'auth.ghsaved':'✓ GH_TOKEN を .env に保存しました','auth.importing':'取り込み中…',
    'auth.verified':'✓ 検証成功','auth.verified.detail':'実行環境で利用できます · {m}',
    'auth.method':'方式：{m}','auth.user':'アカウント：{u}'},
- en:{'nav.guide':'Guide','nav.mon':'Monitor','nav.cfg':'Setup','tasks.title':'Watched tasks','agents.title':'Agents','tasks.empty':'No open issues','tasks.unassigned':'unassigned','rules.title':'Shared channel rules (template)','rules.sub':'Paste into the shared Slack channel topic/description; agents will follow these rules.','rules.copy':'Copy','rules.copied':'rules copied',
+ en:{'nav.guide':'Guide','nav.mon':'Monitor','nav.cfg':'Setup','tasks.title':'Watched tasks','agents.title':'Agents','tasks.empty':'No open issues','tasks.unassigned':'unassigned','tasks.loading':'Refreshing…','tasks.updated':'✓ Updated {t}','tasks.notfound':'This repo does not exist on GitHub, or the current gh account cannot see it. Fix github_repo on Setup (the shared default is github.repo in agents.yaml)','rules.title':'Shared channel rules (template)','rules.sub':'Paste into the shared Slack channel topic/description; agents will follow these rules.','rules.copy':'Copy','rules.copied':'rules copied',
    'guide.kicker':'START HERE · OWNER RUNBOOK','guide.title':'From local accounts to a safe first handoff','guide.sub':'Complete five steps in order. Each person configures only their node; coordinate in Slack and deliver code through GitHub.',
    'guide.boundary':'Share only the credential-free roster, Slack messages, and PR URLs. Never share AI logins, API keys, Slack or GitHub tokens, state databases, or workspaces.',
    'guide.progress':'Setup progress in this browser','guide.map.slack':'Shared Slack thread','guide.map.local':'One private node per person','guide.map.artifact':'GitHub PR / Issue',
@@ -4192,13 +4224,39 @@ function stageCustomModel(n,el,root){
   if(!m)return;
   stageModel(n,m,root);
 }
-async function loadIssues(){
-  let d; try{d=await j('/api/issues');}catch(e){d={issues:[],error:'fetch failed'};}
+let ISSUES_BUSY=false, ISSUES_FLASH=0;
+function issueErrorRow(e){
+  const missing=/Could not resolve to a Repository/i.test(e.error||'');
+  return `<div class="ierr" title="${esc(e.error||'')}"><span class="ierr-repo">${esc(e.repo||'')}</span>
+    <span>${esc(missing?t('tasks.notfound'):(e.error||''))}</span></div>`;
+}
+async function loadIssues(manual){
+  const btn=$('#issues-refresh');
+  if(manual){
+    if(ISSUES_BUSY)return;
+    ISSUES_BUSY=true;clearTimeout(ISSUES_FLASH);
+    btn.disabled=true;btn.textContent=t('tasks.loading');
+  }
+  let d;
+  try{d=await j('/api/issues'+(manual?'?refresh=1':''));}
+  catch(e){d={issues:[],error:'fetch failed'};}
+  finally{if(manual){ISSUES_BUSY=false;btn.disabled=false;}}
+  renderIssues(d);
+  if(manual){
+    const at=d.fetched_at?new Date(d.fetched_at*1000):new Date();
+    btn.textContent=t('tasks.updated').replace('{t}',at.toLocaleTimeString());
+    ISSUES_FLASH=setTimeout(()=>{btn.textContent=t('sw.now');},2600);
+  }
+}
+function renderIssues(d){
   $('#tasks-repo').textContent=d.repo||'';
   const its=d.issues||[];
-  if(d.error){$('#issues').innerHTML=`<div class="empty">${esc(d.error)}</div>`;return;}
-  if(!its.length){$('#issues').innerHTML=`<div class="empty">${t('tasks.empty')}</div>`;return;}
-  $('#issues').innerHTML=its.map(it=>{
+  // One unreachable repo must not hide the issues of the others.
+  const errs=d.errors||[];
+  if(!errs.length&&d.error){$('#issues').innerHTML=`<div class="empty">${esc(d.error)}</div>`;return;}
+  const head=errs.map(issueErrorRow).join('');
+  if(!its.length){$('#issues').innerHTML=head+(errs.length?'':`<div class="empty">${t('tasks.empty')}</div>`);return;}
+  $('#issues').innerHTML=head+its.map(it=>{
     const status=(it.labels||[]).filter(l=>/^status:/.test(l)).map(l=>l.replace('status:','')).join(', ');
     const other=(it.labels||[]).filter(l=>!/^status:/.test(l));
     const asg=(it.assignees||[]).length?('@'+it.assignees.join(', @')):t('tasks.unassigned');
