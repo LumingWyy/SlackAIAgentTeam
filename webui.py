@@ -41,6 +41,7 @@ from control_auth import (
     ControlPrincipal,
     require_slack_human_id,
 )
+from local_config import ensure_agents_config
 from multi_core import (
     canonical_github_repo,
     default_slack_token_env_names,
@@ -4920,6 +4921,8 @@ def make_app(
     *,
     authenticator: ControlAuthenticator | None = None,
 ) -> web.Application:
+    if ensure_agents_config(AGENTS_YAML):
+        logger.info("created %s from agents.example.yaml", AGENTS_YAML)
     if authenticator is None:
         env = read_env_file()
         env.update(os.environ)

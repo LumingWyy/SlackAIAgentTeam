@@ -17,7 +17,8 @@ Multiple agents run Socket Mode in one Python process. In channels, an agent spe
 | `state_store.py` | SQLite thread-state persistence (sessions / summaries survive restarts) |
 | `issue_claim.py` | Host-side GitHub issue claim tool (v2 lease: `claim` / `renew` / `release` / `verify`) |
 | `agent_guard.py`, `agent_guard_bin/` | `gh` / `git` guard on the agent PATH: agents open PRs, humans merge |
-| `agents.yaml` | Agent definitions (`card` / persona, ownership, node, projects) |
+| `agents.yaml` | This machine's agent definitions (`card` / persona, ownership, node, projects, workspaces, repos). Local and gitignored like `.env`; created from `agents.example.yaml` on first run |
+| `agents.example.yaml` | Tracked template for `agents.yaml` (no personal workspaces or repos) |
 | `agents.distributed.example.yaml` | Two humans × two local agents distributed example |
 | `slack-app-manifest-agent.yaml` | Slack App manifest template (one App per agent) |
 | `.env.example` | Env var template (multi-agent tokens) |

@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`multi_app.py` is the runtime entry point and contains Slack, Claude, and Codex integration. Keep reusable decision logic in `multi_core.py`; `webui.py` serves the local configuration and monitoring console. Agent definitions live in `agents.yaml`, while Slack setup templates are in `slack-app-manifest*.yaml`. Tests mirror these boundaries in `tests/test_multi_core.py`, `tests/test_multi_app_config.py`, and `tests/test_webui.py`. Docker support is defined by `Dockerfile` and `docker-compose.yml`.
+`multi_app.py` is the runtime entry point and contains Slack, Claude, and Codex integration. Keep reusable decision logic in `multi_core.py`; `webui.py` serves the local configuration and monitoring console. Agent definitions live in `agents.yaml`, which is local and gitignored (this machine's workspaces and repos); `agents.example.yaml` is the tracked template it is created from on first run. Slack setup templates are in `slack-app-manifest*.yaml`. Tests mirror these boundaries in `tests/test_multi_core.py`, `tests/test_multi_app_config.py`, and `tests/test_webui.py`. Docker support is defined by `Dockerfile` and `docker-compose.yml`.
 
 ## Build, Test, and Development Commands
 
@@ -27,4 +27,4 @@ Recent history follows Conventional Commit-style subjects: `feat:`, `feat(webui)
 
 ## Security & Configuration
 
-Copy `.env.example` for local setup and never commit `.env`, tokens, auth files, or generated backups. Keep secrets in environment variables; `agents.yaml` should reference token variable names, not token values. Preserve localhost-only bindings for the web UI and admin API unless a security review approves broader exposure.
+Copy `.env.example` for local setup and never commit `.env`, tokens, auth files, or generated backups. Keep secrets in environment variables; `agents.yaml` should reference token variable names, not token values. Never commit `agents.yaml`; put shared defaults in `agents.example.yaml` without personal paths or repos. Preserve localhost-only bindings for the web UI and admin API unless a security review approves broader exposure.

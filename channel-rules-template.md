@@ -7,7 +7,7 @@ agent は起動・応答のたびにチャンネルの topic / purpose を読み
 ---
 
 ## 対象リポジトリ
-- repo: `{{OWNER/REPO}}`   （例: LumingWyy/agent-sandbox）
+- repo: `{{OWNER/REPO}}`   （例: acme/agent-sandbox）
 - タスクの唯一の正: **GitHub Issues**。着手前に必ず `gh issue list --repo {{OWNER/REPO}} --label "status:todo"` を確認。
 
 ## パイプライン（崩さない）

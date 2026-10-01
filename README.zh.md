@@ -17,7 +17,8 @@
 | `state_store.py` | SQLite 线程状态持久化（会话/交接摘要跨重启保留） |
 | `issue_claim.py` | 宿主侧 GitHub issue 认领工具（v2 租约：`claim` / `renew` / `release` / `verify`） |
 | `agent_guard.py`, `agent_guard_bin/` | agent PATH 上的 `gh` / `git` 守卫：agent 只开 PR，合并由人来做 |
-| `agents.yaml` | agent 定义（`card` / persona、所有者、节点、项目） |
+| `agents.yaml` | 本机的 agent 定义（`card` / persona、所有者、节点、项目、workspace、仓库）。与 `.env` 一样只在本地、已 gitignore；首次启动时由 `agents.example.yaml` 自动生成 |
+| `agents.example.yaml` | `agents.yaml` 的模板（受版本管理，不含个人 workspace 和仓库） |
 | `agents.distributed.example.yaml` | 两人 × 每人两个本地 agent 的分布式示例 |
 | `slack-app-manifest-agent.yaml` | 每个 agent 一份的 Slack App manifest 模板 |
 | `.env.example` | 环境变量模板（多 agent token） |

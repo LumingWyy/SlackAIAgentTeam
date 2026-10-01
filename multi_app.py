@@ -55,6 +55,7 @@ from control_auth import (
     ControlPrincipal,
     require_slack_human_id,
 )
+from local_config import ensure_agents_config
 from multi_core import (
     AdaptivePacer,
     EventDeduper,
@@ -9372,6 +9373,8 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO)
 
     config_path = os.environ.get("AGENTS_CONFIG", "agents.yaml")
+    if ensure_agents_config(config_path):
+        logger.info("created %s from agents.example.yaml", config_path)
     configs, gcfg = load_agents_config(
         config_path,
         roster_path=os.environ.get("ROSTER_CONFIG") or None,

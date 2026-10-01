@@ -17,7 +17,8 @@
 | `state_store.py` | SQLite スレッド状態永続化（セッション/要約が再起動をまたいで残る） |
 | `issue_claim.py` | ホスト側の GitHub issue claim ツール（v2 lease: `claim` / `renew` / `release` / `verify`） |
 | `agent_guard.py`, `agent_guard_bin/` | agent の PATH 上の `gh` / `git` ガード：agent は PR を作り、マージは人間 |
-| `agents.yaml` | agent 定義（`card` / persona、所有者、node、project） |
+| `agents.yaml` | このマシンの agent 定義（`card` / persona、所有者、node、project、workspace、リポジトリ）。`.env` と同じくローカル専用で gitignore 済み。初回起動時に `agents.example.yaml` から自動生成 |
+| `agents.example.yaml` | `agents.yaml` のテンプレート（バージョン管理対象。個人の workspace やリポジトリは含まない） |
 | `agents.distributed.example.yaml` | 2 人 × 各 2 ローカル agent の分散構成例 |
 | `slack-app-manifest-agent.yaml` | agent ごとの Slack App 用 manifest テンプレート |
 | `.env.example` | 環境変数サンプル（マルチ token） |

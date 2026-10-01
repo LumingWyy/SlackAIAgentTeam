@@ -1,7 +1,13 @@
+# Template for agents.yaml. multi_app and the console copy it to agents.yaml
+# on first run; agents.yaml stays local (gitignored) because it holds this
+# machine's workspaces and GitHub repos. Edit agents.yaml, or use the console
+# (make webui); change this template only for defaults every clone should get.
 budget:
   max_agent_rounds: 12
 github:
-  repo: LumingWyy/agent-sandbox
+  # OWNER/REPO the agents work on; empty keeps GitHub off until you pick one
+  # (the console's workspace editor can choose or create it).
+  repo: ""
 defaults:
   allowed_tools:
   - Read
