@@ -8224,7 +8224,9 @@ class SlackAgent:
             "openai_base_url": self.cfg.openai_base_url,
             "reply_language": self.cfg.reply_language,
             "effort": self.cfg.effort,
-            "paused": self.paused,
+            # Not "paused": the runtime limiter's snapshot below already uses
+            # that key for admissions waiting out a provider cooldown.
+            "stopped": self.paused,
             "slack": dict(self.slack_identity),
             "user_id": self.user_id,
             "workspace": self.cfg.workspace,
@@ -9125,7 +9127,7 @@ def build_admin_app(
         """Stop this agent: cancel running work, refuse new work until resumed."""
         agent = request_agent(request)
         result = await agent.stop()
-        return aio_web.json_response({"ok": True, "paused": True, **result})
+        return aio_web.json_response({"ok": True, "stopped": True, **result})
 
     async def h_slack_identity(request: aio_web.Request) -> aio_web.Response:
         """Sync: read the bot's current Slack display name, username and app."""
@@ -9139,7 +9141,7 @@ def build_admin_app(
     async def h_resume(request: aio_web.Request) -> aio_web.Response:
         agent = request_agent(request)
         agent.resume()
-        return aio_web.json_response({"ok": True, "paused": False})
+        return aio_web.json_response({"ok": True, "stopped": False})
 
     async def h_set_reply_language(request: aio_web.Request) -> aio_web.Response:
         agent = request_agent(request)

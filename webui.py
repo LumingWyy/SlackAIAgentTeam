@@ -4357,8 +4357,8 @@ async function loadLive(){
     .map(([l,n])=>`<span class="metric">${t(l)} <b>${n}</b></span>`).join('');
   if(!ags.length){$('#roster').innerHTML=`<div class="node"><div class="empty">${t('empty.noagents')}</div></div>`;return;}
   $('#roster').innerHTML=ags.map((a,i)=>{
-    const c=a.paused?'paused':(a.busy_threads>0?'work':(a.connected?'idle':'off'));
-    const s=a.paused?t('st.paused'):(a.busy_threads>0?t('st.busy'):(a.connected?t('st.idle'):t('st.off')));
+    const c=a.stopped?'paused':(a.busy_threads>0?'work':(a.connected?'idle':'off'));
+    const s=a.stopped?t('st.paused'):(a.busy_threads>0?t('st.busy'):(a.connected?t('st.idle'):t('st.off')));
     const dispModel=a.model?esc(a.model):((MODELS.current||{})[a.runtime]?esc((MODELS.current)[a.runtime]):t('model.def'));
     const pend=PENDING[a.name];
     const cfgPending=((a.config_reload||{}).pending||null);
@@ -4384,7 +4384,7 @@ async function loadLive(){
           <button class="rt ${a.runtime==='openai'?'on':''}" data-action="runtime" data-value="openai">openai api</button>
         </div>
         <div class="rowbtns"><button class="btn line" data-action="restart">${t('btn.restart')}</button>
-          ${a.paused?`<button class="btn solid" data-action="resume">${t('btn.resume')}</button>`
+          ${a.stopped?`<button class="btn solid" data-action="resume">${t('btn.resume')}</button>`
             :`<button class="btn line stop" data-action="stop" data-busy="${a.busy_threads||0}">${t('btn.stop')}</button>`}</div>
         <span class="lbl">${t('lbl.model')}</span>
         <div class="field">

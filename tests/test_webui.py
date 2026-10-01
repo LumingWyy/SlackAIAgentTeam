@@ -197,6 +197,7 @@ def test_monitor_card_can_stop_and_resume_an_agent():
     html = webui.INDEX_HTML
     script = _main_script(html)
     assert 'data-action="stop" data-busy=' in script
+    assert "a.stopped?" in script and "a.paused" not in script  # see status_snapshot
     assert 'data-action="resume"' in script
     assert "if(a.kind==='stop')return t('stop.confirm'" in script  # inline confirm first
     assert "else if(a.kind==='stop')await stopAgent(a.agent);" in script

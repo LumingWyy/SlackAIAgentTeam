@@ -905,3 +905,16 @@ def test_sync_rereads_the_bot_profile_from_slack(tmp_path, monkeypatch):
     assert asyncio.run(agent.refresh_slack_identity())["display_name"] == "dev"
     assert asyncio.run(agent.refresh_slack_identity())["display_name"] == "developer"
     assert agent.status_snapshot()["slack"]["display_name"] == "developer"
+
+
+def test_status_reports_stopped_apart_from_cooldown_paused_admissions(
+    tmp_path, monkeypatch
+):
+    """The limiter's "paused" (cooldown waits) must not mask or fake a stop."""
+    agent = _build_agent(tmp_path, monkeypatch)
+    snapshot = agent.status_snapshot()
+    assert snapshot["stopped"] is False and "paused" in snapshot
+    agent.set_paused(True)
+    snapshot = agent.status_snapshot()
+    assert snapshot["stopped"] is True
+    assert snapshot["paused"] == 0  # still the limiter's count
