@@ -21,7 +21,8 @@
 | `agents.distributed.example.yaml` | 两人 × 每人两个本地 agent 的分布式示例 |
 | `slack-app-manifest-agent.yaml` | 每个 agent 一份的 Slack App manifest 模板 |
 | `.env.example` | 环境变量模板（多 agent token） |
-| `webui.py` | 本地控制台（agent CRUD、Slack App 向导、实时监控、热切换） |
+| `webui.py` | 本地控制台（agent CRUD、本地 workspace、Slack App 向导、实时监控、热切换） |
+| `.claude/skills/slack-app-setup/` | Claude Code skill：由 agent 操作浏览器完成 Slack App 配置，人只负责确认 |
 
 ## 角色
 
@@ -186,36 +187,40 @@ make webui        # = .venv/bin/python webui.py → http://127.0.0.1:8765
 - 上手勾选进度只保存在当前浏览器，不上传服务器
 - 可直接复制频道规则、人类任务、结构化 `HANDOFF` 与 dev/reviewer/planner persona 模板
 - Agent 职责表明确区分本地工具 Agent 与没有本地文件工具的 OpenAI Agent
-- 只有进入受保护标签页时才询问控制 Bearer；静态指引本身无需凭据
+- 只有服务端要求认证（返回 401）时，页面顶部才出现控制令牌输入条；单机未启用控制认证时不会询问，静态指引本身也无需凭据
 
 **监控**（数据来自运行中的 `multi_app` 管理 API）
 
 - **跟踪的 issues**：各 agent 有效仓库中的 open GitHub issue（编号 / 标题 / status 标签 / 经办人）；30 秒缓存；需本机 `gh` 已登录
 - 顶部状态：在线 / 离线、agent 数、忙碌线程、会话、连接
 - 每个 agent「节点」：状态条、runtime·模型、会话 / 巡检、近期线程（忙碌 / tokens / 剩余预算 / 空闲）
-- **热切换模型**（带确认）：对运行中进程下一回合生效，无需重启
-- **热切换 runtime**（带确认）：claude / codex / openai；会丢弃不兼容会话
+- **热切换模型**：在卡片内确认后，对运行中进程下一回合生效，无需重启
+- **热切换 runtime**：claude / codex / openai；会丢弃不兼容会话
 - **回复语言**下拉（中文 / 日本語 / English）：下一回合生效
 - **Reasoning effort** 按 runtime（openai: none…max；claude: low…max；codex: minimal…xhigh）；空 = 引擎默认
 - **会话重启**：清空该 agent 全部会话（摘要保留供交接）
+- 切换 runtime、会话重启、删除 worktree 都在卡片里展开原地确认条（✓ 确认，✕ 或 Esc 取消），不弹浏览器对话框；确认条在自动刷新后仍保留
 - 模型列表来自真实引擎配置（`~/.claude/settings.json`、有 key 时 Anthropic API、`~/.codex/config.toml`）
 - **UI 语言** 中 / 日 / EN（浏览器本地；与 agent 的 `reply_language` 无关）
-- 每 5 秒自动刷新（确认对话框待处理时暂停）
+- 每 5 秒自动刷新（模型切换待确认时暂停）；数字只在变化时滚动，不会每次刷新都闪动
 
 **配置**（写入 `agents.yaml` / `.env`；保存时自动热加载到运行中的 `multi_app`——新增/删除 agent 仍需重启）
 
 - Agent 列表、token 状态（bot / app）、runtime、职责摘要
-- **设置向导**：为每个 agent 生成 manifest → 复制 → 在 api.slack.com 创建 → 粘贴 token → 校验（`auth.test` + `apps.connections.open`）→ 写入 `.env`
+- **设置向导**：为每个 agent 生成 manifest →「用此 manifest 在 Slack 创建」（打开已预填的 Slack 创建页面；也可复制 manifest 手动创建）→ 粘贴 token → 校验（`auth.test` + `apps.connections.open`）→ 写入 `.env`
+- **本地 workspace**：每张 agent 卡片可修改 workspace 与 `github_repo`。「检查」会确认目录存在、是否为 git 仓库、当前分支与 origin，并在 origin 与仓库不一致时提示（否则 GitHub 协作会被禁用），可一键改用 origin 的仓库；保存后热加载，`github_repo` 留空表示沿用默认
 - **编辑 persona** / **添加 agent**
 
 **认证**用于验证 Agent 实际运行环境中的 Claude、Codex 与 GitHub 登录
 （有 Docker 时优先容器，否则本机）。每个 owner 只连接自己的账号。
 
-Webui **仅绑定 127.0.0.1**（Host 头校验防 DNS rebinding）。实时数据来自管理 API（`ADMIN_BASE`，默认 `http://127.0.0.1:8766`）。owner/分布式配置自动要求环境变量 `SLACK_AGENT_CONTROL_TOKEN_<SLACK_USER_ID>` 中的独立 Bearer（至少 32 个随机可打印字符）。浏览器只存入 `sessionStorage` 并发送 `Authorization: Bearer ...`，任何 user-id header 都不被信任。owner 只能查看/修改自己的 agent，top-level admin 可管理全部，全局 reload 仅 admin 可用；只有 `/healthz` 保持匿名。保存会生成 `.bak` 备份（已 gitignore）；`agents.yaml` 中的 YAML 注释会在保存时丢失。
+**界面**参考 [rare-ui](https://github.com/swamimalode07/rare-ui) 的视觉语言：亮色 / 暗色 / 跟随系统三种主题，选中标签从导航条分离、逐位滚动的数字、勾选后逐条划线的任务清单、复制后变成对勾的按钮等动效；系统开启「减少动效」时全部关闭。
+
+Webui **仅绑定 127.0.0.1**（Host 头校验防 DNS rebinding）。实时数据来自管理 API（`ADMIN_BASE`，默认 `http://127.0.0.1:8766`）。owner/分布式配置自动要求环境变量 `SLACK_AGENT_CONTROL_TOKEN_<SLACK_USER_ID>` 中的独立 Bearer（至少 32 个随机可打印字符）。浏览器只存入 `sessionStorage` 并发送 `Authorization: Bearer ...`（只在服务端返回 401 后在页面内询问；被拒的令牌会立即清除），任何 user-id header 都不被信任。owner 只能查看/修改自己的 agent，top-level admin 可管理全部，全局 reload 仅 admin 可用；只有 `/healthz` 保持匿名。保存会生成 `.bak` 备份（已 gitignore）；`agents.yaml` 中的 YAML 注释会在保存时丢失。
 
 ## Slack App 创建（手动）
 
-（使用 Web UI 向导时可跳过。）每个 agent 需要**独立的 Slack App**。
+（使用 Web UI 向导的「用此 manifest 在 Slack 创建」链接，或在 Claude Code 里运行 `/slack-app-setup` 时可跳过。）每个 agent 需要**独立的 Slack App**。
 
 1. [https://api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From a manifest**
 2. 粘贴 `slack-app-manifest-agent.yaml`；每个 App 改三处：
@@ -283,6 +288,13 @@ ALLOWED_SLACK_USERS=U01ABCDEF
 
 # 可选：agents.yaml 未写 workspace 时的 Claude 工作区
 CLAUDE_WORKSPACE=/path/to/project
+
+# 可选：运行调优（默认值与说明见 .env.example）
+# FRESHNESS_RECHECK=1                  # 发帖前新鲜度复查
+# PROVIDER_COOLDOWN_BASE_SECONDS=60    # 限流冷却（按 provider 账号共享）
+# PROVIDER_PACER_BASE_SECONDS=0.5      # 节点级回合启动间隔；0 关闭
+# SOCKET_GAP_REVALIDATE_SECONDS=120    # Socket 断线多久后重新校验转录
+# AGENT_PROTECTED_BRANCHES=main,master # agent 不能直接 push 的分支
 ```
 
 可在 `agents.yaml` 用 `bot_token_env` / `app_token_env` 覆盖环境变量名。
@@ -609,14 +621,14 @@ Git 纪律（在 system prompt 中）：
 
 预期路径：
 
-1. **dev** 原子创建 issue 专属 Git-ref 租约完成认领，再写入匹配的 agent/node/时间标记
+1. **dev** 用 `issue_claim.py claim` 认领（原子 Git-ref 租约 + 匹配的 agent/node/时间标记；issue 改为 `status:in-progress`）
 2. **dev** 用 `gh issue view` 阅读 issue；`thread_worktree` 中直接在既有
    managed branch 工作，不 checkout
-3. **dev** 修复 → commit/push → `gh pr create`
+3. **dev** 修复 → commit/push → `issue_claim.py open-pr`（PR 自动带 `Closes #N` 与 Slack 线程链接，issue 改为 `status:in-review`，释放认领）
 4. **dev** 贴 PR URL 并 `@reviewer`
 5. **reviewer** 用 `gh pr view` / `gh pr diff`（同机时也可检查共享线程
    worktree）审查，不切换 managed branch
-6. **reviewer** LGTM → merge + `gh issue close`
+6. **reviewer** LGTM → 请人合并（agent 不能合并）；合并时 GitHub 按 `Closes #N` 自动关闭 issue
 
 ### 巡检（Patrol）
 
@@ -640,6 +652,7 @@ agents:
   - name: dev
     github_repo: OWNER/DEV-REPO # agent 级覆盖
     patrol_interval: 300       # 秒；0 = 关闭
+    patrol_labels: [role:dev]  # 只认领同时带这些标签的 issue
 
   - name: reviewer
     github_repo: ""             # 只禁用此 agent 的 GitHub

@@ -21,7 +21,8 @@
 | `agents.distributed.example.yaml` | 2 人 × 各 2 ローカル agent の分散構成例 |
 | `slack-app-manifest-agent.yaml` | agent ごとの Slack App 用 manifest テンプレート |
 | `.env.example` | 環境変数サンプル（マルチ token） |
-| `webui.py` | ローカルコンソール（agent CRUD、セットアップ、監視、ホットスワップ） |
+| `webui.py` | ローカルコンソール（agent CRUD、ローカル workspace、セットアップ、監視、ホットスワップ） |
+| `.claude/skills/slack-app-setup/` | Claude Code skill：agent がブラウザで Slack App 設定を進め、人は確認だけ行う |
 
 ## ロール
 
@@ -189,21 +190,23 @@ make webui        # → http://127.0.0.1:8765
 **ガイド**タブ：初回表示される5段階のランブック（role → Slack App →
 ローカル認証 → Prompt → 最初の handoff）。進捗は browser-local のみ。
 チャンネルルール、タスク開始、構造化 `HANDOFF`、dev/reviewer/planner persona
-をコピーできます。静的ガイドを読むだけなら control Bearer は不要です。
+をコピーできます。静的ガイドを読むだけなら control Bearer は不要です。コントロールトークンは、サーバーが 401 を返したときだけ画面上部の入力欄で求められます（コントロール認証のない単一ノードでは表示されません）。
 
-**監視**タブ：稼働中 multi_app の管理 API から状態・モデル・予算・issue 一覧を表示。モデル / runtime / 返信言語 / reasoning effort のホットスワップ、セッション再起動、UI 言語（中/日/EN）。
+**監視**タブ：稼働中 multi_app の管理 API から状態・モデル・予算・issue 一覧を表示。モデル / runtime / 返信言語 / reasoning effort のホットスワップ、セッション再起動、UI 言語（中/日/EN）。runtime 切替・セッション再起動・worktree 削除はブラウザのダイアログではなくカード内の確認バー（✓ で確定、✕ か Esc で取消）で行い、バーは自動更新後も残ります。5 秒ごとの自動更新では値が変わった数字だけが回転し、画面はちらつきません。
 
-**設定**タブ：agents.yaml / .env 編集（保存すると稼働中 multi_app へ自動反映；agent の追加/削除は再起動が必要）、Slack App セットアップウィザード（manifest 生成 → token 検証 → .env 保存）、persona 編集・agent 追加。ウィザードの「この manifest で Slack に作成」リンクは、manifest を事前入力した Slack の作成画面を開きます。Claude Code で `/slack-app-setup`（`.claude/skills/slack-app-setup`）を実行すると、Claude in Chrome 接続時に agent がブラウザで作成 → インストール → App-Level Token → チャンネル招待 → 再起動を進め、効果のある操作は毎回確認を求め、token には触れません（`xoxb-` / `xapp-` は自分でコンソールに貼り付けます）。
+**設定**タブ：agents.yaml / .env 編集（保存すると稼働中 multi_app へ自動反映；agent の追加/削除は再起動が必要）、Slack App セットアップウィザード（manifest 生成 → token 検証 → .env 保存）、persona 編集・agent 追加。ウィザードの「この manifest で Slack に作成」リンクは、manifest を事前入力した Slack の作成画面を開きます。各 agent カードの**ローカル workspace** で `workspace` と `github_repo` を変更でき、「確認」でディレクトリの有無・git リポジトリか・ブランチ・origin を調べ、origin がリポジトリと一致しない場合（GitHub 連携が無効になる）は警告して origin のリポジトリへワンクリックで切り替えられます。保存するとホットリロードされ、`github_repo` を空にすると既定を使います。Claude Code で `/slack-app-setup`（`.claude/skills/slack-app-setup`）を実行すると、Claude in Chrome 接続時に agent がブラウザで作成 → インストール → App-Level Token → チャンネル招待 → 再起動を進め、効果のある操作は毎回確認を求め、token には触れません（`xoxb-` / `xapp-` は自分でコンソールに貼り付けます）。
 
 **認証**タブ：agent が実際に動く環境（Docker 優先、なければ host）で
 Claude、Codex、GitHub のログインを検証します。各 owner は自分のアカウント
 だけを接続します。
 
-webui は **127.0.0.1 のみ**（DNS rebinding 対策の Host 検査付き）。owner/分散構成では環境変数 `SLACK_AGENT_CONTROL_TOKEN_<SLACK_USER_ID>` の独立 Bearer（32 文字以上のランダムな printable 文字列）が自動的に必須です。browser は `sessionStorage` のみに保持して `Authorization: Bearer ...` を送り、user-id header は信用しません。owner は自分の agent だけ、top-level admin は全 agent を管理でき、global reload は admin 専用です。匿名 endpoint は `/healthz` だけです。保存時 `.bak` バックアップ（gitignore 済み）。`agents.yaml` のコメントは保存時に失われる。
+**見た目**は [rare-ui](https://github.com/swamimalode07/rare-ui) に倣っています：ライト / ダーク / システムの3テーマ、選択タブがバーから分離するナビ、桁ごとに回る数字、チェック時に項目へ取り消し線が引かれるタスクリスト、コピー後にチェックへ変わるボタン。「視差効果を減らす」設定時はすべての動きを止めます。
+
+webui は **127.0.0.1 のみ**（DNS rebinding 対策の Host 検査付き）。owner/分散構成では環境変数 `SLACK_AGENT_CONTROL_TOKEN_<SLACK_USER_ID>` の独立 Bearer（32 文字以上のランダムな printable 文字列）が自動的に必須です。browser は `sessionStorage` のみに保持して `Authorization: Bearer ...` を送り（401 の後にだけ画面内で入力を求め、拒否されたトークンはすぐ破棄）、user-id header は信用しません。owner は自分の agent だけ、top-level admin は全 agent を管理でき、global reload は admin 専用です。匿名 endpoint は `/healthz` だけです。保存時 `.bak` バックアップ（gitignore 済み）。`agents.yaml` のコメントは保存時に失われる。
 
 ## Slack App 作成（手動）
 
-（Web UI ウィザード利用時は省略可。）agent ごとに**独立 App** が必要。
+（ウィザードの「この manifest で Slack に作成」リンクを使うか、Claude Code で `/slack-app-setup` を実行する場合は省略可。）agent ごとに**独立 App** が必要。
 
 1. [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From a manifest**
 2. `slack-app-manifest-agent.yaml` を貼り、次の 3 箇所を agent ごとに変更：
@@ -254,6 +257,13 @@ ALLOWED_SLACK_USERS=U01ABCDEF
 
 # 任意
 CLAUDE_WORKSPACE=/path/to/project
+
+# 任意：運用チューニング（既定値と説明は .env.example）
+# FRESHNESS_RECHECK=1                  # 投稿前の新鮮度チェック
+# PROVIDER_COOLDOWN_BASE_SECONDS=60    # レート制限 cooldown（provider アカウント単位で共有）
+# PROVIDER_PACER_BASE_SECONDS=0.5      # ノード全体のターン開始間隔。0 で無効
+# SOCKET_GAP_REVALIDATE_SECONDS=120    # この秒数以上の Socket 切断後に transcript を再検証
+# AGENT_PROTECTED_BRANCHES=main,master # agent が直接 push できないブランチ
 ```
 
 ## 起動
@@ -562,10 +572,10 @@ Slack/GitHub token、state DB、base workspace、worktree root は各個人の
 - `thread_worktree` では managed branch を維持し、
   `gh issue develop --checkout` と `gh pr checkout` を使わない
 
-実装 agent は `gh issue view` で issue を読み、既存の managed branch で
-commit/push して PR URL を渡します。reviewer は `gh pr view` /
+実装 agent は `issue_claim.py claim` で claim し（issue は `status:in-progress`）、`gh issue view` で issue を読み、既存の managed branch で
+commit/push してから `issue_claim.py open-pr` で PR を作ります（`Closes #N` と Slack スレッドへのリンク付き、issue は `status:in-review`、claim は解放）。reviewer は `gh pr view` /
 `gh pr diff` と、同じローカル root thread なら共有 worktree を使い、
-managed branch を切り替えずに review します。
+managed branch を切り替えずに review します。LGTM の後のマージは人間が行い（agent はマージできません）、マージ時に `Closes #N` で issue が自動クローズされます。
 
 ### 巡回（patrol）
 
@@ -589,6 +599,7 @@ agents:
   - name: dev
     github_repo: OWNER/DEV-REPO
     patrol_interval: 300   # 秒。0 = 無効
+    patrol_labels: [role:dev]  # これらのラベルも付いた issue だけを claim
 
   - name: reviewer
     github_repo: ""        # この agent だけ GitHub 無効
