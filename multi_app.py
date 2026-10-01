@@ -11,6 +11,7 @@ import asyncio
 import copy
 import hashlib
 import logging
+import math
 import os
 import re
 import stat
@@ -53,16 +54,19 @@ from control_auth import (
 from multi_core import (
     AdaptivePacer,
     EventDeduper,
+    FailureFence,
     LiveCoverageMonitor,
     ProjectPolicy,
     ProviderCooldown,
     ProviderCooldownRegistry,
     ProviderRateLimitedError,
+    RUNTIME_FAILURE_NOTICES,
     TurnBudget,
     TurnSignals,
     build_activation_prompt,
     build_freshness_recheck_prompt,
     canonical_github_repo,
+    classify_runtime_failure,
     codex_usage_delta,
     classify_sender,
     constrain_handoff_targets,
@@ -72,6 +76,7 @@ from multi_core import (
     filter_context_messages,
     flatten_event_text,
     format_github_claim_protocol,
+    format_plain_mention_notice,
     format_rate_limit_notice,
     is_rate_limit_signal,
     is_side_effect_tool,
@@ -95,6 +100,7 @@ from multi_core import (
     parse_freshness_decision,
     provider_account_key,
     parse_handoff,
+    plain_agent_mentions,
     next_patrol_deadline,
     registered_agent_mentions,
     safe_filename,
@@ -137,6 +143,8 @@ EMPTY_REPLY_PLACEHOLDERS = frozenset(
     {CLAUDE_EMPTY_REPLY, CODEX_EMPTY_REPLY, OPENAI_EMPTY_REPLY}
 )
 CODEX_USAGE_BASELINE_LIMIT = 4096
+# A provider cooldown wait at least this long is announced in the thread.
+COOLDOWN_NOTICE_SECONDS = 30.0
 
 
 def provider_cooldown_from_env() -> ProviderCooldown:
@@ -2781,6 +2789,13 @@ class SlackAgent:
         # thread_key → previous session summary (injected into new session after rollover)
         self.thread_summaries: dict[str, str] = {}
         self.deduper = EventDeduper()
+        # Patrol stops repeating a failure only a human can fix (auth,
+        # billing, ...), probing occasionally until one round succeeds.
+        self._patrol_fence = FailureFence()
+        # Last runtime failure category, for /state (never the error text).
+        self._last_failure: dict[str, Any] | None = None
+        # (channel, trigger ts) currently showing the 📥 queued reaction.
+        self._inbox_marked: set[tuple[str, str]] = set()
         # codex thread id → last cumulative (input, cache, output) counters.
         self._codex_usage_baselines: dict[str, tuple[int, int, int]] = {}
         # AI-provider back-off per provider account; armed on rate-limited
@@ -2899,6 +2914,9 @@ class SlackAgent:
     def _active_execution_path(self) -> str:
         plan = self._active_execution_plan()
         return plan.execution_path if plan is not None else self.cfg.workspace
+
+    def _note_failure(self, category: str) -> None:
+        self._last_failure = {"category": category, "at": time.time()}
 
     def _cooldown_for(
         self, config: AgentConfig | ExecutionConfig | None = None
@@ -4686,6 +4704,7 @@ class SlackAgent:
         )
         context_token = _CURRENT_RUNTIME_ADMISSION.set(None)
         plan_token = _CURRENT_EXECUTION_PLAN.set(execution_plan)
+        await self._mark_queued(event, client, execution_plan, admission)
         try:
             async with self.runtime_limiter.slot(
                 self.name,
@@ -4749,6 +4768,30 @@ class SlackAgent:
                     exc_info=True,
                 )
 
+    async def _mark_queued(
+        self,
+        event: dict,
+        client: Any,
+        execution_plan: ExecutionPlan,
+        admission: RuntimeAdmission | None,
+    ) -> None:
+        """📥 on a trigger that must wait (node queue or a busy thread).
+
+        Added by the activation task itself before it waits, so the later
+        ⏳ swap in _activate_inner can never race it.
+        """
+        lock = self.locks.get(execution_plan.thread_key)
+        waits = (admission is not None and admission.state == "queued") or (
+            lock is not None and lock.locked()
+        )
+        if not waits:
+            return
+        ts = str(event.get("ts") or "")
+        self._inbox_marked.add((execution_plan.channel_id, ts))
+        await self._set_reaction(
+            client, execution_plan.channel_id, ts, add="inbox_tray"
+        )
+
     async def _activate_inner(
         self, event: dict, client: Any, say: Any
     ) -> None:
@@ -4785,8 +4828,15 @@ class SlackAgent:
             # Outermost: log exit failures from post/reaction so Tasks do not fail silently
             try:
                 # ⏳ up-front so context fetch / file downloads are visibly in progress
+                queued_mark = (channel, ts)
+                was_queued = queued_mark in self._inbox_marked
+                self._inbox_marked.discard(queued_mark)
                 await self._set_reaction(
-                    client, channel, ts, add="hourglass_flowing_sand"
+                    client,
+                    channel,
+                    ts,
+                    add="hourglass_flowing_sand",
+                    remove="inbox_tray" if was_queued else None,
                 )
                 # ok means "result delivered to the thread and the turn succeeded";
                 # the finally below turns it into ✅/❌ even when posting itself fails.
@@ -4895,12 +4945,14 @@ class SlackAgent:
                             retry_after=exc.retry_after,
                             replay_safe=exc.replay_safe,
                         )
-                    except Exception:
+                    except Exception as exc:
                         turn_ok = False
                         logger.exception(
                             "agent %s _activate runtime failed", self.name
                         )
-                        result = "⚠️ エラーが発生しました。サーバーログを確認してください。"
+                        category = classify_runtime_failure(str(exc))
+                        self._note_failure(category)
+                        result = RUNTIME_FAILURE_NOTICES[category]
 
                     # Post-time freshness gate: messages that arrived while
                     # the turn ran get one re-decide pass; a verbatim
@@ -5067,6 +5119,16 @@ class SlackAgent:
                 channel,
                 ",".join(removed),
             )
+        plain = plain_agent_mentions(
+            result,
+            {
+                name: uid
+                for name in self.roster.names()
+                if name != self.name and (uid := self.roster.user_id_of(name))
+            },
+        )
+        if plain:
+            result += "\n\n" + format_plain_mention_notice(plain)
         chunks = split_markdown(result)
         for chunk in chunks:
             posted_text = ""
@@ -5337,6 +5399,14 @@ class SlackAgent:
             self.cfg, allowed_tools=list(self.cfg.allowed_tools)
         )
         cooldown = self._cooldown_for(config_snapshot)
+        if self._patrol_fence.should_skip():
+            logger.warning(
+                "agent %s patrol paused: %d consecutive %s failures",
+                self.name,
+                self._patrol_fence.streak,
+                self._patrol_fence.category,
+            )
+            return
         cooldown_wait = cooldown.remaining()
         if cooldown_wait > 0:
             # Unlike a Slack mention, a skipped patrol round retries at the
@@ -5399,6 +5469,11 @@ class SlackAgent:
                     self._turn_pacer.interval,
                     str(exc)[:300],
                 )
+            else:
+                category = classify_runtime_failure(str(exc))
+                self._note_failure(category)
+                if self._patrol_fence.note_failure(category):
+                    await self._post_patrol_pause_notice(channel, category)
             raise
         else:
             # A patrol skipped before any provider call (ACL, runtime, repo,
@@ -5407,6 +5482,7 @@ class SlackAgent:
             if provider_ran:
                 cooldown.note_success()
                 self._turn_pacer.note_clean_turn()
+                self._patrol_fence.note_success()
         finally:
             _CURRENT_QUOTA_RESERVATION.reset(quota_token)
             if quota_reservation is not None:
@@ -5428,6 +5504,30 @@ class SlackAgent:
                     self.name,
                     exc_info=True,
                 )
+
+    async def _post_patrol_pause_notice(
+        self, channel: str, category: str
+    ) -> None:
+        """Tell the patrol channel once that patrol stopped repeating a failure."""
+        if self.app is None:
+            return
+        try:
+            await self.app.client.chat_postMessage(
+                channel=channel,
+                text=(
+                    f"⏸️ {self.name} の巡回を一時停止しました: 同じ種類の"
+                    f"エラー（{category}）が {self._patrol_fence.streak} 回"
+                    "続いたためです。"
+                    f"{RUNTIME_FAILURE_NOTICES[category]}"
+                    "以後はときどき試行し、成功すると自動で再開します。"
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "agent %s failed to post patrol pause notice",
+                self.name,
+                exc_info=True,
+            )
 
     async def _run_patrol_once_inner(
         self,
@@ -5551,6 +5651,11 @@ class SlackAgent:
                     )
                     if rate_error is not None:
                         raise rate_error from exc
+                    if signals.error_text:
+                        raise RuntimeError(
+                            "patrol claude turn returned an error result: "
+                            f"{signals.error_text[:300]}"
+                        ) from exc
                     raise
                 if provider_usage is not None:
                     self._settle_quota_usage(provider_usage)
@@ -5837,6 +5942,7 @@ class SlackAgent:
                 filtered,
                 name_of=self._display_name_of,
                 self_user_id=self.user_id,
+                pin_root_ts=thread_ts or "",
             )
         except Exception:
             logger.warning(
@@ -5985,7 +6091,10 @@ class SlackAgent:
         raise AssertionError("unreachable: _run_turn retry loop exhausted")
 
     async def _wait_out_cooldown(self, wait: float, thread_key: str) -> None:
-        """Wait out the provider cooldown without occupying a node slot."""
+        """Wait out the provider cooldown without occupying a node slot.
+
+        A wait long enough to look like a hang gets one thread notice.
+        """
         logger.warning(
             "agent %s provider cooldown active: waiting %.1fs before turn "
             "thread=%s",
@@ -5993,6 +6102,27 @@ class SlackAgent:
             wait,
             thread_key,
         )
+        plan = self._active_execution_plan()
+        if (
+            wait >= COOLDOWN_NOTICE_SECONDS
+            and plan is not None
+            and self.app is not None
+        ):
+            try:
+                await self.app.client.chat_postMessage(
+                    channel=plan.channel_id,
+                    thread_ts=plan.root_thread_ts,
+                    text=(
+                        "⏸️ AI provider のレート制限中です。"
+                        f"約 {math.ceil(wait)} 秒後に自動で再開します。"
+                    ),
+                )
+            except Exception:
+                logger.warning(
+                    "agent %s failed to post cooldown notice",
+                    self.name,
+                    exc_info=True,
+                )
         admission = _HELD_RUNTIME_ADMISSION.get()
         if admission is None:
             await asyncio.sleep(wait)
@@ -6567,6 +6697,12 @@ class SlackAgent:
             rate_error = signals.rate_limit_error(str(exc), now=time.time())
             if rate_error is not None:
                 raise rate_error from exc
+            if signals.error_text:
+                # The SDK's replacement text is often just the subtype;
+                # keep the CLI's own message so the failure is classifiable.
+                raise RuntimeError(
+                    f"Claude error result: {signals.error_text[:500]}"
+                ) from exc
             raise
         if provider_usage is not None:
             self._settle_quota_usage(provider_usage)
@@ -7204,6 +7340,8 @@ class SlackAgent:
             **runtime_status,
             "provider_cooldown": self._cooldown_for(self.cfg).snapshot(),
             "turn_pacer": self._turn_pacer.snapshot(),
+            "patrol_fence": self._patrol_fence.snapshot(),
+            "last_failure": self._last_failure,
             "busy_threads": sum(1 for t in threads if t["busy"]),
             "session_count": len(self.sessions),
             "patrol": bool(

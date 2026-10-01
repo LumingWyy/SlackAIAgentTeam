@@ -553,6 +553,8 @@ def test_run_claude_non_rate_limit_error_stays_generic(tmp_path, monkeypatch):
     with pytest.raises(Exception) as info:
         asyncio.run(agent._run_claude("p", "C1:1.0", (0, 0)))
     assert not isinstance(info.value, ProviderRateLimitedError)
+    # The CLI's own message survives so the failure can be classified.
+    assert "Prompt is too long" in str(info.value)
 
 
 # ---------------------------------------------------------------------------

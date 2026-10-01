@@ -276,3 +276,226 @@ def test_socket_gap_threshold_env(monkeypatch):
         monkeypatch.setenv("SOCKET_GAP_REVALIDATE_SECONDS", bad)
         with pytest.raises(RuntimeError):
             socket_gap_threshold_from_env()
+
+
+# ---------------------------------------------------------------------------
+# Thread root pinning in truncated context
+# ---------------------------------------------------------------------------
+
+
+def _context_messages():
+    root = {"ts": "1.0", "text": "TASK: migrate the billing table"}
+    replies = [{"ts": f"{i}.0", "text": f"reply {i} " * 12} for i in range(2, 60)]
+    return [root, *replies]
+
+
+def test_truncated_context_keeps_thread_root():
+    from multi_core import THREAD_CONTEXT_MIDDLE_OMITTED, format_thread_context
+
+    block = format_thread_context(
+        _context_messages(), lambda _m: "h", "", max_chars=800, pin_root_ts="1.0"
+    )
+    assert block.startswith("[h] TASK: migrate the billing table")
+    assert THREAD_CONTEXT_MIDDLE_OMITTED in block
+    assert "reply 59" in block
+    assert len(block) <= 800
+
+
+def test_truncation_without_pinned_root_keeps_legacy_shape():
+    from multi_core import THREAD_CONTEXT_OMITTED, format_thread_context
+
+    # The root was already consumed by the session (filtered out).
+    block = format_thread_context(
+        _context_messages()[5:], lambda _m: "h", "", max_chars=800, pin_root_ts="1.0"
+    )
+    assert block.startswith(THREAD_CONTEXT_OMITTED)
+    assert "TASK" not in block
+
+
+def test_oversized_root_is_clipped():
+    from multi_core import format_thread_context
+
+    messages = [{"ts": "1.0", "text": "R" * 5000}, {"ts": "2.0", "text": "latest"}]
+    block = format_thread_context(
+        messages, lambda _m: "h", "", max_chars=900, pin_root_ts="1.0"
+    )
+    assert block.endswith("[h] latest")
+    assert len(block) <= 900
+
+
+def test_short_context_is_unchanged():
+    from multi_core import format_thread_context
+
+    messages = [{"ts": "1.0", "text": "root"}, {"ts": "2.0", "text": "reply"}]
+    assert (
+        format_thread_context(messages, lambda _m: "h", "", pin_root_ts="1.0")
+        == "[h] root\n[h] reply"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Plain-text @agent mentions
+# ---------------------------------------------------------------------------
+
+
+def test_plain_agent_mentions_detection():
+    from multi_core import plain_agent_mentions
+
+    ids = {"reviewer": "UREV01", "dev": "UDEV01", "grok-reviewer": "UGROK01"}
+    assert plain_agent_mentions("please @reviewer check", ids) == ["reviewer"]
+    assert plain_agent_mentions("@reviewer、お願いします", ids) == ["reviewer"]
+    assert plain_agent_mentions("ping @grok-reviewer.", ids) == ["grok-reviewer"]
+    # Real mentions, code, and e-mail addresses are not plain mentions.
+    assert plain_agent_mentions("<@UREV01> and @reviewer", ids) == []
+    assert plain_agent_mentions("run `@dev deploy`", ids) == []
+    assert plain_agent_mentions("mail ops@reviewer.example", ids) == []
+    assert plain_agent_mentions("@someone-else", ids) == []
+
+
+def test_post_result_flags_plain_agent_mention(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    agent.roster.add("reviewer", "U_REV", "B_REV")
+    client = _FakeClient(None)
+    agent.app = SimpleNamespace(client=client)
+
+    async def members(*_args, **_kwargs):
+        return {"dev", "reviewer"}
+
+    agent._channel_agent_names = members
+    asyncio.run(agent._post_result("C1", "100.0", "done, @reviewer please look"))
+    posted = client.calls[0]["markdown_text"]
+    assert "`@reviewer`" in posted
+    assert "通知されていません" in posted
+
+
+# ---------------------------------------------------------------------------
+# Runtime failure classification + patrol fence
+# ---------------------------------------------------------------------------
+
+
+def test_classify_runtime_failure():
+    from multi_core import classify_runtime_failure
+
+    assert classify_runtime_failure("Claude error result: Prompt is too long") == (
+        "context_too_long"
+    )
+    assert classify_runtime_failure("Invalid API key · Please run /login") == "auth"
+    assert classify_runtime_failure("Credit balance is too low") == "billing"
+    assert classify_runtime_failure("boom") == "other"
+
+
+def test_failed_turn_posts_actionable_notice(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    rec = _wire(agent, [RuntimeError("Claude error result: Prompt is too long")])
+    _activate(agent, _event())
+    assert "!reset" in rec.posts[0]
+    assert agent._last_failure["category"] == "context_too_long"
+
+
+def test_failure_fence_opens_after_threshold_and_probes():
+    from multi_core import FailureFence
+
+    fence = FailureFence(threshold=3, probe_every=3)
+    assert fence.note_failure("auth") is False
+    assert fence.note_failure("other") is False  # category change resets
+    assert fence.note_failure("auth") is False
+    assert fence.note_failure("auth") is False
+    assert fence.note_failure("auth") is True  # third auth in a row
+    assert fence.note_failure("auth") is False  # announced only once
+    assert [fence.should_skip() for _ in range(3)] == [True, True, False]
+    fence.note_success()
+    assert fence.should_skip() is False
+    assert fence.snapshot()["open"] is False
+
+
+def test_patrol_pauses_after_repeated_auth_failures(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    client = _FakeClient(None)
+    agent.app = SimpleNamespace(client=client)
+    runs: list[int] = []
+
+    async def failing_inner(*_args, **_kwargs):
+        runs.append(1)
+        raise RuntimeError("Not logged in · Please run /login")
+
+    agent._run_patrol_once_inner = failing_inner
+    for _ in range(3):
+        with pytest.raises(RuntimeError):
+            asyncio.run(agent._run_patrol_once("p", "C-PATROL"))
+    assert len(runs) == 3
+    assert len(client.calls) == 1
+    assert "巡回を一時停止" in client.calls[0]["text"]
+    # The next round is skipped without touching the provider.
+    asyncio.run(agent._run_patrol_once("p", "C-PATROL"))
+    assert len(runs) == 3
+    assert agent.status_snapshot()["patrol_fence"]["open"] is True
+
+
+# ---------------------------------------------------------------------------
+# Queue / cooldown visibility
+# ---------------------------------------------------------------------------
+
+
+def test_waiting_trigger_shows_inbox_then_hourglass(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    rec = _wire(agent, ["done"])
+    event = _event()
+    plan = agent.build_execution_plan(event)
+
+    async def scenario():
+        lock = agent.locks.setdefault(plan.thread_key, asyncio.Lock())
+        await lock.acquire()  # another turn holds the thread
+        await agent._mark_queued(event, object(), plan, None)
+        lock.release()
+        await agent._activate_inner(event, object(), _say)
+
+    asyncio.run(scenario())
+    assert rec.reactions[0] == {"add": "inbox_tray", "remove": None}
+    assert rec.reactions[1] == {
+        "add": "hourglass_flowing_sand",
+        "remove": "inbox_tray",
+    }
+
+
+def test_idle_trigger_skips_inbox_reaction(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    rec = _wire(agent, ["done"])
+    event = _event()
+    plan = agent.build_execution_plan(event)
+    asyncio.run(agent._mark_queued(event, object(), plan, None))
+    assert rec.reactions == []
+
+
+def test_long_cooldown_wait_is_announced_once(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import multi_app
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    client = _FakeClient(None)
+    agent.app = SimpleNamespace(client=client)
+    plan = agent.build_execution_plan(_event())
+    slept: list[float] = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(multi_app.asyncio, "sleep", fake_sleep)
+
+    async def scenario():
+        token = multi_app._CURRENT_EXECUTION_PLAN.set(plan)
+        try:
+            await agent._wait_out_cooldown(45.0, plan.thread_key)
+            await agent._wait_out_cooldown(5.0, plan.thread_key)
+        finally:
+            multi_app._CURRENT_EXECUTION_PLAN.reset(token)
+
+    asyncio.run(scenario())
+    assert slept == [45.0, 5.0]
+    assert len(client.calls) == 1
+    assert "約 45 秒後" in client.calls[0]["text"]
+    assert client.calls[0]["thread_ts"] == plan.root_thread_ts

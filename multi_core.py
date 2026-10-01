@@ -1303,40 +1303,219 @@ def is_patrol_idle(result: str) -> bool:
     return s == "PATROL_IDLE" or s.startswith("PATROL_IDLE")
 
 
+THREAD_CONTEXT_OMITTED = "(...以前のメッセージは省略...)"
+THREAD_CONTEXT_MIDDLE_OMITTED = "(...途中のメッセージは省略...)"
+
+
 def format_thread_context(
     messages: list[dict],
     name_of: Callable[[dict], str],
     self_user_id: str,
     max_chars: int = 6000,
+    *,
+    pin_root_ts: str = "",
 ) -> str:
     """Format thread messages into a context block.
 
     messages: Slack conversations_replies message dicts (ascending time).
     name_of: caller maps a message to a display name.
     self_user_id: reserved for caller / future use.
+    pin_root_ts: when the oldest message is this thread root and the block
+        must be truncated, keep the root (it usually holds the task
+        definition) and drop from the middle instead of the head. An
+        oversized root is itself clipped to a third of the budget.
     """
     _ = self_user_id  # signature kept for API compatibility; formatting does not use self ID
-    lines: list[str] = []
+    entries: list[tuple[str, str]] = []
     for msg in messages:
         text = (msg.get("text") or "").strip()
         if not text:
             continue
         name = name_of(msg)
-        lines.append(f"[{name}] {text}")
+        entries.append((str(msg.get("ts") or ""), f"[{name}] {text}"))
 
-    if not lines:
+    if not entries:
         return ""
+    lines = [line for _ts, line in entries]
+    if len("\n".join(lines)) <= max_chars:
+        return "\n".join(lines)
 
-    # Drop whole lines from the head until body fits max_chars (keep newest), then prefix omit line
-    omitted = False
-    while len("\n".join(lines)) > max_chars and lines:
+    root = ""
+    if pin_root_ts and entries[0][0] == pin_root_ts:
+        root = lines.pop(0)
+        root_budget = max(1, max_chars // 3)
+        if len(root) > root_budget:
+            root = root[:root_budget].rstrip() + "…"
+    budget = max_chars - (
+        len(root) + len(THREAD_CONTEXT_MIDDLE_OMITTED) + 2 if root else 0
+    )
+    # Drop whole lines from the head until body fits (keep newest)
+    while lines and len("\n".join(lines)) > budget:
         lines.pop(0)
-        omitted = True
 
     body = "\n".join(lines)
-    if omitted:
-        return "(...以前のメッセージは省略...)\n" + body
-    return body
+    if root:
+        return "\n".join(
+            part
+            for part in (root, THREAD_CONTEXT_MIDDLE_OMITTED, body)
+            if part
+        )
+    return THREAD_CONTEXT_OMITTED + "\n" + body
+
+
+_CODE_SPAN_RE = re.compile(r"```.*?```|`[^`\n]*`", re.DOTALL)
+_PLAIN_MENTION_RE = re.compile(
+    r"(?<![A-Za-z0-9_.@<])@([A-Za-z0-9][A-Za-z0-9_.-]*)"
+)
+
+
+def plain_agent_mentions(
+    text: str,
+    agent_user_ids: Mapping[str, str],
+) -> list[str]:
+    """Agent names written as plain-text ``@name`` without a real mention.
+
+    ``agent_user_ids`` maps registered agent name → Slack user ID. A
+    plain-text ``@reviewer`` notifies nobody, so a hand-off silently stalls.
+    Code spans, e-mail-like tokens, and agents that are also mentioned
+    properly (``<@U…>``) are ignored.
+    """
+    by_lower = {name.lower(): name for name in agent_user_ids if name}
+    if not by_lower:
+        return []
+    real_ids = set(MENTION_RE.findall(text or ""))
+    body = MENTION_RE.sub(" ", _CODE_SPAN_RE.sub(" ", text or ""))
+    found: list[str] = []
+    for match in _PLAIN_MENTION_RE.finditer(body):
+        name = by_lower.get(match.group(1).rstrip(".-").lower())
+        if (
+            name
+            and name not in found
+            and agent_user_ids.get(name) not in real_ids
+        ):
+            found.append(name)
+    return found
+
+
+def format_plain_mention_notice(names: list[str]) -> str:
+    targets = " / ".join(f"`@{name}`" for name in names)
+    return (
+        f"⚠️ {targets} はテキストのみの表記のため、誰にも通知されていません"
+        "（引き継ぐ場合は実際のメンションが必要です）。"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Runtime failure classification (actionable notices + repeat fence)
+# ---------------------------------------------------------------------------
+
+_RUNTIME_FAILURE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "context_too_long",
+        re.compile(
+            r"prompt is too long|context[_ ]length|context window"
+            r"|maximum context|input (?:is )?too (?:long|large)"
+            r"|too many (?:input )?tokens",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "billing",
+        re.compile(
+            r"credit balance|insufficient[_ ]quota|billing|payment required",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "auth",
+        re.compile(
+            r"not logged in|please run [`'\"]?\S*\s*login|/login"
+            r"|invalid[_ ]api[_ ]key|authentication|unauthori[sz]ed"
+            r"|\b401\b|oauth token",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def classify_runtime_failure(text: str) -> str:
+    """``context_too_long`` / ``billing`` / ``auth`` / ``other`` for an error."""
+    for category, pattern in _RUNTIME_FAILURE_PATTERNS:
+        if pattern.search(text or ""):
+            return category
+    return "other"
+
+
+RUNTIME_FAILURE_NOTICES = {
+    "context_too_long": (
+        "⚠️ 会話が長すぎて処理できませんでした。`!reset <@agent>` で"
+        "セッションをリセットしてから、もう一度依頼してください。"
+    ),
+    "billing": (
+        "⚠️ AI provider の請求・クレジットの問題で処理できませんでした。"
+        "ノードの所有者が契約状況を確認してください。"
+    ),
+    "auth": (
+        "⚠️ AI runtime の認証に失敗しました（未ログインまたは認証切れ）。"
+        "ノードの所有者が再ログインしてください。"
+    ),
+    "other": "⚠️ エラーが発生しました。サーバーログを確認してください。",
+}
+
+
+class FailureFence:
+    """Stop repeating a failure that a retry cannot fix (Raft: 3 strikes).
+
+    ``threshold`` consecutive failures of one category open the fence;
+    while open, only every ``probe_every``-th round runs (a half-open
+    probe), and any success closes it. ``note_failure`` returns True only
+    on the round that opened the fence, so the caller notifies once.
+    """
+
+    def __init__(self, threshold: int = 3, probe_every: int = 6) -> None:
+        if threshold < 1 or probe_every < 1:
+            raise ValueError("fence threshold and probe_every must be >= 1")
+        self.threshold = threshold
+        self.probe_every = probe_every
+        self.category = ""
+        self.streak = 0
+        self.open = False
+        self._skipped = 0
+
+    def should_skip(self) -> bool:
+        if not self.open:
+            return False
+        self._skipped += 1
+        if self._skipped >= self.probe_every:
+            self._skipped = 0
+            return False
+        return True
+
+    def note_failure(self, category: str) -> bool:
+        if category == self.category:
+            self.streak += 1
+        else:
+            self.category = category
+            self.streak = 1
+        if not self.open and self.streak >= self.threshold:
+            self.open = True
+            self._skipped = 0
+            return True
+        return False
+
+    def note_success(self) -> None:
+        self.category = ""
+        self.streak = 0
+        self.open = False
+        self._skipped = 0
+
+    def snapshot(self) -> dict:
+        return {
+            "open": self.open,
+            "category": self.category,
+            "streak": self.streak,
+            "threshold": self.threshold,
+        }
 
 
 CODEX_SIDE_EFFECT_ITEM_TYPES = frozenset(

@@ -231,7 +231,9 @@ webui は **127.0.0.1 のみ**（DNS rebinding 対策の Host 検査付き）。
 
 - `agents.yaml` の `trusted_feed_bots: [B0XXXXXXX]` — 許可した Slack App（例: GitHub）の投稿を読み取り専用の `[feed]` コンテキストにする（agent は起動しない）。
 - トリガーメッセージの添付ファイルは `<workspace>/.slack-files/` に取得（最大 3 件・各 10MB・48h 後に掃除）。agent がローカルツールで読む。
-- 進行状況はトリガーへの reaction（⏳ 対応中 → ✅ 完了 / ❌ 失敗）。「対応中…」プレースホルダ投稿は出さない。
+- 進行状況はトリガーへの reaction（📥 混雑したスレッドや満杯のノードで待機中 → ⏳ 対応中 → ✅ 完了 / ❌ 失敗 / 🤐 新鮮度チェックで返信を取り下げ）。「対応中…」プレースホルダ投稿は出さない。provider cooldown の待機が 30 秒以上なら、再開見込みを1回だけ通知する。
+- 失敗はカテゴリ別に次の行動を示す（文脈が長すぎる → `!reset`、認証・請求 → ノード所有者）。patrol は同じカテゴリの失敗が3回続くと停止してチャンネルに1回通知し、6 回に 1 回だけ試行、成功すると自動再開（`/state` の `patrol_fence` / `last_failure`）。
+- 登録済み agent をテキストだけの `@name` で書くと誰にも通知されないため、投稿に1行の警告を付ける。
 
 ## .env
 
@@ -305,7 +307,7 @@ DM では人間は `@` なしで会話可能（peer の DM 引き継ぎはしな
 | ハードタイムアウト | `claude_timeout` 既定 900 秒 |
 | Slack 429 | Retry-After 自動リトライ（最大 2） |
 | メモリ回収 | スレッド状態 idle 48h で回収 |
-| 長いスレッド | 共有 bounded local transcript。cold/incomplete のみ cursor、最大 15 件/page で backfill |
+| 長いスレッド | 共有 bounded local transcript。cold/incomplete のみ cursor、最大 15 件/page で backfill。文脈ブロックを切り詰めるときはスレッド先頭（通常はタスク定義）を残し、途中を省略する |
 | 返信 freshness gate | 投稿直前に、ターン実行中へ届いた peer/許可済み人間のメッセージを検出し、ちょうど1回だけ再判断（`POST_ORIGINAL` 原文投稿 / 修正全文 / `NO_REPLY` 取り下げ）。最新の非自分メッセージと逐語一致する返信は投稿しない。ローカル transcript のみ参照（追加 Slack API 呼び出しゼロ）、gate 自体の失敗は fail-open。`FRESHNESS_RECHECK=0` で無効化 |
 | Provider rate-limit cooldown | AI ターンがレート制限された場合（Claude / Codex / OpenAI の 429・usage limit・overloaded シグナル、`Retry-After` 尊重）、同じ provider アカウントを使うローカル agent 全員で共有する cooldown を作動（Claude agent はローカルの Claude ログイン、Codex agent は Codex ログインを共有。OpenAI はエンドポイント + キー変数ごと）——基本 **60 秒**、連続時は倍増で最大 **480 秒**。終了後の再試行は安全が確認できる場合だけ1回行う：副作用のあるツール（シェル・編集・MCP）が未実行、provider の解除時刻が 15 分以内、スレッドが未リセット。それ以外は黙って再実行せず、スレッドに理由を通知する。cooldown の待機中はノードのスロットを手放すため、他の agent は止まらない。cooldown 中に始まるターンは先に待機、patrol はスキップ（次の epoch で再試行）。成功ターンで streak リセット。状態は `/state` の `provider_cooldown`。`PROVIDER_COOLDOWN_BASE_SECONDS` / `PROVIDER_COOLDOWN_MAX_SECONDS` で調整 |
 | Adaptive turn pacer | 全ローカル agent がノード共通の provider ターン開始タイムラインを共有し、適応間隔で開始をずらす——基本 **0.5 秒**、レート制限ごとに倍増で最大 **8 秒**、連続 **5** クリーンターンで半減して基本値へ回帰——共有 provider アカウントの 2-3 agent が同時発火しない。Slack・freshness recheck・patrol の全ターンに適用；待機はターン timeout 窓の外で行われ、総並列度は下げない。状態は `/state` の `turn_pacer`。`PROVIDER_PACER_BASE_SECONDS`（0 で無効）/ `PROVIDER_PACER_MAX_SECONDS` / `PROVIDER_PACER_CLEAN_TURNS` で調整 |
