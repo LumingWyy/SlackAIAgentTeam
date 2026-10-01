@@ -34,6 +34,13 @@ class FakeGitHub:
         self.before_push = None
         self._next = 0
         self.calls: list[list[str]] = []
+        self.labels: dict[int, set[str]] = {}
+        self.issue_state: dict[int, str] = {}
+        self.prs: dict[str, str] = {}
+        self.pr_bodies: dict[str, str] = {}
+        self.branch = "slack-agent-wt/abc"
+        self.head_sha = "f" * 40
+        self.remote_branches: dict[str, str] = {}
 
     def new_sha(self) -> str:
         self._next += 1
@@ -42,8 +49,36 @@ class FakeGitHub:
     def __call__(self, cmd, cwd, timeout):
         self.calls.append(cmd)
         if cmd[0] == "gh":
-            return self._gh(cmd[2:])
+            if cmd[1] == "api":
+                return self._gh(cmd[2:])
+            return self._gh_cli(cmd[1:])
         return self._git(cmd[1:])
+
+    def _gh_cli(self, args):
+        if args[:2] == ["issue", "edit"]:
+            if "labels" in self.fail:
+                return 1, "", "label not found"
+            issue = int(args[2])
+            labels = self.labels.setdefault(issue, set())
+            for flag, value in zip(args, args[1:]):
+                if flag == "--add-label":
+                    labels.add(value)
+                elif flag == "--remove-label":
+                    labels.discard(value)
+            return 0, "", ""
+        if args[:2] == ["repo", "view"]:
+            return 0, "main\n", ""
+        if args[:2] == ["pr", "create"]:
+            head = args[args.index("--head") + 1]
+            if head in self.prs:
+                return 1, "", "a pull request for branch already exists"
+            url = f"https://github.com/{REPO}/pull/{len(self.prs) + 1}"
+            self.prs[head] = url
+            self.pr_bodies[head] = args[args.index("--body") + 1]
+            return 0, url + "\n", ""
+        if args[:2] == ["pr", "view"]:
+            return 0, self.prs[args[2]] + "\n", ""
+        raise AssertionError(f"unexpected gh call {args}")
 
     def _gh(self, args):
         if args[:2] == ["--include", "rate_limit"]:
@@ -56,6 +91,12 @@ class FakeGitHub:
                 return 1, "", "HTTP 502"
             self.comments.setdefault(issue, []).append(args[4][len("body="):])
             return 0, "{}", ""
+        if args[0] == "--paginate" and "/git/matching-refs/" in args[1]:
+            lines = [
+                json.dumps([f"refs/heads/slack-agent-claims/issue-{issue}", sha])
+                for issue, sha in sorted(self.refs.items())
+            ]
+            return 0, "\n".join(lines), ""
         if args[0] == "--paginate":
             issue = int(args[1].split("/")[-2])
             if "comments" in self.fail:
@@ -63,6 +104,11 @@ class FakeGitHub:
             lines = [json.dumps(body) for body in self.comments.get(issue, [])]
             return 0, "\n".join(lines), ""
         path = args[0]
+        if path.startswith(f"repos/{REPO}/issues/") and path.count("/") == 4:
+            issue = int(path.rsplit("/", 1)[-1])
+            labels = [{"name": name} for name in sorted(self.labels.get(issue, ()))]
+            state = self.issue_state.get(issue, "open")
+            return 0, json.dumps({"state": state, "labels": labels}), ""
         if path.startswith(REF_PREFIX):
             issue = int(path[len(REF_PREFIX):])
             if "ref" in self.fail:
@@ -78,6 +124,13 @@ class FakeGitHub:
     def _git(self, args):
         if args[0] == "fetch":
             return 0, "", ""
+        if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+            return 0, self.branch + "\n", ""
+        if args == ["rev-parse", "HEAD"]:
+            return 0, self.head_sha + "\n", ""
+        if args[0] == "ls-remote":
+            sha = self.remote_branches.get(args[-1].removeprefix("refs/heads/"))
+            return 0, (f"{sha}\t{args[-1]}\n" if sha else ""), ""
         if args[0] == "rev-parse":
             return 0, "base\n", ""
         if "commit-tree" in args:
@@ -553,3 +606,303 @@ def test_claim_tool_cli_runs_as_a_script(tmp_path):
     )
     assert proc.returncode == 1
     assert json.loads(proc.stdout)["status"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Status labels, open-pr hand-off, claim ref gc, [skip ci]
+# ---------------------------------------------------------------------------
+
+
+def test_claim_commit_skips_ci():
+    lease = ClaimLease.new(7, "dev", "n1", nonce="a" * 32, now=T0)
+    assert lease.commit_message().endswith("[skip ci]")
+    # The marker parser still reads every field.
+    assert parse_claim_fields(lease.commit_message())["lease_until"] == lease.lease_until
+
+
+def test_claim_moves_issue_to_in_progress():
+    github = FakeGitHub()
+    github.labels[7] = {"status:todo", "role:dev"}
+    result = _claimer(github).claim(7, "dev", "n1")
+    assert result["labels"] == "updated"
+    assert github.labels[7] == {"status:in-progress", "role:dev"}
+
+
+def test_label_failure_does_not_undo_a_verified_claim():
+    github = FakeGitHub()
+    github.fail.add("labels")
+    result = _claimer(github).claim(7, "dev", "n1")
+    assert result["status"] == "claimed"
+    assert result["labels"] == "failed"
+    assert 7 in github.refs
+
+
+def test_release_without_pr_returns_issue_to_todo():
+    github = FakeGitHub()
+    claimer = _claimer(github)
+    github.labels[7] = {"status:todo"}
+    claimer.claim(7, "dev", "n1")
+    result = claimer.release(7, "dev", "n1")
+    assert result["labels"] == "updated"
+    assert github.labels[7] == {"status:todo"}
+
+
+def test_open_pr_hands_off_and_releases_the_claim():
+    github = FakeGitHub()
+    claimer = _claimer(github)
+    github.labels[7] = {"status:todo"}
+    claimer.claim(7, "dev", "n1")
+    github.remote_branches[github.branch] = github.head_sha
+    result = claimer.open_pr(
+        7, "dev", "n1", title="Add CSV export", body="Adds the export.",
+        thread_url="https://acme.slack.com/archives/C1/p100",
+    )
+    assert result["status"] == "opened"
+    assert result["pr_url"].endswith("/pull/1")
+    body = github.pr_bodies[github.branch]
+    assert "Closes #7" in body
+    assert "https://acme.slack.com/archives/C1/p100" in body
+    assert github.labels[7] == {"status:in-review"}
+    assert result["released"] is True and 7 not in github.refs
+
+
+def test_open_pr_requires_a_pushed_work_branch():
+    github = FakeGitHub()
+    claimer = _claimer(github)
+    claimer.claim(7, "dev", "n1")
+    result = claimer.open_pr(7, "dev", "n1", title="t", body="b")
+    assert result["status"] == "failed" and "push" in result["reason"]
+    github.branch = "main"
+    result = claimer.open_pr(7, "dev", "n1", title="t", body="b")
+    assert "default branch" in result["reason"]
+    assert github.prs == {}
+
+
+def test_open_pr_requires_holding_the_claim():
+    github = FakeGitHub()
+    _seed_claim(github, 7, "qa", "n2", now=T0)
+    github.remote_branches[github.branch] = github.head_sha
+    result = _claimer(github).open_pr(7, "dev", "n1", title="t", body="b")
+    assert result["status"] == "failed"
+    assert github.prs == {}
+
+
+def test_open_pr_reuses_an_existing_pr():
+    github = FakeGitHub()
+    claimer = _claimer(github)
+    claimer.claim(7, "dev", "n1")
+    github.remote_branches[github.branch] = github.head_sha
+    github.prs[github.branch] = f"https://github.com/{REPO}/pull/9"
+    result = claimer.open_pr(7, "dev", "n1", title="t", body="b")
+    assert result["status"] == "opened"
+    assert result["pr_url"].endswith("/pull/9")
+
+
+def test_gc_deletes_claim_refs_of_closed_issues_only():
+    github = FakeGitHub()
+    open_sha, _ = _seed_claim(github, 7, "dev", "n1", now=T0)
+    _seed_claim(github, 8, "qa", "n2", now=T0)
+    github.issue_state[8] = "closed"
+    result = run_operation("gc", repo=REPO, cwd="/repo", runner=github)
+    assert result == {"status": "ok", "deleted": [8], "inspected": 2}
+    assert github.refs == {7: open_sha}
+
+
+# ---------------------------------------------------------------------------
+# multi_app wiring: role labels, shared listing, gc cadence, no-merge rules
+# ---------------------------------------------------------------------------
+
+
+def _load(tmp_path, monkeypatch, yaml_text):
+    from multi_app import load_agents_config
+
+    path = tmp_path / "agents.yaml"
+    path.write_text(yaml_text, encoding="utf-8")
+    monkeypatch.setenv("DEV_SLACK_BOT_TOKEN", "xoxb-dev")
+    monkeypatch.setenv("DEV_SLACK_APP_TOKEN", "xapp-dev")
+    monkeypatch.delenv("CLAUDE_WORKSPACE", raising=False)
+    configs, _ = load_agents_config(str(path))
+    return configs[0]
+
+
+def test_patrol_labels_config_precedence_and_validation(tmp_path, monkeypatch):
+    cfg = _load(tmp_path, monkeypatch, "agents:\n  - name: dev\n    persona: x\n")
+    assert cfg.patrol_labels == []
+    cfg = _load(
+        tmp_path,
+        monkeypatch,
+        "defaults:\n  patrol_labels: [role:any]\n"
+        "agents:\n  - name: dev\n    persona: x\n    patrol_labels: role:dev\n",
+    )
+    assert cfg.patrol_labels == ["role:dev"]
+    with pytest.raises(RuntimeError, match="patrol_labels"):
+        _load(
+            tmp_path,
+            monkeypatch,
+            "agents:\n  - name: dev\n    persona: x\n    patrol_labels: [1]\n",
+        )
+
+
+def test_patrol_lists_only_issues_with_its_role_labels(tmp_path, monkeypatch):
+    import asyncio
+
+    import multi_app
+
+    agent, _turns, _posts = _patrol_agent(tmp_path, monkeypatch)
+    agent.cfg.patrol_labels = ["role:dev"]
+    calls: list[list[str]] = []
+
+    async def fake_run(cmd, *, cwd, timeout):
+        calls.append(cmd)
+        return 0, json.dumps([{"number": 9, "title": "b"}, {"number": 4, "title": "a"}]), ""
+
+    monkeypatch.setattr(multi_app, "run_host_command", fake_run)
+    issues = asyncio.run(agent._patrol_candidates(REPO, agent.cfg))
+    assert [item["number"] for item in issues] == [4, 9]
+    [cmd] = calls
+    labels = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--label"]
+    assert labels == ["status:todo", "role:dev"]
+
+
+def test_issue_list_cache_singleflight_ttl_and_failures():
+    import asyncio
+
+    from multi_app import IssueListCache
+
+    clock = [0.0]
+    cache = IssueListCache(ttl_seconds=60, clock=lambda: clock[0])
+    fetches: list[int] = []
+
+    async def fetch():
+        fetches.append(1)
+        await asyncio.sleep(0)
+        return [{"number": 1}]
+
+    async def scenario():
+        first, second = await asyncio.gather(
+            cache.get(("r", ()), fetch), cache.get(("r", ()), fetch)
+        )
+        assert first == second == [{"number": 1}]
+        assert len(fetches) == 1  # concurrent callers share one listing
+        await cache.get(("r", ()), fetch)
+        assert len(fetches) == 1  # warm
+        clock[0] = 61
+        await cache.get(("r", ()), fetch)
+        assert len(fetches) == 2  # expired
+        cache.invalidate(("r", ()))
+        await cache.get(("r", ()), fetch)
+        assert len(fetches) == 3
+
+        async def broken():
+            raise RuntimeError("gh down")
+
+        with pytest.raises(RuntimeError):
+            await cache.get(("other", ()), broken)
+        assert await cache.get(("other", ()), fetch) == [{"number": 1}]
+
+    asyncio.run(scenario())
+
+
+def test_claim_ref_gc_runs_at_most_hourly_per_repo(tmp_path, monkeypatch):
+    import asyncio
+
+    import multi_app
+
+    agent, _turns, _posts = _patrol_agent(tmp_path, monkeypatch)
+    monkeypatch.setattr(multi_app, "_CLAIM_GC_LAST_RUN", {})
+    runs: list[str] = []
+
+    async def claim_tool(action, *, repo, issue=None, config):
+        runs.append(action)
+        return {"status": "ok", "deleted": []}
+
+    agent._run_claim_tool = claim_tool
+    asyncio.run(agent._maybe_gc_claim_refs(REPO, agent.cfg))
+    asyncio.run(agent._maybe_gc_claim_refs(REPO, agent.cfg))
+    assert runs == ["gc"]
+
+
+def test_claude_turns_carry_guard_env_and_deny_merge(tmp_path, monkeypatch):
+    import asyncio
+
+    import multi_app
+
+    agent, _turns, _posts = _patrol_agent(tmp_path, monkeypatch)
+    captured = []
+
+    async def fake_query(*, prompt, options):
+        captured.append(options)
+        if False:
+            yield None
+
+    monkeypatch.setattr(multi_app, "query", fake_query)
+    agent._thread_permalinks["C1:1.0"] = "https://acme.slack.com/archives/C1/p1"
+    plan = agent.build_execution_plan(
+        {"channel": "C1", "ts": "1.0", "thread_ts": "1.0", "text": "x", "user": "U1"}
+    )
+
+    async def scenario():
+        token = multi_app._CURRENT_EXECUTION_PLAN.set(plan)
+        try:
+            await agent._run_claude("p", "C1:1.0", (0, 0))
+        finally:
+            multi_app._CURRENT_EXECUTION_PLAN.reset(token)
+
+    asyncio.run(scenario())
+    [options] = captured
+    assert "Bash(gh pr merge:*)" in options.disallowed_tools
+    assert options.env["PATH"].startswith(multi_app.AGENT_GUARD_BIN)
+    assert options.env["SLACK_AGENT_THREAD_URL"].endswith("/p1")
+
+
+def test_codex_turns_run_with_guard_path(tmp_path, monkeypatch):
+    import asyncio
+
+    import multi_app
+
+    agent, _turns, _posts = _patrol_agent(tmp_path, monkeypatch)
+    seen = {}
+
+    class Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return b'{"type":"turn.completed","usage":{}}', b""
+
+    async def fake_create(*_args, **kwargs):
+        seen.update(kwargs)
+        return Proc()
+
+    monkeypatch.setattr(multi_app.asyncio, "create_subprocess_exec", fake_create)
+    asyncio.run(agent._run_codex_exec("p", None))
+    assert seen["env"]["PATH"].startswith(multi_app.AGENT_GUARD_BIN)
+    assert seen["env"]["SLACK_AGENT_REAL_GIT"]
+
+
+def test_thread_permalink_is_fetched_once(tmp_path, monkeypatch):
+    import asyncio
+
+    agent, _turns, _posts = _patrol_agent(tmp_path, monkeypatch)
+    calls = []
+
+    class Client:
+        async def chat_getPermalink(self, **kwargs):
+            calls.append(kwargs)
+            return {"permalink": "https://acme.slack.com/archives/C1/p100"}
+
+    for _ in range(2):
+        asyncio.run(
+            agent._remember_thread_permalink(Client(), "C1", "100.0", "C1:100.0")
+        )
+    assert len(calls) == 1
+    assert agent._thread_permalinks["C1:100.0"].endswith("/p100")
+
+
+def test_system_prompt_says_humans_merge(tmp_path, monkeypatch):
+    agent, _turns, _posts = _patrol_agent(tmp_path, monkeypatch)
+    prompt = agent._system_prompt()
+    assert "PR のマージは人間だけが行う" in prompt
+    assert "open-pr --repo acme/widgets --issue <number>" in prompt
+    assert "PR をマージ" not in prompt
+    assert "gh issue close" not in prompt
+    assert "手でラベルを変更しない" in prompt

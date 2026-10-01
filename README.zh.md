@@ -16,6 +16,7 @@
 | `multi_core.py` | 纯逻辑层（不依赖 slack/claude 包） |
 | `state_store.py` | SQLite 线程状态持久化（会话/交接摘要跨重启保留） |
 | `issue_claim.py` | 宿主侧 GitHub issue 认领工具（v2 租约：`claim` / `renew` / `release` / `verify`） |
+| `agent_guard.py`, `agent_guard_bin/` | agent PATH 上的 `gh` / `git` 守卫：agent 只开 PR，合并由人来做 |
 | `agents.yaml` | agent 定义（`card` / persona、所有者、节点、项目） |
 | `agents.distributed.example.yaml` | 两人 × 每人两个本地 agent 的分布式示例 |
 | `slack-app-manifest-agent.yaml` | 每个 agent 一份的 Slack App manifest 模板 |
@@ -618,7 +619,11 @@ Git 纪律（在 system prompt 中）：
 
 ### 巡检（Patrol）
 
-Agent 可周期性扫描 `status:todo` issue，原子创建 issue 专属 Git-ref 租约后认领一件并推进。租约协议由 `issue_claim.py` 执行（`claim` / `renew` / `release` / `verify`，输出一个 JSON 结论，只有 `claimed` / `renewed` 代表拥有），不再交给模型手动执行：巡检由宿主先列出 todo issue 并认领最早可认领的一件，空闲轮不消耗任何 provider 回合；回合工作期间由宿主续租，续租失败或结果未知会取消该回合。交互回合调用同一个工具；ref 和 marker 格式不变，仍可与旧的 prompt 驱动协议节点混跑。租约为 30 分钟，至少每 15 分钟续约；仅当 GitHub 服务端 `Date` 已超过到期时间加 5 分钟宽限期时，才允许 stale takeover。创建、续约、接管和释放都使用 `--force-with-lease`，条件必须是 ref 不存在或等于已观测 SHA。开工前必须重读并确认 ref、metadata commit、marker comment 的 issue/agent/node/nonce/时间/SHA 完全一致。读取失败、marker 缺失或不匹配、命令失败、超时及结果不确定一律 fail-closed。运维恢复 stale ref 时也必须基于已观测 SHA 条件写，禁止无条件删除。共享 GitHub assignee 不代表所有权。
+Agent 可周期性扫描 `status:todo` issue，原子创建 issue 专属 Git-ref 租约后认领一件并推进。租约协议由 `issue_claim.py` 执行（`claim` / `renew` / `release` / `verify`，输出一个 JSON 结论，只有 `claimed` / `renewed` 代表拥有），不再交给模型手动执行：巡检由宿主先列出 todo issue 并认领最早可认领的一件，空闲轮不消耗任何 provider 回合；回合工作期间由宿主续租，续租失败或结果未知会取消该回合。交互回合调用同一个工具；ref 和 marker 格式不变，仍可与旧的 prompt 驱动协议节点混跑。
+
+**看板状态和交接都由工具负责。** `claim` 把 issue 从 `status:todo` 改为 `status:in-progress`；`open-pr --title … --body-file …` 先确认工作分支已 push，再创建带 `Closes #N` 和 Slack 线程链接的 PR，把 issue 改为 `status:in-review` 并释放认领；`release`（中途放弃）把未完成的 issue 改回 `status:todo`。认领提交带 `[skip ci]`，巡检会按 SHA 条件删除已关闭 issue 的 claim ref（最多每小时一次）。每个 agent 可配置 `patrol_labels`（如 `[role:dev]`，agent → defaults → 不限），巡检只认领带这些标签的 issue；同一节点的 agent 共用一份缓存 60 秒的 issue 列表。
+
+**agent 不能合并。** 合并只由人来做：agent 运行时的 PATH 最前面是 `agent_guard_bin/`，其中的 `gh` / `git` 守卫会拒绝 `gh pr merge`（含 `--auto`）、REST/GraphQL 合并 API、gh 别名，以及 push 到受保护分支（`AGENT_PROTECTED_BRANCHES`，默认 `main,master`）；Claude 回合还额外禁用 `Bash(gh pr merge:*)`。这是共用 GitHub 身份下的防护栏，不是安全边界——真正的边界请开启分支保护（要求 review），并让 agent 使用没有合并权限的 GitHub 身份。租约为 30 分钟，至少每 15 分钟续约；仅当 GitHub 服务端 `Date` 已超过到期时间加 5 分钟宽限期时，才允许 stale takeover。创建、续约、接管和释放都使用 `--force-with-lease`，条件必须是 ref 不存在或等于已观测 SHA。开工前必须重读并确认 ref、metadata commit、marker comment 的 issue/agent/node/nonce/时间/SHA 完全一致。读取失败、marker 缺失或不匹配、命令失败、超时及结果不确定一律 fail-closed。运维恢复 stale ref 时也必须基于已观测 SHA 条件写，禁止无条件删除。共享 GitHub assignee 不代表所有权。
 
 巡检使用 epoch 对齐的绝对 deadline，以及所有节点一致、稳定排序的 logical-agent roster；不同节点会得到同一 wall-clock schedule，长任务结束后跳过错过周期，不做追赶式突发。启用 GitHub 时，workspace 的每一条 `origin` fetch/push URL 都必须匹配配置的 canonical `OWNER/REPO`，否则该 workspace 的 GitHub workflow 与巡检会被禁用；租约 CAS push 不使用可变 remote 名，而固定推送到显式 canonical `https://github.com/OWNER/REPO.git`，因此须先配置非交互 HTTPS 认证（例如 `gh auth setup-git`）。巡检与 Slack 回合共用 node concurrency limiter 和 realpath workspace lock。空闲轮次输出 `PATROL_IDLE`（不发帖）。
 
