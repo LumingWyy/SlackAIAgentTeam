@@ -70,6 +70,8 @@ class FakeGitHub:
             return 0, "main\n", ""
         if args[:2] == ["pr", "create"]:
             head = args[args.index("--head") + 1]
+            if "pr-url" in self.fail:
+                return 0, "", ""
             if head in self.prs:
                 return 1, "", "a pull request for branch already exists"
             url = f"https://github.com/{REPO}/pull/{len(self.prs) + 1}"
@@ -77,7 +79,15 @@ class FakeGitHub:
             self.pr_bodies[head] = args[args.index("--body") + 1]
             return 0, url + "\n", ""
         if args[:2] == ["pr", "view"]:
-            return 0, self.prs[args[2]] + "\n", ""
+            if "pr-view" in self.fail:
+                return 1, "", "HTTP 502"
+            head = args[2]
+            return 0, json.dumps({"url": self.prs[head], "body": self.pr_bodies.get(head, "")}), ""
+        if args[:2] == ["pr", "edit"]:
+            if "pr-edit" in self.fail:
+                return 1, "", "HTTP 422"
+            self.pr_bodies[args[2]] = args[args.index("--body") + 1]
+            return 0, "", ""
         raise AssertionError(f"unexpected gh call {args}")
 
     def _gh(self, args):
@@ -473,7 +483,7 @@ def test_patrol_claims_first_claimable_issue_then_works(tmp_path, monkeypatch):
     async def candidates(*_args):
         return [{"number": 3, "title": "taken"}, {"number": 5, "title": "Add CSV export"}]
 
-    async def claim_tool(action, *, repo, issue, config):
+    async def claim_tool(action, *, repo, issue, config, stale_only=False):
         attempts.append(issue)
         if issue == 3:
             return {"status": "failed", "reason": "held by qa"}
@@ -687,15 +697,74 @@ def test_open_pr_requires_holding_the_claim():
     assert github.prs == {}
 
 
-def test_open_pr_reuses_an_existing_pr():
+def test_open_pr_reuses_an_existing_pr_and_adds_the_closing_reference():
     github = FakeGitHub()
     claimer = _claimer(github)
     claimer.claim(7, "dev", "n1")
     github.remote_branches[github.branch] = github.head_sha
     github.prs[github.branch] = f"https://github.com/{REPO}/pull/9"
-    result = claimer.open_pr(7, "dev", "n1", title="t", body="b")
+    github.pr_bodies[github.branch] = "Earlier description"
+    result = claimer.open_pr(
+        7, "dev", "n1", title="t", body="b",
+        thread_url="https://acme.slack.com/archives/C1/p100",
+    )
     assert result["status"] == "opened"
     assert result["pr_url"].endswith("/pull/9")
+    body = github.pr_bodies[github.branch]
+    assert body.startswith("Earlier description")
+    assert "Closes #7" in body and "archives/C1/p100" in body
+
+
+def test_open_pr_keeps_claim_when_existing_pr_cannot_close_the_issue():
+    for failure in ("pr-view", "pr-edit"):
+        github = FakeGitHub()
+        claimer = _claimer(github)
+        claimer.claim(7, "dev", "n1")
+        github.remote_branches[github.branch] = github.head_sha
+        github.prs[github.branch] = f"https://github.com/{REPO}/pull/9"
+        github.fail.add(failure)
+        result = claimer.open_pr(7, "dev", "n1", title="t", body="b")
+        assert result["status"] == "failed", failure
+        assert "claim kept" in result["reason"]
+        assert 7 in github.refs
+        assert "status:in-review" not in github.labels.get(7, set())
+
+
+def test_open_pr_without_a_known_url_keeps_the_claim():
+    github = FakeGitHub()
+    claimer = _claimer(github)
+    claimer.claim(7, "dev", "n1")
+    github.remote_branches[github.branch] = github.head_sha
+    github.fail.add("pr-url")
+    result = claimer.open_pr(7, "dev", "n1", title="t", body="b")
+    assert result["status"] == "failed"
+    assert 7 in github.refs
+
+
+def test_stale_only_claim_needs_a_lapsed_claim():
+    github = FakeGitHub()
+    # A human marked it in-progress without any claim ref: leave it alone.
+    result = _claimer(github).claim(7, "dev", "n1", stale_only=True)
+    assert result["status"] == "failed"
+    assert 7 not in github.refs
+    # A claim that lapsed past the grace period is taken over.
+    github = FakeGitHub(now=T0 + timedelta(seconds=2101))
+    _seed_claim(github, 7, "qa", "n2", now=T0)
+    assert _claimer(github).claim(7, "dev", "n1", stale_only=True)["status"] == "claimed"
+
+
+def test_claim_tool_cli_passes_stale_only(monkeypatch, capsys):
+    import issue_claim
+
+    seen = {}
+
+    def fake_run(action, **kwargs):
+        seen.update(kwargs, action=action)
+        return {"status": "failed", "issue": 7}
+
+    monkeypatch.setattr(issue_claim, "run_operation", fake_run)
+    issue_claim.main(["claim", "--repo", REPO, "--issue", "7", "--agent", "dev", "--stale-only"])
+    assert seen["action"] == "claim" and seen["stale_only"] is True
 
 
 def test_gc_deletes_claim_refs_of_closed_issues_only():
@@ -752,16 +821,28 @@ def test_patrol_lists_only_issues_with_its_role_labels(tmp_path, monkeypatch):
     agent.cfg.patrol_labels = ["role:dev"]
     calls: list[list[str]] = []
 
+    listings = {
+        "status:todo": [{"number": 9, "title": "b"}, {"number": 4, "title": "a"}],
+        "status:in-progress": [{"number": 2, "title": "lapsed"}, {"number": 9, "title": "b"}],
+    }
+
     async def fake_run(cmd, *, cwd, timeout):
         calls.append(cmd)
-        return 0, json.dumps([{"number": 9, "title": "b"}, {"number": 4, "title": "a"}]), ""
+        status = cmd[cmd.index("--label") + 1]
+        return 0, json.dumps(listings[status]), ""
 
     monkeypatch.setattr(multi_app, "run_host_command", fake_run)
     issues = asyncio.run(agent._patrol_candidates(REPO, agent.cfg))
-    assert [item["number"] for item in issues] == [4, 9]
-    [cmd] = calls
-    labels = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--label"]
-    assert labels == ["status:todo", "role:dev"]
+    # Todo first, then in-progress issues that only a lapsed claim may yield.
+    assert [item["number"] for item in issues] == [4, 9, 2]
+    assert [bool(item.get("stale_only")) for item in issues] == [False, False, True]
+    for cmd in calls:
+        labels = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "--label"]
+        assert labels[1:] == ["role:dev"]
+    assert {cmd[cmd.index("--label") + 1] for cmd in calls} == {
+        "status:todo",
+        "status:in-progress",
+    }
 
 
 def test_issue_list_cache_singleflight_ttl_and_failures():

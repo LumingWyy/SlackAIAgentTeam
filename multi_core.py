@@ -1097,20 +1097,12 @@ _GIT_PUSH_OPTIONS_WITH_VALUE = frozenset(
 )
 
 
-def git_push_protected_targets(
-    args: list[str],
-    *,
-    current_branch: str,
-    protected: Iterable[str],
-) -> list[str]:
-    """Protected branches a ``git ... push ...`` invocation would update.
+def _git_push_plan(args: list[str]) -> tuple[bool, list[str]] | None:
+    """``(updates_everything, targets)`` of a push; None when not a push.
 
-    Pushing straight to the default branch is a merge by another name, so
-    it is blocked like ``gh pr merge``. ``--all`` / ``--mirror`` update every
-    branch. A refspec of ``HEAD`` (or no refspec) means the current branch.
-    Non-push invocations return [].
+    ``targets`` are destination names as written, with ``HEAD`` standing for
+    the current branch (an empty refspec list pushes the current branch).
     """
-    guarded = {branch for branch in protected if branch}
     index = 0
     while index < len(args):
         arg = args[index]
@@ -1122,7 +1114,7 @@ def git_push_protected_targets(
             continue
         break
     if index >= len(args) or args[index] != "push":
-        return []
+        return None
     positional: list[str] = []
     everything = False
     deleting = False
@@ -1143,31 +1135,59 @@ def git_push_protected_targets(
             skip = True
         elif not arg.startswith("-"):
             positional.append(arg)
-    if everything:
-        return sorted(guarded)
     refspecs = positional[1:]
     if not refspecs:
-        targets = [current_branch]
-    else:
-        targets = []
-        pending_tag = False
-        for spec in refspecs:
-            if pending_tag:
-                pending_tag = False
-                continue
-            if spec == "tag":
-                pending_tag = True
-                continue
-            spec = spec.lstrip("+")
-            source, _, destination = spec.partition(":")
-            target = destination if ":" in spec else source
-            if deleting and ":" not in spec:
-                target = spec
-            if target == "HEAD" or (not target and source == "HEAD"):
-                target = current_branch
-            targets.append(target)
+        return everything, ["HEAD"]
+    targets: list[str] = []
+    pending_tag = False
+    for spec in refspecs:
+        if pending_tag:
+            pending_tag = False
+            continue
+        if spec == "tag":
+            pending_tag = True
+            continue
+        spec = spec.lstrip("+")
+        source, _, destination = spec.partition(":")
+        target = destination if ":" in spec else source
+        if deleting and ":" not in spec:
+            target = spec
+        if not target and source == "HEAD":
+            target = "HEAD"
+        targets.append(target)
+    return everything, targets
+
+
+def git_push_targets_current_branch(args: list[str]) -> bool:
+    """Whether a push's destination depends on the current branch."""
+    plan = _git_push_plan(args)
+    return bool(plan) and not plan[0] and "HEAD" in plan[1]
+
+
+def git_push_protected_targets(
+    args: list[str],
+    *,
+    current_branch: str,
+    protected: Iterable[str],
+) -> list[str]:
+    """Protected branches a ``git ... push ...`` invocation would update.
+
+    Pushing straight to the default branch is a merge by another name, so
+    it is blocked like ``gh pr merge``. ``--all`` / ``--mirror`` update every
+    branch. A refspec of ``HEAD`` (or no refspec) means the current branch.
+    Non-push invocations return [].
+    """
+    guarded = {branch for branch in protected if branch}
+    plan = _git_push_plan(args)
+    if plan is None:
+        return []
+    everything, targets = plan
+    if everything:
+        return sorted(guarded)
     hits: list[str] = []
     for target in targets:
+        if target == "HEAD":
+            target = current_branch
         name = target[len("refs/heads/") :] if target.startswith("refs/heads/") else target
         if name.startswith("refs/"):
             continue

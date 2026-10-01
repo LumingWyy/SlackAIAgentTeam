@@ -86,6 +86,7 @@ from multi_core import (
     flatten_event_text,
     format_github_claim_protocol,
     format_plain_mention_notice,
+    STATUS_IN_PROGRESS_LABEL,
     STATUS_TODO_LABEL,
     format_rate_limit_notice,
     is_rate_limit_signal,
@@ -6162,9 +6163,12 @@ class SlackAgent:
         repo: str,
         issue: int | None = None,
         config: AgentConfig | ExecutionConfig,
+        stale_only: bool = False,
     ) -> dict:
         """Run issue_claim.py; any failure to get a verdict is ``unknown``."""
         cmd = [sys.executable, ISSUE_CLAIM_TOOL, action, "--repo", repo]
+        if stale_only:
+            cmd.append("--stale-only")
         if issue is not None:
             cmd += [
                 "--issue",
@@ -6209,16 +6213,8 @@ class SlackAgent:
         Shared through the node-wide cache; a gh failure raises.
         """
 
-        async def fetch() -> list[dict]:
-            cmd = [
-                "gh",
-                "issue",
-                "list",
-                "--repo",
-                repo,
-                "--label",
-                STATUS_TODO_LABEL,
-            ]
+        async def list_status(status: str) -> list[dict]:
+            cmd = ["gh", "issue", "list", "--repo", repo, "--label", status]
             for label in config.patrol_labels:
                 cmd += ["--label", label]
             cmd += [
@@ -6240,12 +6236,27 @@ class SlackAgent:
                 raise RuntimeError(
                     "gh issue list returned malformed JSON"
                 ) from exc
-            candidates = [
-                item
-                for item in issues
-                if isinstance(item, dict) and isinstance(item.get("number"), int)
+            return sorted(
+                (
+                    item
+                    for item in issues
+                    if isinstance(item, dict)
+                    and isinstance(item.get("number"), int)
+                ),
+                key=lambda item: item["number"],
+            )
+
+        async def fetch() -> list[dict]:
+            # Todo first; then in-progress issues, which only a lapsed claim
+            # (an agent that never released) may hand over (stale_only).
+            todo = await list_status(STATUS_TODO_LABEL)
+            seen = {item["number"] for item in todo}
+            lapsed = [
+                dict(item, stale_only=True)
+                for item in await list_status(STATUS_IN_PROGRESS_LABEL)
+                if item["number"] not in seen
             ]
-            return sorted(candidates, key=lambda item: item["number"])
+            return todo + lapsed
 
         return await self._issue_list_cache.get(
             self._patrol_list_key(repo, config), fetch
@@ -6275,7 +6286,11 @@ class SlackAgent:
             :PATROL_CLAIM_ATTEMPTS
         ]:
             result = await self._run_claim_tool(
-                "claim", repo=repo, issue=candidate["number"], config=config
+                "claim",
+                repo=repo,
+                issue=candidate["number"],
+                config=config,
+                stale_only=bool(candidate.get("stale_only")),
             )
             if result.get("status") == "claimed":
                 # The claim moved it out of status:todo for every local agent.

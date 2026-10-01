@@ -619,7 +619,7 @@ Git 纪律（在 system prompt 中）：
 
 ### 巡检（Patrol）
 
-Agent 可周期性扫描 `status:todo` issue，原子创建 issue 专属 Git-ref 租约后认领一件并推进。租约协议由 `issue_claim.py` 执行（`claim` / `renew` / `release` / `verify`，输出一个 JSON 结论，只有 `claimed` / `renewed` 代表拥有），不再交给模型手动执行：巡检由宿主先列出 todo issue 并认领最早可认领的一件，空闲轮不消耗任何 provider 回合；回合工作期间由宿主续租，续租失败或结果未知会取消该回合。交互回合调用同一个工具；ref 和 marker 格式不变，仍可与旧的 prompt 驱动协议节点混跑。
+Agent 可周期性扫描 `status:todo` issue，原子创建 issue 专属 Git-ref 租约后认领一件并推进。租约协议由 `issue_claim.py` 执行（`claim` / `renew` / `release` / `verify`，输出一个 JSON 结论，只有 `claimed` / `renewed` 代表拥有），不再交给模型手动执行：巡检由宿主先列出 todo issue 并认领最早可认领的一件，空闲轮不消耗任何 provider 回合（也会检查 `status:in-progress` 的 issue，但只接手认领已过期的；没有 claim ref 的 in-progress issue 不会动）；回合工作期间由宿主续租，续租失败或结果未知会取消该回合。交互回合调用同一个工具；ref 和 marker 格式不变，仍可与旧的 prompt 驱动协议节点混跑。
 
 **看板状态和交接都由工具负责。** `claim` 把 issue 从 `status:todo` 改为 `status:in-progress`；`open-pr --title … --body-file …` 先确认工作分支已 push，再创建带 `Closes #N` 和 Slack 线程链接的 PR，把 issue 改为 `status:in-review` 并释放认领；`release`（中途放弃）把未完成的 issue 改回 `status:todo`。认领提交带 `[skip ci]`，巡检会按 SHA 条件删除已关闭 issue 的 claim ref（最多每小时一次）。每个 agent 可配置 `patrol_labels`（如 `[role:dev]`，agent → defaults → 不限），巡检只认领带这些标签的 issue；同一节点的 agent 共用一份缓存 60 秒的 issue 列表。
 

@@ -20,7 +20,12 @@ from multi_core import (
     DEFAULT_PROTECTED_BRANCHES,
     gh_merge_violation,
     git_push_protected_targets,
+    git_push_targets_current_branch,
 )
+
+# Global options that choose which repository git runs in; their values may
+# be separate arguments (``--git-dir DIR``) or attached (``--git-dir=DIR``).
+_REPO_OPTIONS = ("-C", "--git-dir", "--work-tree")
 
 
 def _real_binary(name: str) -> str:
@@ -38,13 +43,20 @@ def _protected_branches() -> list[str]:
 
 
 def _current_branch(real_git: str, args: list[str]) -> str:
-    """Current branch of the repository the push runs in (honors -C)."""
+    """Current branch of the repository the push runs in; "" when unknown.
+
+    Forwards only the options that locate the repository, so the answer
+    describes the same repository the push would use.
+    """
     cmd = [real_git]
     index = 0
     while index < len(args) and args[index] != "push":
         arg = args[index]
-        if arg == "-C" and index + 1 < len(args):
-            cmd += ["-C", args[index + 1]]
+        if arg in _REPO_OPTIONS and index + 1 < len(args):
+            cmd += [arg, args[index + 1]]
+            index += 2
+            continue
+        if arg == "-c" and index + 1 < len(args):
             index += 2
             continue
         if arg.startswith(("--git-dir=", "--work-tree=")):
@@ -56,7 +68,9 @@ def _current_branch(real_git: str, args: list[str]) -> str:
         text=True,
         check=False,
     )
-    return proc.stdout.strip() if proc.returncode == 0 else ""
+    branch = proc.stdout.strip() if proc.returncode == 0 else ""
+    # a detached HEAD has no branch name either
+    return "" if branch == "HEAD" else branch
 
 
 def violation(tool: str, args: list[str]) -> str:
@@ -64,9 +78,16 @@ def violation(tool: str, args: list[str]) -> str:
     if tool == "gh":
         return gh_merge_violation(args)
     if tool == "git":
+        current = _current_branch(_real_binary("git"), args)
+        if not current and git_push_targets_current_branch(args):
+            # fail closed: the target cannot be checked, so name it explicitly
+            return (
+                "cannot resolve the current branch for this push; "
+                "push an explicit work branch (git push origin <branch>)"
+            )
         hits = git_push_protected_targets(
             args,
-            current_branch=_current_branch(_real_binary("git"), args),
+            current_branch=current,
             protected=_protected_branches(),
         )
         if hits:

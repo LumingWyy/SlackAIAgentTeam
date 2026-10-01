@@ -362,11 +362,21 @@ class IssueClaimer:
 
     # -- operations ----------------------------------------------------------
 
-    def claim(self, issue: int, agent: str, node: str) -> dict:
+    def claim(
+        self, issue: int, agent: str, node: str, *, stale_only: bool = False
+    ) -> dict:
+        """Claim ``issue``. ``stale_only`` only takes over an existing claim.
+
+        Patrol uses ``stale_only`` for status:in-progress issues: one whose
+        claim lapsed (its agent never released it) is recovered, while one a
+        human marked in-progress without any claim ref is left alone.
+        """
         now = self.server_now()
         ref_sha = self.read_ref(issue)
         expected = ""
         claimed_at = ""
+        if stale_only and not ref_sha:
+            return _result("failed", issue, reason="no lapsed claim to take over")
         if ref_sha:
             fields, reason = self._evaluate(issue, ref_sha)
             if fields is None:
@@ -545,13 +555,15 @@ class IssueClaimer:
         if rc == 0:
             pr_url = out.strip().splitlines()[-1] if out.strip() else ""
         elif "already exists" in f"{err}{out}":
-            rc, out, _err = self._run(
-                ["gh", "pr", "view", branch, "--repo", self.repo, "--json", "url",
-                 "--jq", ".url"]
-            )
-            pr_url = out.strip() if rc == 0 else ""
+            failure = self._link_existing_pr(issue, branch, thread_url)
+            if isinstance(failure, dict):
+                return failure
+            pr_url = failure
         else:
             return _result("failed", issue, reason="gh pr create failed")
+        if not pr_url:
+            # without a known PR the hand-off is unproven: keep the claim
+            return _result("failed", issue, reason="PR URL is unknown; claim kept")
         result = _result("opened", issue, ref_sha=ref_sha)
         result["pr_url"] = pr_url
         result["labels"] = self._edit_labels(
@@ -562,6 +574,44 @@ class IssueClaimer:
         # The work is handed off: free the ref instead of letting it go stale.
         result["released"] = self._push(issue, ref_sha, None)
         return result
+
+    def _link_existing_pr(
+        self, issue: int, branch: str, thread_url: str
+    ) -> str | dict:
+        """URL of the branch's open PR, made to close ``issue`` on merge.
+
+        Returns a failed result (claim kept) when the PR cannot be read or
+        its body cannot be given the closing reference.
+        """
+        rc, out, _err = self._run(
+            ["gh", "pr", "view", branch, "--repo", self.repo, "--json", "url,body"]
+        )
+        if rc != 0:
+            return _result("failed", issue, reason="existing PR read failed; claim kept")
+        try:
+            existing = json.loads(out)
+            pr_url = str(existing["url"] or "")
+            body = str(existing.get("body") or "")
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return _result(
+                "failed", issue, reason="existing PR response is malformed; claim kept"
+            )
+        closing = f"Closes #{int(issue)}"
+        additions = [] if closing in body else [closing]
+        if thread_url and thread_url not in body:
+            additions.append(f"Slack thread: {thread_url}")
+        if additions:
+            new_body = (body.rstrip() + "\n\n" + "\n".join(additions)).lstrip()
+            rc, _out, _err = self._run(
+                ["gh", "pr", "edit", branch, "--repo", self.repo, "--body", new_body]
+            )
+            if rc != 0:
+                return _result(
+                    "failed",
+                    issue,
+                    reason="could not add the closing reference to the existing PR; claim kept",
+                )
+        return pr_url
 
     def gc(self) -> dict:
         """Conditionally delete claim refs whose issue is already closed."""
@@ -629,6 +679,10 @@ def run_operation(
             return claimer.gc()
         if action == "open-pr":
             return claimer.open_pr(int(issue), agent, node, **pr_options)
+        if action == "claim":
+            return claimer.claim(
+                int(issue), agent, node, stale_only=bool(pr_options.get("stale_only"))
+            )
         operation = getattr(claimer, action)
         return operation(int(issue), agent, node)
     except ClaimUnknown as exc:
@@ -651,10 +705,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--body", default="")
     parser.add_argument("--body-file")
     parser.add_argument("--draft", action="store_true")
+    parser.add_argument(
+        "--stale-only",
+        action="store_true",
+        help="claim: only take over an existing lapsed claim",
+    )
     args = parser.parse_args(argv)
     if args.action != "gc" and (args.issue is None or not args.agent):
         parser.error(f"{args.action} requires --issue and --agent")
     pr_options: dict[str, object] = {}
+    if args.action == "claim" and args.stale_only:
+        pr_options = {"stale_only": True}
     if args.action == "open-pr":
         body = args.body
         if args.body_file:

@@ -71,22 +71,29 @@ def test_git_push_protected_targets(args, current, expected):
     )
 
 
-def _fake_binary(tmp_path, name):
-    """A stand-in real binary that records its argv and exits 0."""
+def _fake_binary(tmp_path, name, branch="feature"):
+    """A stand-in real binary that records its argv and exits 0.
+
+    ``rev-parse`` (after any repository options) prints ``branch``, or fails
+    when ``branch`` is empty; every rev-parse argv is logged too.
+    """
     log = tmp_path / f"{name}.log"
+    probes = tmp_path / f"{name}.probes"
     path = tmp_path / f"real-{name}"
+    answer = f"echo {branch}; exit 0" if branch else "exit 128"
     path.write_text(
         "#!/bin/sh\n"
-        f'if [ "$1" = "rev-parse" ]; then echo feature; exit 0; fi\n'
+        'for a in "$@"; do if [ "$a" = "rev-parse" ]; then '
+        f'echo "$@" >> "{probes}"; {answer}; fi; done\n'
         f'echo "$@" >> "{log}"\n'
     )
     path.chmod(path.stat().st_mode | stat.S_IEXEC)
     return str(path), log
 
 
-def _run_shim(tmp_path, tool, args):
+def _run_shim(tmp_path, tool, args, branch="feature"):
     real_gh, gh_log = _fake_binary(tmp_path, "gh")
-    real_git, git_log = _fake_binary(tmp_path, "git")
+    real_git, git_log = _fake_binary(tmp_path, "git", branch)
     env = {
         **os.environ,
         "PATH": GUARD_BIN + os.pathsep + os.environ.get("PATH", ""),
@@ -145,3 +152,35 @@ def test_agent_env_puts_guard_first_and_finds_real_binaries(monkeypatch):
         "PATH", multi_app.AGENT_GUARD_BIN + os.pathsep + os.environ["PATH"]
     )
     assert "agent_guard_bin" not in multi_app._real_binary("git")
+
+
+def test_git_shim_reads_the_branch_of_the_repository_being_pushed(tmp_path):
+    proc, _log = _run_shim(
+        tmp_path, "git", ["--git-dir", "/other/.git", "-c", "x.y=z", "push"], branch="main"
+    )
+    assert proc.returncode == 1
+    probes = (tmp_path / "git.probes").read_text()
+    assert "--git-dir /other/.git rev-parse" in probes
+    assert "x.y=z" not in probes
+
+
+def test_git_shim_refuses_implicit_push_when_branch_is_unknown(tmp_path):
+    proc, log = _run_shim(tmp_path, "git", ["push"], branch="")
+    assert proc.returncode == 1
+    assert "cannot resolve the current branch" in proc.stderr
+    assert log == ""
+    # An explicit target does not need the current branch.
+    proc, log = _run_shim(tmp_path, "git", ["push", "origin", "feature"], branch="")
+    assert proc.returncode == 0
+    assert log.strip() == "push origin feature"
+
+
+def test_push_target_dependency_on_current_branch():
+    from multi_core import git_push_targets_current_branch
+
+    assert git_push_targets_current_branch(["push"])
+    assert git_push_targets_current_branch(["push", "origin", "HEAD"])
+    assert git_push_targets_current_branch(["push", "origin", "HEAD:refs/heads/x"]) is False
+    assert git_push_targets_current_branch(["push", "origin", "feature"]) is False
+    assert git_push_targets_current_branch(["push", "--all", "origin"]) is False
+    assert git_push_targets_current_branch(["status"]) is False
