@@ -1875,6 +1875,19 @@ def test_guide_links_straight_to_slack_apps_and_the_setup_skill():
     assert "/slack-app-setup" in script
 
 
+def test_guide_walks_a_new_agent_into_slack_in_every_language():
+    """Creating, restarting, inviting and @mentioning a new agent are spelled out."""
+    html = webui.INDEX_HTML
+    steps = [f"guide.join.s{n}" for n in range(1, 8)]
+    for key in ("guide.join.title", "guide.join.sub", *steps, "guide.join.tip"):
+        assert f'data-i18n="{key}"' in html, key
+    script = _main_script(html)
+    for key in steps:
+        assert script.count(f"'{key}':") == 3, key
+    for needle in ("/invite @", "connections:write", "multi_app"):
+        assert script.count(needle) >= 3, needle
+
+
 def test_workspace_check_flags_a_repo_github_cannot_find(tmp_path, monkeypatch):
     _workspace_app(
         tmp_path, monkeypatch,

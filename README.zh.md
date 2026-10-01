@@ -188,6 +188,7 @@ make webui        # = .venv/bin/python webui.py → http://127.0.0.1:8765
 - 上手勾选进度只保存在当前浏览器，不上传服务器
 - 可直接复制频道规则、人类任务、结构化 `HANDOFF` 与 dev/reviewer/planner persona 模板
 - Agent 职责表明确区分本地工具 Agent 与没有本地文件工具的 OpenAI Agent
+- 把新 agent 加进 Slack：第 02 步给出完整流程（新增 agent → 创建并安装它的 Slack App → App-Level Token → 粘贴 token → 重启 multi_app → 在项目频道 `/invite @名字` → @ 它测试），并列出找不到它或不回复时的排查办法
 - 只有服务端要求认证（返回 401）时，页面顶部才出现控制令牌输入条；单机未启用控制认证时不会询问，静态指引本身也无需凭据
 
 **监控**（数据来自运行中的 `multi_app` 管理 API）

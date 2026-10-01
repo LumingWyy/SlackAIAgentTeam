@@ -200,6 +200,7 @@ Four tabs:
 - Browser-local progress checklist; no setup state is sent to the server
 - Copy-ready Slack channel rules, human task kickoff, structured `HANDOFF`, and dev/reviewer/planner persona templates
 - Agent responsibility matrix makes local-tool and OpenAI no-tool boundaries explicit
+- Adding an agent to Slack: step 02 walks a newly created agent in from start to finish (New agent → create and install its Slack App → App-Level Token → paste tokens → restart multi_app → `/invite @name` in the project channel → @mention test), with fixes for when it does not show up or answer
 - A control-token bar appears at the top only after the server answers 401; a single node without control auth never asks, and the static guide needs no credentials
 
 **Monitor** (data from running `multi_app` admin API)
