@@ -171,6 +171,28 @@ def test_issue_panel_renders_errors_beside_issues_and_shows_refresh_feedback():
         assert script.count(f"'{key}':") == 3, key
 
 
+def test_issues_mirror_startup_for_remote_and_openai_agents(monkeypatch):
+    """Remote entries and an optional OpenAI agent without key/base URL never start here."""
+    raw = {
+        "node": {"id": "n1"},
+        "agents": [
+            {"name": "dev", "node_id": "n1", "github_repo": "acme/live"},
+            {"name": "far", "node_id": "n2", "github_repo": "acme/remote"},
+            {"name": "ask", "node_id": "n1", "optional": True, "runtime": "openai",
+             "github_repo": "acme/openai"},
+        ],
+    }
+    tokens = {"ASK_SLACK_BOT_TOKEN": "x", "ASK_SLACK_APP_TOKEN": "y"}
+    for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "AGENT_NODE_ID"):
+        monkeypatch.delenv(name, raising=False)
+    fetch, _calls = _issues_fixture(monkeypatch, raw, env=tokens)
+    assert fetch()["repos"] == ["acme/live"]
+    fetch, _calls = _issues_fixture(
+        monkeypatch, raw, env={**tokens, "OPENAI_API_KEY": "sk-x"}
+    )
+    assert fetch()["repos"] == ["acme/live", "acme/openai"]
+
+
 def test_gh_issues_timeout_kills_and_reaps_process(monkeypatch):
     class Process:
         returncode = None

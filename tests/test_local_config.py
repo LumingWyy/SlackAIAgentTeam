@@ -68,3 +68,10 @@ def test_template_reviewer_writes_its_review_onto_the_pr():
     assert '"event": "COMMENT"' in persona
     assert "/replies" in persona  # re-review answers in the existing thread
     assert "Verdict: PASS" in persona and "Verdict: CHANGES REQUESTED" in persona
+
+
+def test_every_generated_agents_yaml_is_gitignored():
+    """AGENTS_CONFIG may point anywhere; a root-only pattern would miss it."""
+    lines = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "agents.yaml" in lines
+    assert "/agents.yaml" not in lines

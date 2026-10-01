@@ -1442,15 +1442,37 @@ async def _gh_issues(repo: str) -> tuple[list[dict], str]:
     return issues, ""
 
 
-def _skipped_optional_agent(
-    entry: dict[str, Any], defaults: dict[str, Any], env: dict[str, str]
+def _starts_on_this_node(
+    entry: dict[str, Any],
+    defaults: dict[str, Any],
+    env: dict[str, str],
+    local_names: set[str],
 ) -> bool:
-    """An optional agent missing a Slack token, which multi_app does not start."""
-    if not entry.get("optional"):
+    """Whether multi_app on this node would start ``entry`` (mirrors startup).
+
+    Remote entries never run here; an optional entry is skipped when a Slack
+    token, or an OpenAI runtime's key / base URL, is missing.
+    """
+    if entry.get("name") not in local_names:
         return False
-    return not all(
-        env.get(name) or os.environ.get(name)
-        for name in token_env_names(entry, defaults)
+    if not entry.get("optional"):
+        return True
+
+    def present(name: str) -> bool:
+        return bool(env.get(name) or os.environ.get(name))
+
+    if not all(present(name) for name in token_env_names(entry, defaults)):
+        return False
+    runtime = entry.get("runtime") or defaults.get("runtime") or "claude"
+    if runtime != "openai":
+        return True
+    key_env = (
+        entry.get("openai_api_key_env")
+        or defaults.get("openai_api_key_env")
+        or "OPENAI_API_KEY"
+    )
+    return present(key_env) or bool(
+        _resolve_openai_base_url(entry, defaults, env)
     )
 
 
@@ -1466,13 +1488,14 @@ async def h_issues(request: web.Request) -> web.Response:
         raw = read_yaml()
         defaults = raw.get("defaults") or {}
         env = read_env_file()
+        local_names = {entry.get("name") for entry in _local_entries(raw)}
         entries = [
             entry
             for entry in _visible_entries(request, raw)
-            if not _skipped_optional_agent(entry, defaults, env)
+            if _starts_on_this_node(entry, defaults, env, local_names)
         ]
         repos = _configured_github_repos(raw, entries)
-    except ValueError as exc:
+    except (ValueError, RuntimeError) as exc:
         return web.json_response(
             {"repo": "", "repos": [], "issues": [], "error": str(exc)}
         )

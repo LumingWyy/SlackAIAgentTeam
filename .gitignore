@@ -17,7 +17,7 @@ nohup.out
 multi_app.pid
 .env.bak
 # this machine's agents (workspaces, repos); agents.example.yaml is the template
-/agents.yaml
+agents.yaml
 agents.yaml.bak
 state.db*
 .slack-files/
