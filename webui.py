@@ -827,6 +827,100 @@ async def h_list_dirs(request: web.Request) -> web.Response:
     )
 
 
+_REPO_LIST_LIMIT = 200
+
+
+async def _gh_status() -> dict[str, Any]:
+    """Whether this machine has gh and which account it is signed in as."""
+    rc, out, err = await _run(["gh", "api", "user", "--jq", ".login"], timeout=15)
+    if rc == -1 and err.endswith("not found"):
+        return {"installed": False, "logged_in": False, "login": ""}
+    login = out.strip() if rc == 0 else ""
+    return {"installed": True, "logged_in": bool(login), "login": login}
+
+
+async def h_github_status(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True, **await _gh_status()})
+
+
+def _gh_error(err: str, rc: int) -> str:
+    if rc == -1:
+        return "gh is not installed or timed out"
+    line = (err or "").strip().splitlines()
+    return (line[-1] if line else "gh failed")[:200]
+
+
+async def h_github_repos(request: web.Request) -> web.Response:
+    """Repositories the local gh account can see, for the repo picker.
+
+    ``owner`` picks a user/org (default: the signed-in user); the response
+    also lists the owners to switch between.
+    """
+    gh = await _gh_status()
+    if not gh["logged_in"]:
+        return web.json_response({"ok": False, "gh": gh,
+            "error": "gh is not installed" if not gh["installed"] else "gh is not signed in"})
+    login = gh["login"]
+    rc, out, _err = await _run(
+        ["gh", "api", "user/orgs", "--jq", ".[].login"], timeout=15
+    )
+    owners = [login] + (
+        [line.strip() for line in out.splitlines() if line.strip()] if rc == 0 else []
+    )
+    owner = str(request.query.get("owner") or login).strip()
+    if owner not in owners:
+        return web.json_response({"ok": False, "error": "unknown owner", "owners": owners})
+    rc, out, err = await _run(
+        [
+            "gh", "repo", "list", owner,
+            "--limit", str(_REPO_LIST_LIMIT),
+            "--json", "nameWithOwner,description,isPrivate,isArchived,updatedAt",
+        ],
+        timeout=30,
+    )
+    if rc != 0:
+        return web.json_response(
+            {"ok": False, "error": _gh_error(err, rc), "owners": owners, "owner": owner}
+        )
+    try:
+        items = json.loads(out or "[]")
+    except ValueError:
+        return web.json_response({"ok": False, "error": "gh returned malformed JSON"})
+    repos = [
+        {
+            "name": str(item.get("nameWithOwner") or ""),
+            "description": str(item.get("description") or "")[:200],
+            "private": bool(item.get("isPrivate")),
+            "archived": bool(item.get("isArchived")),
+            "updated": str(item.get("updatedAt") or ""),
+        }
+        for item in items
+        if isinstance(item, dict) and item.get("nameWithOwner")
+    ]
+    repos.sort(key=lambda repo: repo["updated"], reverse=True)
+    return web.json_response(
+        {"ok": True, "owner": owner, "owners": owners, "repos": repos}
+    )
+
+
+async def h_github_create_repo(request: web.Request) -> web.Response:
+    """Create one GitHub repository (private unless asked) with the local gh."""
+    body = await request.json()
+    try:
+        repo = canonical_github_repo(str(body.get("repo") or "").strip())
+    except ValueError:
+        return web.json_response({"ok": False, "error": "repo must be OWNER/REPO"})
+    visibility = "--public" if body.get("public") else "--private"
+    rc, out, err = await _run(["gh", "repo", "create", repo, visibility], timeout=60)
+    if rc != 0:
+        return web.json_response({"ok": False, "error": _gh_error(err, rc)})
+    url = next(
+        (line.strip() for line in out.splitlines() if line.strip().startswith("https://")),
+        f"https://github.com/{repo}",
+    )
+    return web.json_response({"ok": True, "repo": repo, "url": url})
+
+
 async def _repo_reachable(repo: str) -> bool | None:
     """Whether the local gh account can see ``repo``; None when unknown."""
     if not repo:
@@ -885,13 +979,14 @@ async def h_update_workspace(request: web.Request) -> web.Response:
         effective = repo or inherited
     else:
         effective = str(entry.get("github_repo") or inherited)
-    facts, reachable = await asyncio.gather(
-        _inspect_workspace(path), _repo_reachable(effective)
-    )
+    facts, gh = await asyncio.gather(_inspect_workspace(path), _gh_status())
+    # an unsigned gh cannot see any repo: report that, not "repo unreachable"
+    reachable = await _repo_reachable(effective) if gh["logged_in"] else None
     result: dict[str, Any] = {
         "ok": True,
         "path": path,
         **facts,
+        "gh": gh,
         "github_repo": effective,
         "repo_reachable": reachable,
         "mismatch": bool(
@@ -2777,10 +2872,20 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
 .dirbrowser .dir{appearance:none;display:flex;align-items:center;gap:8px;width:100%;border:0;background:transparent;
   padding:7px 10px;border-radius:var(--r);font-family:var(--mono);font-size:.78rem;color:var(--ink-2);cursor:pointer;text-align:left}
 .dirbrowser .dir:hover,.dirbrowser .dir:focus-visible{background:var(--tile);color:var(--ink)}
+.dirbrowser .dir[hidden]{display:none}
 .dirbrowser .dir::before{content:"";width:12px;height:9px;flex:none;border:1.5px solid var(--faint);border-radius:2px}
 .dirbrowser .dir.git::before{border-color:var(--accent);background:var(--accent-wash)}
 .dirbrowser .dir .chip{margin-left:auto}
 .dirbrowser .empty{padding:10px 12px}
+.dirbrowser .dirbar select,.dirbrowser .dirbar input{width:auto;padding:5px 9px;font-size:.8rem}
+.dirbrowser .dirbar select{padding-right:28px}
+.dirbrowser .dirbar input{flex:1;min-width:120px}
+.dirbrowser .repo{flex-wrap:wrap;row-gap:2px}
+.dirbrowser .repo::before{display:none}
+.dirbrowser .repo .desc{flex-basis:100%;font-family:var(--sans);font-size:.72rem;color:var(--faint);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.dirbrowser .repo.archived{opacity:.6}
+.repoask{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap;font-family:var(--sans);color:var(--ink)}
 .wsedit.open{animation:rise .35s var(--out) both}
 .wsinfo{display:flex;align-items:center;gap:6px 10px;flex-wrap:wrap;font-family:var(--mono);font-size:.74rem;color:var(--muted);margin-top:12px}
 .wsinfo:empty{display:none}
@@ -3432,7 +3537,7 @@ const I18N={
    'cfg.save':'保存','cfg.setup':'设置','cfg.retoken':'重设 token','cfg.required':'必需','cfg.optional':'可选',
    'wz.s1':'1. 点「用此 manifest 在 Slack 创建」（或打开 api.slack.com/apps →「From a manifest」贴入下方）→ 选择 workspace → Create → Install to Workspace',
    'wz.copy':'复制 manifest','wz.create':'用此 manifest 在 Slack 创建','wz.s2':'2. 粘贴 Bot Token (xoxb-) 与 App-Level Token (xapp-, connections:write)：',
-   'wz.save':'验证并写入 .env','tok.copied':'manifest 已复制','saved':'✓ 已保存','savefail':'保存失败','unlock.title':'需要控制令牌','unlock.hint':'这个节点启用了控制认证。输入 .env 里为你（owner）配置的控制 Bearer 令牌；只保存在本标签页的会话里。','unlock.save':'解锁','unlock.bad':'令牌不正确，请重新输入。','ws.title':'本地 workspace','ws.edit':'修改','ws.path':'目录（绝对路径或 ~/…）','ws.repo':'GitHub 仓库（OWNER/REPO，留空沿用默认）','ws.check':'检查','ws.unset':'未设置（使用 CLAUDE_WORKSPACE 或启动目录）','ws.nogit':'不是 git 仓库，GitHub 协作不可用','ws.branch':'分支','ws.mismatch':'origin 与 GitHub 仓库不一致，GitHub 协作会被禁用','ws.useorigin':'改用 {r}','ws.setup':'设置 workspace','ws.ok':'就绪','ws.missing':'目录不存在','ws.unsetshort':'未设置','ws.nogitshort':'不是 git 仓库','ws.mismatchshort':'origin 不一致','ws.badreposhort':'GitHub 仓库不可用','ws.badrepo':'GitHub 上找不到 {r}，或当前 gh 账号无权访问；GitHub 协作会被禁用','ws.checking':'检查中…','guide.local.ws':'workspace 是 agent 读写代码的本机目录，必须是目标 GitHub 仓库的 clone（origin 指向 agent 的 OWNER/REPO）。在「团队构成」每张 agent 卡片里设置；打开时会自动检查目录、git、origin 和仓库能否访问。','guide.local.ev4':'每张 agent 卡片的 workspace 显示「就绪」','guide.goto.ws':'去设置 workspace','ws.ghoff':'{r} 的 GitHub 协作已禁用','ws.pick':'选择…','ws.browse':'浏览','ws.pickfail':'这台机器无法弹出系统对话框，已改用页面内浏览','ws.up':'上一级','ws.choose':'选择此目录','ws.close':'收起','ws.nodirs':'这里没有子目录','cfg.editpersona':'编辑内容','cfg.restarthint':'重启 multi_app 生效','cfg.worktreerootrestart':'worktree root 仅在重启后生效；重启前请先用旧 root clean remove 仍存活的映射',
+   'wz.save':'验证并写入 .env','tok.copied':'manifest 已复制','saved':'✓ 已保存','savefail':'保存失败','unlock.title':'需要控制令牌','unlock.hint':'这个节点启用了控制认证。输入 .env 里为你（owner）配置的控制 Bearer 令牌；只保存在本标签页的会话里。','unlock.save':'解锁','unlock.bad':'令牌不正确，请重新输入。','ws.title':'本地 workspace','ws.edit':'修改','ws.path':'目录（绝对路径或 ~/…）','ws.repo':'GitHub 仓库（OWNER/REPO，留空沿用默认）','ws.check':'检查','ws.unset':'未设置（使用 CLAUDE_WORKSPACE 或启动目录）','ws.nogit':'不是 git 仓库，GitHub 协作不可用','ws.branch':'分支','ws.mismatch':'origin 与 GitHub 仓库不一致，GitHub 协作会被禁用','ws.useorigin':'改用 {r}','ws.setup':'设置 workspace','ws.ok':'就绪','ws.missing':'目录不存在','ws.unsetshort':'未设置','ws.nogitshort':'不是 git 仓库','ws.mismatchshort':'origin 不一致','ws.badreposhort':'GitHub 仓库不可用','ws.badrepo':'GitHub 上找不到 {r}，或当前 gh 账号无权访问；GitHub 协作会被禁用','ws.checking':'检查中…','guide.local.ws':'workspace 是 agent 读写代码的本机目录，必须是目标 GitHub 仓库的 clone（origin 指向 agent 的 OWNER/REPO）。在「团队构成」每张 agent 卡片里设置；打开时会自动检查目录、git、origin 和仓库能否访问。','guide.local.ev4':'每张 agent 卡片的 workspace 显示「就绪」','guide.goto.ws':'去设置 workspace','ws.ghoff':'{r} 的 GitHub 协作已禁用','ws.pick':'选择…','ws.browse':'浏览','ws.pickfail':'这台机器无法弹出系统对话框，已改用页面内浏览','ws.up':'上一级','ws.choose':'选择此目录','ws.close':'收起','ws.nodirs':'这里没有子目录','ws.loading':'加载中…','ws.search':'搜索仓库','ws.inherit':'沿用默认','ws.private':'私有','ws.archived':'已归档','ws.norepos':'没有匹配的仓库','ws.ghfail':'gh 无法列出仓库：{e}','ws.create':'在 GitHub 创建 {r}','ws.createq':'将在 GitHub 创建私有仓库 {r}，确定吗？','ws.createbtn':'创建','ws.created':'✓ 已在 GitHub 创建 {r}','ws.ghmissing':'本机没有安装 gh（GitHub CLI），GitHub 协作无法使用。安装后刷新本页：','ws.ghlogin':'本机的 gh 还没有登录，GitHub 协作无法使用。','ws.gotoauth':'去认证页登录 GitHub','ws.ghmissingshort':'gh 未安装','ws.ghloginshort':'gh 未登录','cfg.editpersona':'编辑内容','cfg.restarthint':'重启 multi_app 生效','cfg.worktreerootrestart':'worktree root 仅在重启后生效；重启前请先用旧 root clean remove 仍存活的映射',
       'nav.auth':'认证','auth.title':'认证','auth.sub':'智能体实际运行环境（优先 Docker 容器，否则本机）的登录凭据。',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
    'auth.signin':'开始登录','auth.openurl':'打开下方链接完成授权，再把页面给出的 code 粘贴回来。',
@@ -3501,7 +3606,7 @@ const I18N={
    'cfg.save':'保存','cfg.setup':'セットアップ','cfg.retoken':'token 再設定','cfg.required':'必須','cfg.optional':'任意',
    'wz.s1':'1.「この manifest で Slack に作成」を押す（または api.slack.com/apps →「From a manifest」に下記を貼付）→ workspace を選択 → Create → Install to Workspace',
    'wz.copy':'manifest をコピー','wz.create':'この manifest で Slack に作成','wz.s2':'2. Bot Token (xoxb-) と App-Level Token (xapp-, connections:write) を貼付:',
-   'wz.save':'検証して .env に保存','tok.copied':'manifest コピー','saved':'✓ 保存','savefail':'保存に失敗しました','unlock.title':'コントロールトークンが必要です','unlock.hint':'このノードはコントロール認証が有効です。.env に自分（owner）用に設定したコントロール Bearer トークンを入力してください。このタブのセッションにだけ保存されます。','unlock.save':'ロック解除','unlock.bad':'トークンが正しくありません。もう一度入力してください。','ws.title':'ローカル workspace','ws.edit':'変更','ws.path':'ディレクトリ（絶対パスまたは ~/…）','ws.repo':'GitHub リポジトリ（OWNER/REPO、空欄なら既定を使用）','ws.check':'確認','ws.unset':'未設定（CLAUDE_WORKSPACE または起動ディレクトリ）','ws.nogit':'git リポジトリではないため GitHub 連携は使えません','ws.branch':'ブランチ','ws.mismatch':'origin と GitHub リポジトリが一致しないため GitHub 連携は無効になります','ws.useorigin':'{r} を使う','ws.setup':'workspace を設定','ws.ok':'準備完了','ws.missing':'ディレクトリなし','ws.unsetshort':'未設定','ws.nogitshort':'git リポジトリではない','ws.mismatchshort':'origin 不一致','ws.badreposhort':'GitHub リポジトリ不可','ws.badrepo':'GitHub に {r} が見つからないか、現在の gh アカウントに権限がありません。GitHub 連携は無効になります','ws.checking':'確認中…','guide.local.ws':'workspace は agent がコードを読み書きするローカルディレクトリで、対象 GitHub リポジトリの clone（origin が agent の OWNER/REPO）である必要があります。「チーム構成」の各 agent カードで設定し、開くとディレクトリ・git・origin・リポジトリへのアクセスを自動で確認します。','guide.local.ev4':'各 agent カードの workspace が「準備完了」','guide.goto.ws':'workspace を設定','ws.ghoff':'{r} の GitHub 連携は無効','ws.pick':'選択…','ws.browse':'参照','ws.pickfail':'このマシンではシステムのダイアログを開けないため、画面内で参照します','ws.up':'上へ','ws.choose':'このフォルダを選択','ws.close':'閉じる','ws.nodirs':'サブフォルダはありません','cfg.editpersona':'内容を編集','cfg.restarthint':'multi_app 再起動で反映','cfg.worktreerootrestart':'worktree root は再起動時だけ反映されます。稼働中の mapping は先に旧 root 設定で clean remove してください',
+   'wz.save':'検証して .env に保存','tok.copied':'manifest コピー','saved':'✓ 保存','savefail':'保存に失敗しました','unlock.title':'コントロールトークンが必要です','unlock.hint':'このノードはコントロール認証が有効です。.env に自分（owner）用に設定したコントロール Bearer トークンを入力してください。このタブのセッションにだけ保存されます。','unlock.save':'ロック解除','unlock.bad':'トークンが正しくありません。もう一度入力してください。','ws.title':'ローカル workspace','ws.edit':'変更','ws.path':'ディレクトリ（絶対パスまたは ~/…）','ws.repo':'GitHub リポジトリ（OWNER/REPO、空欄なら既定を使用）','ws.check':'確認','ws.unset':'未設定（CLAUDE_WORKSPACE または起動ディレクトリ）','ws.nogit':'git リポジトリではないため GitHub 連携は使えません','ws.branch':'ブランチ','ws.mismatch':'origin と GitHub リポジトリが一致しないため GitHub 連携は無効になります','ws.useorigin':'{r} を使う','ws.setup':'workspace を設定','ws.ok':'準備完了','ws.missing':'ディレクトリなし','ws.unsetshort':'未設定','ws.nogitshort':'git リポジトリではない','ws.mismatchshort':'origin 不一致','ws.badreposhort':'GitHub リポジトリ不可','ws.badrepo':'GitHub に {r} が見つからないか、現在の gh アカウントに権限がありません。GitHub 連携は無効になります','ws.checking':'確認中…','guide.local.ws':'workspace は agent がコードを読み書きするローカルディレクトリで、対象 GitHub リポジトリの clone（origin が agent の OWNER/REPO）である必要があります。「チーム構成」の各 agent カードで設定し、開くとディレクトリ・git・origin・リポジトリへのアクセスを自動で確認します。','guide.local.ev4':'各 agent カードの workspace が「準備完了」','guide.goto.ws':'workspace を設定','ws.ghoff':'{r} の GitHub 連携は無効','ws.pick':'選択…','ws.browse':'参照','ws.pickfail':'このマシンではシステムのダイアログを開けないため、画面内で参照します','ws.up':'上へ','ws.choose':'このフォルダを選択','ws.close':'閉じる','ws.nodirs':'サブフォルダはありません','ws.loading':'読み込み中…','ws.search':'リポジトリを検索','ws.inherit':'既定を使う','ws.private':'非公開','ws.archived':'アーカイブ済み','ws.norepos':'一致するリポジトリはありません','ws.ghfail':'gh でリポジトリを取得できません：{e}','ws.create':'GitHub に {r} を作成','ws.createq':'GitHub に非公開リポジトリ {r} を作成します。よろしいですか？','ws.createbtn':'作成','ws.created':'✓ GitHub に {r} を作成しました','ws.ghmissing':'このマシンに gh（GitHub CLI）がないため GitHub 連携を使えません。インストール後にこのページを再読み込み：','ws.ghlogin':'このマシンの gh はまだログインしていないため GitHub 連携を使えません。','ws.gotoauth':'認証ページで GitHub にログイン','ws.ghmissingshort':'gh 未インストール','ws.ghloginshort':'gh 未ログイン','cfg.editpersona':'内容を編集','cfg.restarthint':'multi_app 再起動で反映','cfg.worktreerootrestart':'worktree root は再起動時だけ反映されます。稼働中の mapping は先に旧 root 設定で clean remove してください',
       'nav.auth':'認証','auth.title':'認証','auth.sub':'エージェントが実際に動く環境（優先：Docker コンテナ／なければこのホスト）のログイン情報です。',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
    'auth.signin':'ログイン開始','auth.openurl':'下のリンクで承認し、表示された code を貼り付けてください。',
@@ -3570,7 +3675,7 @@ const I18N={
    'cfg.save':'Save','cfg.setup':'Set up','cfg.retoken':'Reset tokens','cfg.required':'required','cfg.optional':'optional',
    'wz.s1':'1. Click "Create in Slack from this manifest" (or open api.slack.com/apps → "From a manifest" and paste below) → pick the workspace → Create → Install to Workspace',
    'wz.copy':'Copy manifest','wz.create':'Create in Slack from this manifest','wz.s2':'2. Paste Bot Token (xoxb-) and App-Level Token (xapp-, connections:write):',
-   'wz.save':'Verify & save to .env','tok.copied':'manifest copied','saved':'✓ Saved','savefail':'save failed','unlock.title':'Control token required','unlock.hint':'This node requires control authentication. Enter the control bearer token configured for you (the owner) in .env; it is kept in this tab session only.','unlock.save':'Unlock','unlock.bad':'That token was rejected. Try again.','ws.title':'Local workspace','ws.edit':'Change','ws.path':'Directory (absolute path or ~/…)','ws.repo':'GitHub repo (OWNER/REPO; empty inherits the default)','ws.check':'Check','ws.unset':'not set (falls back to CLAUDE_WORKSPACE or the launch directory)','ws.nogit':'not a git repo; GitHub collaboration is unavailable','ws.branch':'branch','ws.mismatch':'origin differs from the GitHub repo; GitHub collaboration will be disabled','ws.useorigin':'Use {r}','ws.setup':'Set workspace','ws.ok':'ready','ws.missing':'directory missing','ws.unsetshort':'not set','ws.nogitshort':'not a git repo','ws.mismatchshort':'origin mismatch','ws.badreposhort':'repo unreachable','ws.badrepo':'{r} was not found on GitHub, or the current gh account cannot access it; GitHub collaboration will be disabled','ws.checking':'checking…','guide.local.ws':'The workspace is the local directory where an agent reads and writes code. It must be a clone of the target GitHub repository (origin points at the agent OWNER/REPO). Set it on each agent card under Setup; opening it checks the directory, git, origin, and repo access automatically.','guide.local.ev4':'Every agent card shows its workspace as ready','guide.goto.ws':'Set up workspaces','ws.ghoff':'GitHub disabled for {r}','ws.pick':'Choose…','ws.browse':'Browse','ws.pickfail':'No system folder dialog on this machine; browsing in the page instead','ws.up':'Up','ws.choose':'Use this folder','ws.close':'Close','ws.nodirs':'No subfolders here','cfg.editpersona':'Edit content','cfg.restarthint':'restart multi_app to apply','cfg.worktreerootrestart':'worktree root applies only after restart; clean-remove live mappings with the old root first',
+   'wz.save':'Verify & save to .env','tok.copied':'manifest copied','saved':'✓ Saved','savefail':'save failed','unlock.title':'Control token required','unlock.hint':'This node requires control authentication. Enter the control bearer token configured for you (the owner) in .env; it is kept in this tab session only.','unlock.save':'Unlock','unlock.bad':'That token was rejected. Try again.','ws.title':'Local workspace','ws.edit':'Change','ws.path':'Directory (absolute path or ~/…)','ws.repo':'GitHub repo (OWNER/REPO; empty inherits the default)','ws.check':'Check','ws.unset':'not set (falls back to CLAUDE_WORKSPACE or the launch directory)','ws.nogit':'not a git repo; GitHub collaboration is unavailable','ws.branch':'branch','ws.mismatch':'origin differs from the GitHub repo; GitHub collaboration will be disabled','ws.useorigin':'Use {r}','ws.setup':'Set workspace','ws.ok':'ready','ws.missing':'directory missing','ws.unsetshort':'not set','ws.nogitshort':'not a git repo','ws.mismatchshort':'origin mismatch','ws.badreposhort':'repo unreachable','ws.badrepo':'{r} was not found on GitHub, or the current gh account cannot access it; GitHub collaboration will be disabled','ws.checking':'checking…','guide.local.ws':'The workspace is the local directory where an agent reads and writes code. It must be a clone of the target GitHub repository (origin points at the agent OWNER/REPO). Set it on each agent card under Setup; opening it checks the directory, git, origin, and repo access automatically.','guide.local.ev4':'Every agent card shows its workspace as ready','guide.goto.ws':'Set up workspaces','ws.ghoff':'GitHub disabled for {r}','ws.pick':'Choose…','ws.browse':'Browse','ws.pickfail':'No system folder dialog on this machine; browsing in the page instead','ws.up':'Up','ws.choose':'Use this folder','ws.close':'Close','ws.nodirs':'No subfolders here','ws.loading':'loading…','ws.search':'Search repositories','ws.inherit':'Inherit the default','ws.private':'private','ws.archived':'archived','ws.norepos':'No matching repositories','ws.ghfail':'gh could not list repositories: {e}','ws.create':'Create {r} on GitHub','ws.createq':'Create the private repository {r} on GitHub?','ws.createbtn':'Create','ws.created':'✓ Created {r} on GitHub','ws.ghmissing':'gh (GitHub CLI) is not installed on this machine, so GitHub collaboration cannot work. Install it, then reload:','ws.ghlogin':'gh on this machine is not signed in, so GitHub collaboration cannot work.','ws.gotoauth':'Sign in to GitHub on the Auth tab','ws.ghmissingshort':'gh not installed','ws.ghloginshort':'gh not signed in','cfg.editpersona':'Edit content','cfg.restarthint':'restart multi_app to apply','cfg.worktreerootrestart':'worktree root applies only after restart; clean-remove live mappings with the old root first',
       'nav.auth':'Auth','auth.title':'Authentication','auth.sub':'Sign-in for the runtime agents actually use (Docker when up, otherwise this host).',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
    'auth.signin':'Start sign-in','auth.openurl':'Open the link below to authorize, then paste the code it shows.',
@@ -4258,9 +4363,11 @@ function workspaceEditor(workspace,explicitRepo,effectiveRepo){
             <button class="btn line" type="button" data-action="pick-dir">${t('ws.pick')}</button>
             <button class="btn text" type="button" data-action="browse-dir">${t('ws.browse')}</button></div></div>
         <div><span class="lbl">${t('ws.repo')}</span>
-          <input class="repo-input" value="${esc(explicitRepo||'')}" placeholder="${esc(effectiveRepo||'OWNER/REPO')}" spellcheck="false" autocomplete="off"></div>
+          <div class="wspick"><input class="repo-input" value="${esc(explicitRepo||'')}" placeholder="${esc(effectiveRepo||'OWNER/REPO')}" spellcheck="false" autocomplete="off">
+            <button class="btn line" type="button" data-action="pick-repo">${t('ws.pick')}</button></div></div>
       </div>
       <div class="dirbrowser" hidden></div>
+      <div class="dirbrowser repobrowser" hidden></div>
       <div class="wsinfo"></div>
       <div class="rowbtns" style="margin-top:12px">
         <button class="btn line" data-action="check-workspace">${t('ws.check')}</button>
@@ -4296,7 +4403,7 @@ async function pickDir(n,card){
   toast(t('ws.pickfail'));browseDirs(card,input.value||'~');
 }
 async function browseDirs(card,path){
-  const box=card.querySelector('.dirbrowser');
+  const box=card.querySelector('.dirbrowser:not(.repobrowser)');
   let r;try{r=await j('/api/fs/dirs?path='+encodeURIComponent(path||'~'));}catch(e){r={ok:false,error:'fetch failed'};}
   if(!r.ok&&path!=='~'){return browseDirs(card,'~');}
   box.hidden=false;
@@ -4310,7 +4417,56 @@ async function browseDirs(card,path){
     </div>
     <div class="dirlist">${rows||`<div class="empty">${t('ws.nodirs')}</div>`}</div>`;
 }
-function closeDirs(card){const box=card.querySelector('.dirbrowser');if(box){box.hidden=true;box.innerHTML='';}}
+function closeDirs(card){const box=card.querySelector('.dirbrowser:not(.repobrowser)');if(box){box.hidden=true;box.innerHTML='';}}
+// repo picker: what the local gh account can see, by owner, filterable
+async function browseRepos(card,owner){
+  const box=card.querySelector('.repobrowser');box.hidden=false;
+  box.innerHTML=`<div class="empty">${t('ws.loading')}</div>`;
+  let r;try{r=await j('/api/github/repos'+(owner?'?owner='+encodeURIComponent(owner):''));}catch(e){r={ok:false,error:'fetch failed'};}
+  const owners=(r.owners||[]).map(o=>`<option value="${esc(o)}"${o===r.owner?' selected':''}>${esc(o)}</option>`).join('');
+  const bar=`<div class="dirbar">
+      ${owners?`<select class="repo-owner" data-action="repo-owner" aria-label="owner">${owners}</select>`:''}
+      <input class="repo-search" type="search" placeholder="${esc(t('ws.search'))}" spellcheck="false" autocomplete="off">
+      <button class="btn text" type="button" data-action="repo-inherit">${t('ws.inherit')}</button>
+      <button class="btn text" type="button" data-action="repo-close" aria-label="${esc(t('ws.close'))}">✕</button>
+    </div>`;
+  if(!r.ok){
+    const hint=ghStatusHint(r.gh);
+    box.innerHTML=bar+`<div class="empty">${hint||'✕ '+esc(t('ws.ghfail',{e:r.error||''}))}</div>`;return;}
+  const rows=(r.repos||[]).map(x=>`<button class="dir repo${x.archived?' archived':''}" type="button" data-action="repo-choose" data-repo="${esc(x.name)}" data-filter="${esc((x.name+' '+x.description).toLowerCase())}">${esc(x.name)}${x.private?`<span class="chip">${t('ws.private')}</span>`:''}${x.archived?`<span class="chip">${t('ws.archived')}</span>`:''}${x.description?`<span class="desc">${esc(x.description)}</span>`:''}</button>`).join('');
+  box.innerHTML=bar+`<div class="dirlist">${rows||`<div class="empty">${t('ws.norepos')}</div>`}</div>`;
+  const search=box.querySelector('.repo-search');if(search)search.focus();
+}
+function filterRepos(box,q){
+  q=(q||'').trim().toLowerCase();let shown=0;
+  box.querySelectorAll('.repo').forEach(row=>{const hit=!q||row.dataset.filter.includes(q);row.hidden=!hit;if(hit)shown++;});
+  let none=box.querySelector('.norepo');
+  if(!shown&&!none){none=document.createElement('div');none.className='empty norepo';none.textContent=t('ws.norepos');box.querySelector('.dirlist').appendChild(none);}
+  if(shown&&none)none.remove();
+}
+// gh must exist and be signed in on this machine for every GitHub feature
+function ghStatusHint(gh){
+  if(!gh)return '';
+  if(!gh.installed)return `<span class="ng">${t('ws.ghmissing')}</span> <a href="https://cli.github.com/" target="_blank" rel="noopener noreferrer">cli.github.com ↗</a>`;
+  if(!gh.logged_in)return `<span class="ng">${t('ws.ghlogin')}</span> <button class="btn text" type="button" onclick="showTab('auth')">${t('ws.gotoauth')}</button>`;
+  return '';
+}
+function closeRepos(card){const box=card.querySelector('.repobrowser');if(box){box.hidden=true;box.innerHTML='';}}
+function askCreateRepo(card,repo){
+  const info=card.querySelector('.wsinfo');
+  const ask=document.createElement('span');ask.className='repoask';
+  ask.innerHTML=`<span>${esc(t('ws.createq',{r:repo}))}</span>
+    <button class="btn solid" type="button" data-action="create-repo-yes" data-repo="${esc(repo)}">${t('ws.createbtn')}</button>
+    <button class="btn text" type="button" data-action="create-repo-no">${t('btn.cancel')}</button>`;
+  info.replaceChildren(ask);
+}
+async function createRepo(n,card,repo){
+  const info=card.querySelector('.wsinfo');info.textContent=t('ws.loading');
+  let r;try{r=await j('/api/github/repos',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({repo:repo})});}catch(e){r={ok:false,error:'fetch failed'};}
+  if(r.ok){toast(t('ws.created',{r:r.repo}));checkWorkspace(n,card);}
+  else{info.innerHTML=`<span class="ng">✕ ${esc(r.error||t('toast.fail'))}</span>`;}
+}
 function workspaceBody(card,dryRun){
   return JSON.stringify({workspace:card.querySelector('.ws-input').value,
     github_repo:card.querySelector('.repo-input').value,dry_run:!!dryRun});
@@ -4320,6 +4476,8 @@ function openWorkspaceSettings(){WS_FOCUS=true;showTab('cfg');}
 function workspaceVerdict(r){
   if(!r||!r.ok)return ['off',t('ws.missing')];
   if(!r.git)return ['warn',t('ws.nogitshort')];
+  if(r.github_repo&&r.gh&&!r.gh.installed)return ['warn',t('ws.ghmissingshort')];
+  if(r.github_repo&&r.gh&&!r.gh.logged_in)return ['warn',t('ws.ghloginshort')];
   if(r.mismatch)return ['warn',t('ws.mismatchshort')];
   if(r.repo_reachable===false)return ['warn',t('ws.badreposhort')];
   return ['idle',t('ws.ok')];
@@ -4359,7 +4517,13 @@ function renderWorkspaceFacts(card,r){
     if(r.branch)parts.push(`${t('ws.branch')} ${esc(r.branch)}`);
     if(r.origin_repo)parts.push(`origin ${esc(r.origin_repo)}`);
   }
-  if(r.repo_reachable===false&&r.github_repo)parts.push(`<span class="ng">${t('ws.badrepo',{r:esc(r.github_repo)})}</span>`);
+  const ghHint=ghStatusHint(r.gh);
+  if(r.github_repo&&ghHint)parts.push(ghHint);
+  else if(r.gh&&r.gh.login)parts.push(`gh @${esc(r.gh.login)}`);
+  if(r.repo_reachable===false&&r.github_repo){
+    parts.push(`<span class="ng">${t('ws.badrepo',{r:esc(r.github_repo)})}</span>`);
+    parts.push(`<button class="btn text" data-action="create-repo-ask" data-repo="${esc(r.github_repo)}">${t('ws.create',{r:esc(r.github_repo)})}</button>`);
+  }
   if(r.mismatch){
     parts.push(`<span class="warn">${t('ws.mismatch')}</span>`);
     parts.push(`<button class="btn text" data-action="use-origin" data-repo="${esc(r.origin_repo)}">${t('ws.useorigin',{r:esc(r.origin_repo)})}</button>`);
@@ -4435,6 +4599,13 @@ document.addEventListener('click',event=>{
   else if(action==='dir-open'){if(control.dataset.path)browseDirs(root,control.dataset.path);}
   else if(action==='dir-choose'){root.querySelector('.ws-input').value=control.dataset.path||'';closeDirs(root);checkWorkspace(n,root);}
   else if(action==='dir-close')closeDirs(root);
+  else if(action==='pick-repo')browseRepos(root,'');
+  else if(action==='repo-choose'){root.querySelector('.repo-input').value=control.dataset.repo||'';closeRepos(root);checkWorkspace(n,root);}
+  else if(action==='repo-inherit'){root.querySelector('.repo-input').value='';closeRepos(root);checkWorkspace(n,root);}
+  else if(action==='repo-close')closeRepos(root);
+  else if(action==='create-repo-ask')askCreateRepo(root,control.dataset.repo||'');
+  else if(action==='create-repo-yes')createRepo(n,root,control.dataset.repo||'');
+  else if(action==='create-repo-no')checkWorkspace(n,root);
   else if(action==='check-workspace')checkWorkspace(n,root);
   else if(action==='save-workspace')saveWorkspace(n,root);
   else if(action==='use-origin'){root.querySelector('.repo-input').value=control.dataset.repo||'';checkWorkspace(n,root);}
@@ -4451,6 +4622,7 @@ document.addEventListener('change',event=>{
   else if(action==='model-custom')stageCustomModel(n,control,root);
   else if(action==='effort')setEffort(n,control.value);
   else if(action==='reply-language')setReplyLang(n,control.value);
+  else if(action==='repo-owner')browseRepos(root,control.value);
 });
 document.addEventListener('keydown',event=>{
   if(event.key!=='Enter')return;
@@ -4462,6 +4634,7 @@ document.addEventListener('keydown',event=>{
 });
 document.addEventListener('input',event=>{
   const control=event.target;
+  if(control.matches&&control.matches('.repo-search')){filterRepos(control.closest('.repobrowser'),control.value);return;}
   if(!control.matches||!control.matches('[data-action="card-watch"]'))return;
   const root=control.closest('[data-agent]');
   if(root)watchCard(control,root.querySelector('.cardlong'));
@@ -4804,6 +4977,9 @@ def make_app(
     app.router.add_post("/api/agents/{name}/workspace", h_update_workspace)
     app.router.add_post("/api/fs/pick-dir", h_pick_dir)
     app.router.add_get("/api/fs/dirs", h_list_dirs)
+    app.router.add_get("/api/github/status", h_github_status)
+    app.router.add_get("/api/github/repos", h_github_repos)
+    app.router.add_post("/api/github/repos", h_github_create_repo)
     app.router.add_get("/api/issues", h_issues)
     app.router.add_get("/api/channel-rules", h_channel_rules)
     app.router.add_get("/api/live/state", h_live_state)

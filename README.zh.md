@@ -208,7 +208,7 @@ make webui        # = .venv/bin/python webui.py → http://127.0.0.1:8765
 
 - Agent 列表、token 状态（bot / app）、runtime、职责摘要
 - **设置向导**：为每个 agent 生成 manifest →「用此 manifest 在 Slack 创建」（打开已预填的 Slack 创建页面；也可复制 manifest 手动创建）→ 粘贴 token → 校验（`auth.test` + `apps.connections.open`）→ 写入 `.env`
-- **本地 workspace**：每张 agent 卡片可修改 workspace 与 `github_repo`。「检查」会确认目录存在、是否为 git 仓库、当前分支与 origin，并在 origin 与仓库不一致时提示（否则 GitHub 协作会被禁用），可一键改用 origin 的仓库；保存后热加载，`github_repo` 留空表示沿用默认。目录可以手动输入，也可以点「选择…」弹出本机系统的选文件夹窗口（macOS，或装有 zenity / kdialog 的 Linux 桌面），或点「浏览」在页面内逐级选择（只能浏览主目录，git 仓库会标出）
+- **本地 workspace**：每张 agent 卡片可修改 workspace 与 `github_repo`。「检查」会确认目录存在、是否为 git 仓库、当前分支与 origin，并在 origin 与仓库不一致时提示（否则 GitHub 协作会被禁用），可一键改用 origin 的仓库；保存后热加载，`github_repo` 留空表示沿用默认。目录可以手动输入，也可以点「选择…」弹出本机系统的选文件夹窗口（macOS，或装有 zenity / kdialog 的 Linux 桌面），或点「浏览」在页面内逐级选择（只能浏览主目录，git 仓库会标出）。GitHub 仓库也可以点「选择…」从本机 gh 账号能访问的仓库里挑（可切换 owner 与组织、可搜索）；检查发现仓库不存在时，可一键「在 GitHub 创建」（默认私有，先确认）。检查会先确认本机装有 gh 并已登录：未安装时给出安装链接，未登录时引导到「认证」页登录，不会误报为仓库不可用
 - **编辑 persona** / **添加 agent**
 
 **认证**用于验证 Agent 实际运行环境中的 Claude、Codex 与 GitHub 登录

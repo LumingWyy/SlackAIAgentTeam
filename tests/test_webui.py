@@ -1733,7 +1733,15 @@ def _workspace_app(tmp_path, monkeypatch, yaml_text):
         return None if not repo else repo not in reachable
 
     monkeypatch.setattr(webui, "_repo_reachable", _fake_reachable)
+
+    async def _signed_in():
+        return {"installed": True, "logged_in": True, "login": "alice"}
+
+    monkeypatch.setattr(webui, "_gh_status", _signed_in)
     return target
+
+
+_REAL_GH_STATUS = webui._gh_status
 
 
 def _git_repo(path, origin):
@@ -1979,4 +1987,131 @@ def test_workspace_editor_offers_pick_and_browse():
     assert 'data-action="pick-dir"' in script and 'data-action="browse-dir"' in script
     assert "/api/fs/pick-dir" in script and "/api/fs/dirs?path=" in script
     for key in ("ws.pick", "ws.browse", "ws.pickfail", "ws.up", "ws.choose", "ws.close", "ws.nodirs"):
+        assert script.count(f"'{key}':") >= 3, key
+
+
+# ---------------------------------------------------------------------------
+# GitHub repo picker / create
+# ---------------------------------------------------------------------------
+
+
+def _fake_gh(monkeypatch, *, repos=None, fail=None, create_rc=0):
+    import json
+
+    calls = []
+
+    async def fake_run(argv, timeout=15.0):
+        calls.append(argv)
+        if fail and fail in argv:
+            return 1, "", "HTTP 401: Bad credentials"
+        if argv[:3] == ["gh", "api", "user"]:
+            return 0, "alice\n", ""
+        if argv[:3] == ["gh", "api", "user/orgs"]:
+            return 0, "acme\n", ""
+        if argv[:3] == ["gh", "repo", "list"]:
+            return 0, json.dumps((repos or {}).get(argv[3], [])), ""
+        if argv[:3] == ["gh", "repo", "create"]:
+            if create_rc:
+                return create_rc, "", "GraphQL: Name already exists on this account"
+            return 0, f"https://github.com/{argv[3]}\n", ""
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(webui, "_run", fake_run)
+    # the real status check, driven by the fake gh above
+    monkeypatch.setattr(webui, "_gh_status", _REAL_GH_STATUS)
+    return calls
+
+
+def _gh_call(method, path, **kwargs):
+    async def _run():
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async with TestClient(TestServer(webui.make_app())) as client:
+            return await (await client.request(method, path, **kwargs)).json()
+
+    return asyncio.run(_run())
+
+
+def test_repo_picker_lists_repos_per_owner(tmp_path, monkeypatch):
+    _workspace_app(tmp_path, monkeypatch, "agents:\n- name: a\n  persona: p\n")
+    _fake_gh(monkeypatch, repos={
+        "alice": [
+            {"nameWithOwner": "alice/old", "isPrivate": False, "isArchived": True, "updatedAt": "2026-01-01T00:00:00Z"},
+            {"nameWithOwner": "alice/new", "isPrivate": True, "isArchived": False, "updatedAt": "2026-09-01T00:00:00Z", "description": "d"},
+        ],
+        "acme": [{"nameWithOwner": "acme/widgets", "updatedAt": "2026-05-01T00:00:00Z"}],
+    })
+    data = _gh_call("GET", "/api/github/repos")
+    assert data["ok"] is True and data["owner"] == "alice"
+    assert data["owners"] == ["alice", "acme"]
+    assert [r["name"] for r in data["repos"]] == ["alice/new", "alice/old"]
+    assert data["repos"][0]["private"] is True and data["repos"][1]["archived"] is True
+    data = _gh_call("GET", "/api/github/repos?owner=acme")
+    assert [r["name"] for r in data["repos"]] == ["acme/widgets"]
+    assert _gh_call("GET", "/api/github/repos?owner=evil")["ok"] is False
+
+
+def test_repo_picker_reports_gh_failures(tmp_path, monkeypatch):
+    _workspace_app(tmp_path, monkeypatch, "agents:\n- name: a\n  persona: p\n")
+    _fake_gh(monkeypatch, fail="user")
+    data = _gh_call("GET", "/api/github/repos")
+    assert data["ok"] is False and data["error"] == "gh is not signed in"
+    assert data["gh"] == {"installed": True, "logged_in": False, "login": ""}
+
+
+def test_gh_status_distinguishes_missing_and_signed_out(tmp_path, monkeypatch):
+    _workspace_app(tmp_path, monkeypatch, "agents:\n- name: a\n  persona: p\n")
+    monkeypatch.setattr(webui, "_gh_status", _REAL_GH_STATUS)
+    answers = iter([(-1, "", "gh not found"), (1, "", "not logged in"), (0, "alice\n", "")])
+
+    async def fake_run(argv, timeout=15.0):
+        return next(answers)
+
+    monkeypatch.setattr(webui, "_run", fake_run)
+    assert _gh_call("GET", "/api/github/status") == {
+        "ok": True, "installed": False, "logged_in": False, "login": ""}
+    assert _gh_call("GET", "/api/github/status")["logged_in"] is False
+    assert _gh_call("GET", "/api/github/status")["login"] == "alice"
+
+
+def test_workspace_check_reports_gh_state_instead_of_a_bad_repo(tmp_path, monkeypatch):
+    _workspace_app(
+        tmp_path, monkeypatch,
+        "github:\n  repo: acme/gone\nagents:\n- name: a\n  persona: p\n",
+    )
+
+    async def signed_out():
+        return {"installed": True, "logged_in": False, "login": ""}
+
+    monkeypatch.setattr(webui, "_gh_status", signed_out)
+    repo = _git_repo(tmp_path / "gone", "https://github.com/acme/gone.git")
+    data = _post_workspace({"workspace": str(repo), "dry_run": True})
+    # gh cannot see anything while signed out: no false "repo unreachable"
+    assert data["gh"]["logged_in"] is False
+    assert data["repo_reachable"] is None
+    script = _main_script(webui.INDEX_HTML)
+    assert "function ghStatusHint(gh)" in script
+    for key in ("ws.ghmissing", "ws.ghlogin", "ws.gotoauth", "ws.ghmissingshort", "ws.ghloginshort"):
+        assert script.count(f"'{key}':") >= 3, key
+
+
+def test_create_repo_is_private_by_default_and_validated(tmp_path, monkeypatch):
+    _workspace_app(tmp_path, monkeypatch, "agents:\n- name: a\n  persona: p\n")
+    calls = _fake_gh(monkeypatch)
+    data = _gh_call("POST", "/api/github/repos", json={"repo": "alice/agent-sandbox"})
+    assert data == {"ok": True, "repo": "alice/agent-sandbox", "url": "https://github.com/alice/agent-sandbox"}
+    assert calls[-1] == ["gh", "repo", "create", "alice/agent-sandbox", "--private"]
+    assert _gh_call("POST", "/api/github/repos", json={"repo": "bad name; rm"})["ok"] is False
+    assert calls[-1][3] == "alice/agent-sandbox"  # nothing ran for the bad name
+    _fake_gh(monkeypatch, create_rc=1)
+    data = _gh_call("POST", "/api/github/repos", json={"repo": "alice/agent-sandbox"})
+    assert data["ok"] is False and "already exists" in data["error"]
+
+
+def test_repo_field_offers_picker_and_create():
+    script = _main_script(webui.INDEX_HTML)
+    for action in ("pick-repo", "repo-choose", "repo-inherit", "create-repo-ask", "create-repo-yes"):
+        assert f"'{action}'" in script or f'"{action}"' in script, action
+    for key in ("ws.search", "ws.inherit", "ws.private", "ws.norepos", "ws.ghfail",
+                "ws.create", "ws.createq", "ws.createbtn", "ws.created", "ws.loading"):
         assert script.count(f"'{key}':") >= 3, key
