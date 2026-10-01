@@ -16,6 +16,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import stat
 import sys
 import threading
@@ -71,6 +72,7 @@ from multi_core import (
     build_patrol_work_prompt,
     build_freshness_recheck_prompt,
     CLAIM_RENEW_SECONDS,
+    DEFAULT_PROTECTED_BRANCHES,
     canonical_github_repo,
     claim_tool_command,
     classify_runtime_failure,
@@ -84,6 +86,8 @@ from multi_core import (
     flatten_event_text,
     format_github_claim_protocol,
     format_plain_mention_notice,
+    STATUS_IN_PROGRESS_LABEL,
+    STATUS_TODO_LABEL,
     format_rate_limit_notice,
     is_rate_limit_signal,
     is_side_effect_tool,
@@ -161,6 +165,86 @@ ISSUE_CLAIM_TOOL_PREFIX = shlex.join([sys.executable, ISSUE_CLAIM_TOOL])
 CLAIM_TOOL_TIMEOUT_SECONDS = 300.0
 # Todo issues one patrol round tries to claim before giving up as idle.
 PATROL_CLAIM_ATTEMPTS = 5
+# Node-wide `gh issue list` cache for patrol candidates (per repo + labels).
+ISSUE_LIST_TTL_SECONDS = 60.0
+# Claim refs of closed issues are garbage-collected at most this often.
+CLAIM_GC_INTERVAL_SECONDS = 3600.0
+# Agents open PRs; humans merge. The guard shims on the agent PATH refuse
+# merge-shaped gh/git commands, and Claude additionally denies the tool call.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+AGENT_GUARD = os.path.join(_HERE, "agent_guard.py")
+AGENT_GUARD_BIN = os.path.join(_HERE, "agent_guard_bin")
+AGENT_DISALLOWED_TOOLS = ("Bash(gh pr merge:*)",)
+
+
+def _real_binary(name: str) -> str:
+    """``name`` on the host PATH, never the guard shim itself."""
+    search = os.pathsep.join(
+        entry
+        for entry in os.environ.get("PATH", "").split(os.pathsep)
+        if entry and os.path.realpath(entry) != os.path.realpath(AGENT_GUARD_BIN)
+    )
+    return shutil.which(name, path=search) or ""
+
+
+def protected_branches_from_env() -> tuple[str, ...]:
+    """``AGENT_PROTECTED_BRANCHES`` (comma list; default main,master)."""
+    raw = os.environ.get("AGENT_PROTECTED_BRANCHES", "")
+    names = tuple(name.strip() for name in raw.split(",") if name.strip())
+    return names or DEFAULT_PROTECTED_BRANCHES
+
+
+def agent_guard_env(*, thread_url: str = "") -> dict[str, str]:
+    """Environment overlay for agent runtimes (Claude CLI, codex exec)."""
+    env = {
+        "PATH": AGENT_GUARD_BIN + os.pathsep + os.environ.get("PATH", ""),
+        "SLACK_AGENT_GUARD": AGENT_GUARD,
+        "SLACK_AGENT_PYTHON": sys.executable,
+        "SLACK_AGENT_REAL_GH": _real_binary("gh"),
+        "SLACK_AGENT_REAL_GIT": _real_binary("git"),
+        "SLACK_AGENT_PROTECTED_BRANCHES": ",".join(protected_branches_from_env()),
+    }
+    if thread_url:
+        env["SLACK_AGENT_THREAD_URL"] = thread_url
+    return env
+
+
+class IssueListCache:
+    """Node-wide singleflight + TTL cache of patrol issue listings.
+
+    Two or three local agents patrolling one repo would otherwise each run
+    ``gh issue list`` every period. Failures are never cached.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: float = ISSUE_LIST_TTL_SECONDS,
+        clock: Any = time.monotonic,
+    ) -> None:
+        self._ttl = ttl_seconds
+        self._clock = clock
+        self._entries: dict[tuple, tuple[float, list[dict]]] = {}
+        self._inflight: dict[tuple, asyncio.Future] = {}
+
+    async def get(self, key: tuple, fetch: Any) -> list[dict]:
+        hit = self._entries.get(key)
+        if hit is not None and self._clock() - hit[0] < self._ttl:
+            return [dict(item) for item in hit[1]]
+        task = self._inflight.get(key)
+        if task is None:
+            task = asyncio.ensure_future(fetch())
+            self._inflight[key] = task
+            task.add_done_callback(lambda _t: self._inflight.pop(key, None))
+        result = await asyncio.shield(task)
+        self._entries[key] = (self._clock(), [dict(item) for item in result])
+        return [dict(item) for item in result]
+
+    def invalidate(self, key: tuple) -> None:
+        self._entries.pop(key, None)
+
+
+# repo → monotonic time of the last claim-ref gc run in this process.
+_CLAIM_GC_LAST_RUN: dict[str, float] = {}
 # Restart reconciliation reports at most this many recent cut-off
 # activations per agent; older or excess rows are dropped silently.
 INTERRUPTED_ACTIVATION_MAX_AGE_SECONDS = 24 * 3600.0
@@ -557,6 +641,9 @@ class AgentConfig:
     optional: bool = False
     context_rollover_tokens: int = 60000
     patrol_interval: int = 0
+    # Extra labels a patrol issue must carry (AND-ed with status:todo), so
+    # each agent only picks up its own role's work, e.g. ["role:dev"].
+    patrol_labels: list[str] = field(default_factory=list)
     claude_timeout: int = 900
     runtime: str = "claude"
     codex_model: str = ""
@@ -1427,6 +1514,26 @@ def parse_agent_fields(
         patrol_interval = int(defaults["patrol_interval"])
     else:
         patrol_interval = 0
+    # patrol_labels: agent field → defaults → [] (labels AND-ed with status:todo)
+    raw_patrol_labels = (
+        entry["patrol_labels"]
+        if "patrol_labels" in entry
+        else defaults.get("patrol_labels", [])
+    )
+    if isinstance(raw_patrol_labels, str):
+        raw_patrol_labels = [raw_patrol_labels]
+    if not isinstance(raw_patrol_labels, list) or not all(
+        isinstance(label, str)
+        and label.strip()
+        and len(label.strip()) <= 50
+        and "\n" not in label
+        for label in raw_patrol_labels
+    ):
+        raise RuntimeError(
+            f"agent {name}: patrol_labels must be a list of GitHub label names "
+            "(1-50 characters each)"
+        )
+    patrol_labels = [label.strip() for label in raw_patrol_labels]
     # claude_timeout: agent field → defaults → 900 (seconds; hard timeout per turn,
     # also applies to codex / openai runtimes)
     if "claude_timeout" in entry:
@@ -1554,6 +1661,7 @@ def parse_agent_fields(
         "max_turns": max_turns,
         "context_rollover_tokens": context_rollover_tokens,
         "patrol_interval": patrol_interval,
+        "patrol_labels": patrol_labels,
         "claude_timeout": claude_timeout,
         "runtime": runtime,
         "codex_model": codex_model,
@@ -2804,6 +2912,7 @@ class SlackAgent:
         patrol_count: int = 1,
         turn_pacer: AdaptivePacer | None = None,
         provider_cooldowns: ProviderCooldownRegistry | None = None,
+        issue_list_cache: IssueListCache | None = None,
     ) -> None:
         self.cfg = cfg
         self.budget = budget
@@ -2865,6 +2974,10 @@ class SlackAgent:
         self._last_failure: dict[str, Any] | None = None
         # (channel, trigger ts) currently showing the 📥 queued reaction.
         self._inbox_marked: set[tuple[str, str]] = set()
+        # Shared across local agents in production (see main()).
+        self._issue_list_cache = issue_list_cache or IssueListCache()
+        # thread_key → Slack permalink of the thread root (for PR bodies).
+        self._thread_permalinks: dict[str, str] = {}
         # thread_key → admitted triggers not yet claimed by a turn, and the
         # (channel, ts) of triggers a batched turn already answered.
         self._pending_triggers: dict[str, list[dict]] = {}
@@ -5069,6 +5182,9 @@ class SlackAgent:
                     channel_guidance = await self._fetch_channel_guidance(
                         client, channel
                     )
+                    await self._remember_thread_permalink(
+                        client, channel, thread_ts, thread_key
+                    )
                     attachment_notes = [
                         note
                         for note in [
@@ -5845,6 +5961,12 @@ class SlackAgent:
                 prompt = build_patrol_work_prompt(
                     issue=int(claim["number"]),
                     title=str(claim.get("title") or ""),
+                    open_pr_command=self._claim_command(
+                        "open-pr",
+                        repo=repo_snapshot,
+                        issue=str(claim["number"]),
+                        config=config_snapshot,
+                    ),
                     release_command=self._claim_command(
                         "release",
                         repo=repo_snapshot,
@@ -5938,6 +6060,8 @@ class SlackAgent:
                 if config_snapshot.effort in CLAUDE_EFFORTS
                 else None
             ),
+            disallowed_tools=list(AGENT_DISALLOWED_TOOLS),
+            env=self._agent_env(),
         )
         result_text = ""
         provider_usage: ProviderTokenUsage | None = None
@@ -5980,6 +6104,38 @@ class SlackAgent:
             )
         return result_text
 
+    # -- agent runtime environment -------------------------------------------
+
+    def _agent_env(self, plan: ExecutionPlan | None = None) -> dict[str, str]:
+        """Guard shims on PATH plus the Slack thread link for PR bodies."""
+        thread_url = (
+            self._thread_permalinks.get(plan.thread_key, "")
+            if plan is not None
+            else ""
+        )
+        return agent_guard_env(thread_url=thread_url)
+
+    async def _remember_thread_permalink(
+        self, client: Any, channel: str, thread_ts: str | None, thread_key: str
+    ) -> None:
+        """Best-effort chat.getPermalink of the thread root, cached per thread."""
+        if not thread_ts or thread_key in self._thread_permalinks:
+            return
+        try:
+            response = await client.chat_getPermalink(
+                channel=channel, message_ts=thread_ts
+            )
+            permalink = str((response or {}).get("permalink") or "")
+        except Exception:
+            logger.debug(
+                "agent %s permalink lookup failed", self.name, exc_info=True
+            )
+            return
+        if permalink:
+            if len(self._thread_permalinks) >= 2048:
+                self._thread_permalinks.pop(next(iter(self._thread_permalinks)))
+            self._thread_permalinks[thread_key] = permalink
+
     # -- host-side issue claims (issue_claim.py) -----------------------------
 
     def _claim_command(
@@ -6005,23 +6161,23 @@ class SlackAgent:
         action: str,
         *,
         repo: str,
-        issue: int,
+        issue: int | None = None,
         config: AgentConfig | ExecutionConfig,
+        stale_only: bool = False,
     ) -> dict:
         """Run issue_claim.py; any failure to get a verdict is ``unknown``."""
-        cmd = [
-            sys.executable,
-            ISSUE_CLAIM_TOOL,
-            action,
-            "--repo",
-            repo,
-            "--issue",
-            str(int(issue)),
-            "--agent",
-            self.name,
-            "--node",
-            config.node_id or "unspecified",
-        ]
+        cmd = [sys.executable, ISSUE_CLAIM_TOOL, action, "--repo", repo]
+        if stale_only:
+            cmd.append("--stale-only")
+        if issue is not None:
+            cmd += [
+                "--issue",
+                str(int(issue)),
+                "--agent",
+                self.name,
+                "--node",
+                config.node_id or "unspecified",
+            ]
         rc, out, err = await run_host_command(
             cmd, cwd=config.workspace, timeout=CLAIM_TOOL_TIMEOUT_SECONDS
         )
@@ -6038,56 +6194,109 @@ class SlackAgent:
                 rc,
                 err[-500:],
             )
-            return {"status": "unknown", "issue": int(issue), "reason": "no verdict"}
+            return {
+                "status": "unknown",
+                "issue": int(issue or 0),
+                "reason": "no verdict",
+            }
         return result
+
+    @staticmethod
+    def _patrol_list_key(repo: str, config: AgentConfig) -> tuple:
+        return (repo, tuple(sorted(config.patrol_labels)))
 
     async def _patrol_candidates(
         self, repo: str, config: AgentConfig
     ) -> list[dict]:
-        """Open ``status:todo`` issues, oldest first; a gh failure raises."""
-        rc, out, err = await run_host_command(
-            [
-                "gh",
-                "issue",
-                "list",
-                "--repo",
-                repo,
-                "--label",
-                "status:todo",
+        """Open todo issues carrying every ``patrol_labels`` label, oldest first.
+
+        Shared through the node-wide cache; a gh failure raises.
+        """
+
+        async def list_status(status: str) -> list[dict]:
+            cmd = ["gh", "issue", "list", "--repo", repo, "--label", status]
+            for label in config.patrol_labels:
+                cmd += ["--label", label]
+            cmd += [
                 "--state",
                 "open",
                 "--json",
                 "number,title",
                 "--limit",
                 "20",
-            ],
-            cwd=config.workspace,
-            timeout=CLAIM_TOOL_TIMEOUT_SECONDS,
+            ]
+            rc, out, err = await run_host_command(
+                cmd, cwd=config.workspace, timeout=CLAIM_TOOL_TIMEOUT_SECONDS
+            )
+            if rc != 0:
+                raise RuntimeError(f"gh issue list failed: {err.strip()[-300:]}")
+            try:
+                issues = json.loads(out or "[]")
+            except ValueError as exc:
+                raise RuntimeError(
+                    "gh issue list returned malformed JSON"
+                ) from exc
+            return sorted(
+                (
+                    item
+                    for item in issues
+                    if isinstance(item, dict)
+                    and isinstance(item.get("number"), int)
+                ),
+                key=lambda item: item["number"],
+            )
+
+        async def fetch() -> list[dict]:
+            # Todo first; then in-progress issues, which only a lapsed claim
+            # (an agent that never released) may hand over (stale_only).
+            todo = await list_status(STATUS_TODO_LABEL)
+            seen = {item["number"] for item in todo}
+            lapsed = [
+                dict(item, stale_only=True)
+                for item in await list_status(STATUS_IN_PROGRESS_LABEL)
+                if item["number"] not in seen
+            ]
+            return todo + lapsed
+
+        return await self._issue_list_cache.get(
+            self._patrol_list_key(repo, config), fetch
         )
-        if rc != 0:
-            raise RuntimeError(f"gh issue list failed: {err.strip()[-300:]}")
-        try:
-            issues = json.loads(out or "[]")
-        except ValueError as exc:
-            raise RuntimeError("gh issue list returned malformed JSON") from exc
-        candidates = [
-            item
-            for item in issues
-            if isinstance(item, dict) and isinstance(item.get("number"), int)
-        ]
-        return sorted(candidates, key=lambda item: item["number"])
+
+    async def _maybe_gc_claim_refs(self, repo: str, config: AgentConfig) -> None:
+        """Drop claim refs of closed issues, at most hourly per repo and node."""
+        now = time.monotonic()
+        last = _CLAIM_GC_LAST_RUN.get(repo)
+        if last is not None and now - last < CLAIM_GC_INTERVAL_SECONDS:
+            return
+        _CLAIM_GC_LAST_RUN[repo] = now
+        result = await self._run_claim_tool("gc", repo=repo, config=config)
+        if result.get("deleted"):
+            logger.info(
+                "agent %s removed claim refs of closed issues: %s",
+                self.name,
+                result["deleted"],
+            )
 
     async def _claim_patrol_issue(
         self, repo: str, config: AgentConfig
     ) -> dict | None:
         """Claim the oldest claimable todo issue; None when nothing is claimable."""
+        await self._maybe_gc_claim_refs(repo, config)
         for candidate in (await self._patrol_candidates(repo, config))[
             :PATROL_CLAIM_ATTEMPTS
         ]:
             result = await self._run_claim_tool(
-                "claim", repo=repo, issue=candidate["number"], config=config
+                "claim",
+                repo=repo,
+                issue=candidate["number"],
+                config=config,
+                stale_only=bool(candidate.get("stale_only")),
             )
             if result.get("status") == "claimed":
+                # The claim moved it out of status:todo for every local agent.
+                self._issue_list_cache.invalidate(
+                    self._patrol_list_key(repo, config)
+                )
                 logger.info(
                     "agent %s patrol claimed issue #%s",
                     self.name,
@@ -6712,6 +6921,12 @@ class SlackAgent:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=active_workspace,
+            env={
+                **os.environ,
+                **self._agent_env(
+                    execution_plan if config is None else None
+                ),
+            },
         )
         # Process creation failure means the provider runtime never started and
         # the outer activation must release, rather than charge, its reservation.
@@ -7130,6 +7345,8 @@ class SlackAgent:
             ),
             model=active_config.claude_model or None,
             effort=self._claude_effort(active_config),
+            disallowed_tools=list(AGENT_DISALLOWED_TOOLS),
+            env=self._agent_env(execution_plan),
         )
 
         result_text = ""
@@ -7371,6 +7588,7 @@ class SlackAgent:
             "card",
             "optional",
             "allowed_tools",
+            "patrol_labels",
             "max_turns",
             "context_rollover_tokens",
             "claude_timeout",
@@ -7734,6 +7952,7 @@ class SlackAgent:
         for key in (
             "optional",
             "allowed_tools",
+            "patrol_labels",
             "max_turns",
             "context_rollover_tokens",
             "claude_timeout",
@@ -7960,12 +8179,21 @@ class SlackAgent:
                 active_config.node_id,
                 tool_command=ISSUE_CLAIM_TOOL_PREFIX,
             )
+            open_pr = claim_tool_command(
+                "open-pr",
+                tool=ISSUE_CLAIM_TOOL_PREFIX,
+                repo=repo,
+                issue="<number>",
+                agent=self.name,
+                node=active_config.node_id,
+            )
             base += (
                 "- ローカルコードを閲覧・調査・作業する前にremote情報を取得し、最新状態を確認する。thread worktreeでは現在の管理branchを維持し、`gh issue develop --checkout` や `gh pr checkout` は使わない。\n"
-                "- 進行に応じてラベルを status:in-progress → status:in-review に付け替える。\n"
-                "- 他の agent に引き継ぐ・レビューを依頼する前に必ず commit & push し、PR を作成(`gh pr create`)して URL を Slack に貼る。push していない作業は他の機械の agent からは存在しないのと同じ。\n"
+                "- status ラベル（status:todo → status:in-progress → status:in-review）は claim ツールが付け替える。手でラベルを変更しない。\n"
+                "- 他の agent に引き継ぐ・レビューを依頼する前に必ず commit & push する。push していない作業は他の機械の agent からは存在しないのと同じ。\n"
+                f"- 認領した issue の PR は `{open_pr} --title <タイトル> --body-file <本文ファイル>` で作成する（`Closes #<number>` と Slack スレッドへのリンクが自動で入り、issue は status:in-review になり、claim は解放される）。認領していない作業の PR だけ `gh pr create` を使う。PR の URL を Slack に貼る。\n"
                 "- レビュー/QA 側は現在の管理branchを切り替えずにPR差分を取得・確認し、結果は PR コメントと Slack の両方に書く。PR リンクの無いレビュー依頼は差し戻す。\n"
-                "- 完了: PR をマージ → `gh issue close <番号>` → claim ref を解放 → Slack に報告。\n"
+                "- PR のマージは人間だけが行う。agent は `gh pr merge`・自動マージ設定・マージ API・default branch への直接 push を実行しない（ガードで拒否される）。レビューが通ったら人間にマージを依頼して終了する。issue は PR のマージ時に自動でクローズされる。\n"
             )
         base += f"{active_config.persona}"
         return base
@@ -9243,6 +9471,8 @@ async def main() -> None:
     # One cooldown per provider account across all local agents.
     provider_cooldowns = ProviderCooldownRegistry(provider_cooldown_from_env)
     provider_cooldown_from_env()  # validate the env before going live
+    # One patrol issue listing per repo + labels per minute for the node.
+    issue_list_cache = IssueListCache()
     socket_gap_threshold = socket_gap_threshold_from_env()
     agents = [
         SlackAgent(
@@ -9271,6 +9501,7 @@ async def main() -> None:
             patrol_count=patrol_count,
             turn_pacer=turn_pacer,
             provider_cooldowns=provider_cooldowns,
+            issue_list_cache=issue_list_cache,
         )
         for cfg in configs
     ]

@@ -26,7 +26,8 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install -r requirements.txt
 
-COPY multi_app.py multi_core.py state_store.py transcript_store.py control_auth.py worktree_manager.py webui.py issue_claim.py agents.yaml ./
+COPY multi_app.py multi_core.py state_store.py transcript_store.py control_auth.py worktree_manager.py webui.py issue_claim.py agent_guard.py agents.yaml ./
+COPY agent_guard_bin/ agent_guard_bin/
 COPY tests/ tests/
 # Compose mounts agent-state → /app/data; pre-create so non-root can write
 RUN mkdir -p /app/data /app/worktrees \

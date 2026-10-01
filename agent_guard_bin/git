@@ -1,0 +1,8 @@
+#!/bin/sh
+# Only pushes are inspected (see agent_guard.py); other git commands run as is.
+for arg in "$@"; do
+    if [ "$arg" = "push" ]; then
+        exec "${SLACK_AGENT_PYTHON:-python3}" "${SLACK_AGENT_GUARD:?agent guard is not configured}" git "$@"
+    fi
+done
+exec "${SLACK_AGENT_REAL_GIT:?agent guard is not configured}" "$@"

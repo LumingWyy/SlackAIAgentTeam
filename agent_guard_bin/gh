@@ -1,0 +1,3 @@
+#!/bin/sh
+# Agents open PRs but never merge them; see agent_guard.py.
+exec "${SLACK_AGENT_PYTHON:-python3}" "${SLACK_AGENT_GUARD:?agent guard is not configured}" gh "$@"
