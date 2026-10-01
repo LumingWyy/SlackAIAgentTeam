@@ -413,3 +413,160 @@ def test_freshness_recheck_enabled_env_toggle(monkeypatch):
         assert SlackAgent._freshness_recheck_enabled() is False
     monkeypatch.setenv("FRESHNESS_RECHECK", "1")
     assert SlackAgent._freshness_recheck_enabled() is True
+
+
+def test_parse_freshness_decision_sentinel_with_trailing_reason():
+    # Models often explain the decision on the same line; that commentary
+    # must never be posted as the "revised" reply.
+    assert parse_freshness_decision("`NO_REPLY` — 同事已答复") == ("skip", "")
+    assert parse_freshness_decision("- POST_ORIGINAL (still correct)") == (
+        "keep",
+        "",
+    )
+    assert parse_freshness_decision("**NO_REPLY**: duplicate") == ("skip", "")
+    assert parse_freshness_decision("NO_REPLYING is not a sentinel")[0] == (
+        "revise"
+    )
+
+
+def test_gate_empty_recheck_placeholder_keeps_draft(tmp_path, monkeypatch):
+    from multi_app import CLAUDE_EMPTY_REPLY
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    agent.transcript_store = _FakeTranscriptStore(
+        [
+            _msg("100.0", "please do the task", user=HUMAN),
+            _msg("101.0", "one more thing", user=HUMAN),
+        ]
+    )
+    _stub_run_turn(agent, [CLAUDE_EMPTY_REPLY])
+    assert _run_gate(agent, "the answer") == ("the answer", False)
+
+
+# ---------------------------------------------------------------------------
+# _activate_inner wiring: baseline timing, reset skip, withdrawn reaction
+# ---------------------------------------------------------------------------
+
+
+def _wire_activation(agent, store, outputs, *, during_guidance=None):
+    """Stub every side effect of _activate_inner; returns call recorders."""
+    agent.transcript_store = store
+    calls: list[str] = []
+    posts: list[str] = []
+    reactions: list[dict] = []
+
+    async def fake_fetch_context(*_args, **_kwargs):
+        return "[human] please do the task"
+
+    async def fake_guidance(*_args, **_kwargs):
+        if during_guidance is not None:
+            during_guidance()
+        return ""
+
+    async def no_files(_event):
+        return ""
+
+    async def fake_run_turn(prompt, thread_key, gen, **kwargs):
+        calls.append(prompt)
+        return outputs[min(len(calls) - 1, len(outputs) - 1)]
+
+    async def fake_post(_channel, _thread_ts, result):
+        posts.append(result)
+
+    async def fake_reaction(_client, _channel, _ts, add=None, remove=None):
+        reactions.append({"add": add, "remove": remove})
+
+    async def members(*_args, **_kwargs):
+        return {"dev"}
+
+    async def no_rollover(*_args, **_kwargs):
+        return None
+
+    agent._fetch_context = fake_fetch_context
+    agent._fetch_channel_guidance = fake_guidance
+    agent._ingest_files = no_files
+    agent._run_turn = fake_run_turn
+    agent._post_result = fake_post
+    agent._set_reaction = fake_reaction
+    agent._channel_agent_names = members
+    agent._maybe_rollover = no_rollover
+    return calls, posts, reactions
+
+
+def _thread_event():
+    return {
+        "channel": "C1",
+        "ts": "100.0",
+        "thread_ts": "100.0",
+        "text": f"<@{SELF_USER}> please do the task",
+        "user": HUMAN,
+    }
+
+
+async def _say(**_kwargs):
+    return None
+
+
+def test_message_during_guidance_fetch_still_triggers_recheck(
+    tmp_path, monkeypatch
+):
+    import asyncio
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    store = _FakeTranscriptStore([_msg("100.0", "please do the task", user=HUMAN)])
+    calls, posts, _reactions = _wire_activation(
+        agent,
+        store,
+        ["draft", "POST_ORIGINAL"],
+        during_guidance=lambda: store.messages.append(
+            _msg("101.0", "switch to plan B", user=HUMAN)
+        ),
+    )
+    asyncio.run(agent._activate_inner(_thread_event(), object(), _say))
+    # The arrival was not in the prompt, so it must reach the recheck.
+    assert len(calls) == 2
+    assert "switch to plan B" in calls[1]
+    assert posts == ["draft"]
+
+
+def test_gate_is_skipped_after_mid_turn_reset(tmp_path, monkeypatch):
+    import asyncio
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    store = _FakeTranscriptStore([_msg("100.0", "please do the task", user=HUMAN)])
+    generations = iter([(0, 0)])
+    monkeypatch.setattr(
+        agent, "_turn_generation", lambda _key: next(generations, (1, 1))
+    )
+    calls, posts, _reactions = _wire_activation(
+        agent,
+        store,
+        ["draft", "POST_ORIGINAL"],
+        during_guidance=lambda: store.messages.append(
+            _msg("101.0", "new info", user=HUMAN)
+        ),
+    )
+    asyncio.run(agent._activate_inner(_thread_event(), object(), _say))
+    assert len(calls) == 1
+    assert posts == ["draft"]
+
+
+def test_withdrawn_reply_gets_distinct_reaction(tmp_path, monkeypatch):
+    import asyncio
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    store = _FakeTranscriptStore([_msg("100.0", "please do the task", user=HUMAN)])
+    calls, posts, reactions = _wire_activation(
+        agent,
+        store,
+        ["draft", "NO_REPLY"],
+        during_guidance=lambda: store.messages.append(
+            _msg("101.0", "never mind, done", user=HUMAN)
+        ),
+    )
+    asyncio.run(agent._activate_inner(_thread_event(), object(), _say))
+    assert posts == []
+    assert reactions[-1] == {
+        "add": "zipper_mouth_face",
+        "remove": "hourglass_flowing_sand",
+    }

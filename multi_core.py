@@ -1657,22 +1657,31 @@ def build_freshness_recheck_prompt(draft: str, new_context_block: str) -> str:
     )
 
 
+_FRESHNESS_SENTINEL_RE = re.compile(
+    r"^[\s`*_>\-\[(「\"']*"
+    rf"({FRESHNESS_KEEP_SENTINEL}|{FRESHNESS_SKIP_SENTINEL})"
+    r"(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+
+
 def parse_freshness_decision(text: str) -> tuple[str, str]:
     """Map a recheck turn's output to ``("keep"|"skip"|"revise", revised)``.
 
-    The first non-empty line decides: a bare keep/skip sentinel (tolerating
-    backticks / bold / trailing punctuation) wins; anything else means the
-    whole output is the revised reply. Empty output fails open to "keep" so a
+    The first non-empty line decides: a line that starts with a keep/skip
+    sentinel (tolerating backticks / bold / bullets, and a trailing reason
+    such as "`NO_REPLY` — already answered") wins, so the model's meta
+    commentary is never posted as the reply; anything else means the whole
+    output is the revised reply. Empty output fails open to "keep" so a
     broken recheck can never lose an already-computed reply.
     """
     for line in (text or "").splitlines():
-        token = line.strip().strip("`").strip("*").strip()
-        if not token:
+        if not line.strip():
             continue
-        normalized = token.rstrip(".。:：!！").upper()
-        if normalized == FRESHNESS_KEEP_SENTINEL:
-            return "keep", ""
-        if normalized == FRESHNESS_SKIP_SENTINEL:
+        match = _FRESHNESS_SENTINEL_RE.match(line)
+        if match:
+            if match.group(1).upper() == FRESHNESS_KEEP_SENTINEL:
+                return "keep", ""
             return "skip", ""
         break
     stripped = (text or "").strip()

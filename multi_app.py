@@ -123,6 +123,14 @@ _ALL_EFFORTS = CLAUDE_EFFORTS | CODEX_EFFORTS | OPENAI_EFFORTS
 DEFAULT_OPENAI_MODEL = "gpt-5.6-sol"
 # Placeholder so the OpenAI SDK can talk to a local CLI Proxy that may not need a real key.
 LOCAL_OPENAI_API_KEY_PLACEHOLDER = "sk-local"
+# Posted in place of an empty provider reply. The freshness recheck treats
+# them as "no decision" so a placeholder never replaces a real draft.
+CLAUDE_EMPTY_REPLY = "(Claude からテキストの応答がありませんでした)"
+CODEX_EMPTY_REPLY = "(Codex からテキストの応答がありませんでした)"
+OPENAI_EMPTY_REPLY = "(OpenAI API からテキストの応答がありませんでした)"
+EMPTY_REPLY_PLACEHOLDERS = frozenset(
+    {CLAUDE_EMPTY_REPLY, CODEX_EMPTY_REPLY, OPENAI_EMPTY_REPLY}
+)
 
 
 def provider_cooldown_from_env() -> ProviderCooldown:
@@ -4699,6 +4707,7 @@ class SlackAgent:
                 # ok means "result delivered to the thread and the turn succeeded";
                 # the finally below turns it into ✅/❌ even when posting itself fails.
                 ok = False
+                skip_post = False
                 try:
                     context_block = await self._fetch_context(
                         client,
@@ -4707,6 +4716,14 @@ class SlackAgent:
                         exclude_ts=ts,
                         thread_key=thread_key,
                         allowed_agent_names=allowed_agent_names,
+                    )
+                    # Freshness baseline from the same transcript state the
+                    # context was just built from (no await in between):
+                    # backfilled history is not a mid-turn arrival, and a
+                    # message landing during guidance/file fetches below is
+                    # unseen, so it must still trigger the recheck.
+                    freshness_baseline = self._freshness_baseline(
+                        channel, thread_ts, ts
                     )
                     channel_guidance = await self._fetch_channel_guidance(
                         client, channel
@@ -4760,12 +4777,6 @@ class SlackAgent:
                                 "`git pull` で最新化。他の agent に見せる成果は "
                                 "commit & push 済みであること。タスクの正は GitHub Issues)"
                             )
-                        # Freshness baseline AFTER context fetch (backfilled
-                        # history must not count as mid-turn arrivals): the
-                        # newest locally-known ts before the turn starts.
-                        freshness_baseline = self._freshness_baseline(
-                            channel, thread_ts, ts
-                        )
                         result = await self._run_turn(
                             prompt,
                             thread_key,
@@ -4815,6 +4826,8 @@ class SlackAgent:
                         turn_ok
                         and thread_ts
                         and self._freshness_recheck_enabled()
+                        # A thread reset mid-turn has no session to recheck in.
+                        and gen == self._turn_generation(thread_key)
                     ):
                         result, skip_post = await self._freshness_gate(
                             result,
@@ -4850,11 +4863,18 @@ class SlackAgent:
                         await self._post_result(channel, thread_ts, result)
                     ok = turn_ok
                 finally:
+                    if not ok:
+                        done_reaction = "x"
+                    elif skip_post:
+                        # Withdrawn on purpose; ✅ would claim a reply exists.
+                        done_reaction = "zipper_mouth_face"
+                    else:
+                        done_reaction = "white_check_mark"
                     await self._set_reaction(
                         client,
                         channel,
                         ts,
-                        add="white_check_mark" if ok else "x",
+                        add=done_reaction,
                         remove="hourglass_flowing_sand",
                     )
 
@@ -5116,6 +5136,10 @@ class SlackAgent:
                         self.name,
                         exc_info=True,
                     )
+                    decision_raw = ""
+                if decision_raw.strip() in EMPTY_REPLY_PLACEHOLDERS:
+                    # An empty recheck is no decision; never post the
+                    # placeholder in place of the draft.
                     decision_raw = ""
                 decision, revised = parse_freshness_decision(decision_raw)
                 if decision == "skip":
@@ -6134,14 +6158,14 @@ class SlackAgent:
                 self.name,
             )
             self.sessions.pop(thread_key, None)
-            return result_text or "(Codex からテキストの応答がありませんでした)"
+            return result_text or CODEX_EMPTY_REPLY
         if thread_id:
             self.sessions[thread_key] = thread_id
         self.thread_stats[thread_key] = {
             "input_tokens": input_tokens,
             "num_turns": 0,
         }
-        return result_text or "(Codex からテキストの応答がありませんでした)"
+        return result_text or CODEX_EMPTY_REPLY
 
     def _openai_system_prompt(
         self,
@@ -6289,18 +6313,14 @@ class SlackAgent:
                 self.name,
             )
             self.sessions.pop(thread_key, None)
-            return result_text or (
-                "(OpenAI API からテキストの応答がありませんでした)"
-            )
+            return result_text or OPENAI_EMPTY_REPLY
         if response_id:
             self.sessions[thread_key] = response_id
         self.thread_stats[thread_key] = {
             "input_tokens": input_tokens,
             "num_turns": 1,
         }
-        return result_text or (
-            "(OpenAI API からテキストの応答がありませんでした)"
-        )
+        return result_text or OPENAI_EMPTY_REPLY
 
     async def _run_claude(
         self,
@@ -6403,12 +6423,12 @@ class SlackAgent:
                 self.name,
             )
             self.sessions.pop(thread_key, None)
-            return result_text or "(Claude からテキストの応答がありませんでした)"
+            return result_text or CLAUDE_EMPTY_REPLY
         if pending_session:
             self.sessions[thread_key] = pending_session
         if pending_stats is not None:
             self.thread_stats[thread_key] = pending_stats
-        return result_text or "(Claude からテキストの応答がありませんでした)"
+        return result_text or CLAUDE_EMPTY_REPLY
 
     def effective_model(self) -> str:
         """Currently effective model name; returns "" when unset (= CLI/SDK default)."""
