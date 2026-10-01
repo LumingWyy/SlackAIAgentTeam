@@ -306,6 +306,9 @@ DM では人間は `@` なしで会話可能（peer の DM 引き継ぎはしな
 | Slack 429 | Retry-After 自動リトライ（最大 2） |
 | メモリ回収 | スレッド状態 idle 48h で回収 |
 | 長いスレッド | 共有 bounded local transcript。cold/incomplete のみ cursor、最大 15 件/page で backfill |
+| 返信 freshness gate | 投稿直前に、ターン実行中へ届いた peer/許可済み人間のメッセージを検出し、ちょうど1回だけ再判断（`POST_ORIGINAL` 原文投稿 / 修正全文 / `NO_REPLY` 取り下げ）。最新の非自分メッセージと逐語一致する返信は投稿しない。ローカル transcript のみ参照（追加 Slack API 呼び出しゼロ）、gate 自体の失敗は fail-open。`FRESHNESS_RECHECK=0` で無効化 |
+| Provider rate-limit cooldown | AI ターンがレート制限された場合（Claude / Codex / OpenAI の 429・usage limit・overloaded シグナル、`Retry-After` 尊重）、agent 単位の cooldown を作動——基本 **60 秒**、連続時は倍増で最大 **480 秒**——終了後に1回だけ再試行し、Slack メンションを失わない。cooldown 中に始まるターンは先に待機、patrol はスキップ（次の epoch で再試行）。成功ターンで streak リセット。状態は `/state` の `provider_cooldown`。`PROVIDER_COOLDOWN_BASE_SECONDS` / `PROVIDER_COOLDOWN_MAX_SECONDS` で調整 |
+| Adaptive turn pacer | 全ローカル agent がノード共通の provider ターン開始タイムラインを共有し、適応間隔で開始をずらす——基本 **0.5 秒**、レート制限ごとに倍増で最大 **8 秒**、連続 **5** クリーンターンで半減して基本値へ回帰——共有 provider アカウントの 2-3 agent が同時発火しない。Slack・freshness recheck・patrol の全ターンに適用；待機はターン timeout 窓の外で行われ、総並列度は下げない。状態は `/state` の `turn_pacer`。`PROVIDER_PACER_BASE_SECONDS`（0 で無効）/ `PROVIDER_PACER_MAX_SECONDS` / `PROVIDER_PACER_CLEAN_TURNS` で調整 |
 
 ## セキュリティ
 

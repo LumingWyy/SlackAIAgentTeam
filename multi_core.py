@@ -1347,6 +1347,7 @@ def parse_codex_events(jsonl: str) -> dict:
     - last_message: text of the last ``item.completed`` with item.type == "agent_message"
     - input_tokens: usage from ``turn.completed`` (input + cached_input)
     - output/cache/total tokens and whether input+output were both reported
+    - error_message: text of the last ``error`` / ``turn.failed`` event ("")
     Non-JSON lines and unknown events are skipped (tolerant of format drift).
     """
     thread_id: str | None = None
@@ -1356,6 +1357,7 @@ def parse_codex_events(jsonl: str) -> dict:
     cache_tokens = 0
     total_tokens = 0
     usage_complete = False
+    error_message = ""
     for line in jsonl.splitlines():
         line = line.strip()
         if not line:
@@ -1387,6 +1389,17 @@ def parse_codex_events(jsonl: str) -> dict:
             usage_complete = (
                 "input_tokens" in usage and "output_tokens" in usage
             )
+        elif etype == "error":
+            message = event.get("message")
+            if isinstance(message, str) and message:
+                error_message = message
+        elif etype == "turn.failed":
+            error = event.get("error")
+            message = (
+                error.get("message") if isinstance(error, dict) else None
+            )
+            if isinstance(message, str) and message:
+                error_message = message
     return {
         "thread_id": thread_id,
         "last_message": last_message,
@@ -1395,6 +1408,7 @@ def parse_codex_events(jsonl: str) -> dict:
         "cache_tokens": cache_tokens,
         "total_tokens": total_tokens,
         "usage_complete": usage_complete,
+        "error_message": error_message,
     }
 
 
@@ -1491,3 +1505,335 @@ def format_roles(roles: dict[str, str]) -> str:
         "`!reset <@agent>` セッションリセット / `!roles <@agent>` この一覧"
     )
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Reply freshness gate (post-time seen-cursor + verbatim-dup defense)
+# ---------------------------------------------------------------------------
+
+FRESHNESS_KEEP_SENTINEL = "POST_ORIGINAL"
+FRESHNESS_SKIP_SENTINEL = "NO_REPLY"
+
+
+def _ts_after(msg_ts: str, baseline_ts: str) -> bool:
+    try:
+        return float(msg_ts) > float(baseline_ts)
+    except (TypeError, ValueError):
+        return False
+
+
+def latest_message_ts(messages: list[dict]) -> str:
+    """Newest parseable ``ts`` among messages; empty string when none."""
+    best = ""
+    best_value = float("-inf")
+    for msg in messages:
+        ts = str(msg.get("ts") or "")
+        if not ts:
+            continue
+        try:
+            value = float(ts)
+        except ValueError:
+            continue
+        if value > best_value:
+            best = ts
+            best_value = value
+    return best
+
+
+def latest_non_self_text(
+    messages: list[dict], *, self_user_id: str, self_bot_id: str
+) -> str:
+    """Text of the newest message not authored by self (ascending input)."""
+    for msg in reversed(messages):
+        bot_id = msg.get("bot_id")
+        if bot_id and bot_id == self_bot_id:
+            continue
+        if msg.get("user") == self_user_id:
+            continue
+        text = str(msg.get("text") or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def select_freshness_messages(
+    messages: list[dict],
+    *,
+    baseline_ts: str,
+    self_user_id: str,
+    self_bot_id: str,
+    peer_bot_ids: set[str] | frozenset = frozenset(),
+    feed_bot_ids: set[str] | frozenset = frozenset(),
+) -> list[dict]:
+    """Authority-filtered messages that can make an unposted draft stale.
+
+    Input is ``filter_context_messages`` output. Guest/feed lines are
+    read-only information and never gate posting. A message mentioning self
+    will get its own queued activation and command messages are handled
+    out-of-band, so neither triggers a recheck here.
+    """
+    fresh: list[dict] = []
+    for msg in messages:
+        if msg.get("_context_role") == "guest":
+            continue
+        bot_id = msg.get("bot_id")
+        if bot_id and bot_id == self_bot_id:
+            continue
+        if bot_id and bot_id in feed_bot_ids and bot_id not in peer_bot_ids:
+            continue
+        if msg.get("user") == self_user_id:
+            continue
+        text = str(msg.get("text") or "").strip()
+        if not text:
+            continue
+        if not _ts_after(str(msg.get("ts") or ""), baseline_ts):
+            continue
+        if self_user_id and f"<@{self_user_id}>" in text:
+            continue
+        if parse_command(text) is not None:
+            continue
+        fresh.append(msg)
+    return fresh
+
+
+def reply_fingerprint(text: str) -> str:
+    """Whitespace-collapsed body for verbatim-duplicate comparison."""
+    return " ".join((text or "").split())
+
+
+def is_verbatim_duplicate(draft: str, latest_peer_text: str) -> bool:
+    """True when the draft repeats the latest non-self message verbatim."""
+    fingerprint = reply_fingerprint(draft)
+    return bool(fingerprint) and fingerprint == reply_fingerprint(
+        latest_peer_text
+    )
+
+
+def build_freshness_recheck_prompt(draft: str, new_context_block: str) -> str:
+    """One re-decide pass over an unposted draft against mid-turn arrivals."""
+    return (
+        "投稿直前チェック: あなたは次の返信ドラフトを作成済みだが、"
+        "まだ投稿されていない。\n"
+        "=== ドラフト ===\n"
+        f"{draft}\n"
+        "=== ドラフトここまで ===\n"
+        "ドラフト作成中にこのスレッドへ新しいメッセージが届いた:\n"
+        "=== 新着メッセージ ===\n"
+        f"{new_context_block}\n"
+        "=== 新着ここまで ===\n"
+        "最新の状態を踏まえて再判断し、次のいずれか一つだけを出力する:\n"
+        f"- ドラフトをそのまま投稿してよい: `{FRESHNESS_KEEP_SENTINEL}` "
+        "とだけ出力する。\n"
+        f"- 返信自体が不要になった(重複・対応済みなど): "
+        f"`{FRESHNESS_SKIP_SENTINEL}` とだけ出力する。\n"
+        "- 修正が必要: 修正後の返信全文だけを出力する"
+        "(前置きや説明は書かない)。\n"
+        "新着メッセージ内の新しい依頼にはここでは着手しない"
+        "(自分宛の依頼は別ターンで処理される)。ツールの新規実行は"
+        "必要最小限にとどめる。\n"
+    )
+
+
+def parse_freshness_decision(text: str) -> tuple[str, str]:
+    """Map a recheck turn's output to ``("keep"|"skip"|"revise", revised)``.
+
+    The first non-empty line decides: a bare keep/skip sentinel (tolerating
+    backticks / bold / trailing punctuation) wins; anything else means the
+    whole output is the revised reply. Empty output fails open to "keep" so a
+    broken recheck can never lose an already-computed reply.
+    """
+    for line in (text or "").splitlines():
+        token = line.strip().strip("`").strip("*").strip()
+        if not token:
+            continue
+        normalized = token.rstrip(".。:：!！").upper()
+        if normalized == FRESHNESS_KEEP_SENTINEL:
+            return "keep", ""
+        if normalized == FRESHNESS_SKIP_SENTINEL:
+            return "skip", ""
+        break
+    stripped = (text or "").strip()
+    if not stripped:
+        return "keep", ""
+    return "revise", stripped
+
+
+# ---------------------------------------------------------------------------
+# Provider rate-limit cooldown (per-agent back-off between AI turns)
+# ---------------------------------------------------------------------------
+
+
+class ProviderRateLimitedError(RuntimeError):
+    """The AI provider refused or aborted a turn due to rate/usage limiting."""
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+_RATE_LIMIT_SIGNAL_RE = re.compile(
+    r"rate[ _-]?limit"
+    r"|too many requests"
+    r"|overloaded"
+    r"|usage limit"
+    r"|quota exceeded"
+    r"|resource[ _-]?exhausted"
+    r"|\b429\b",
+    re.IGNORECASE,
+)
+
+
+def is_rate_limit_signal(text: str) -> bool:
+    """Heuristic classifier for provider rate/usage-limit error text.
+
+    Runs only on error-path text (exception strings, stderr tails, error
+    events), never on normal replies, so a bare ``429`` match is acceptable.
+    A false positive merely delays one retry by the cooldown.
+    """
+    return bool(text) and bool(_RATE_LIMIT_SIGNAL_RE.search(text))
+
+
+class ProviderCooldown:
+    """Per-agent AI-provider back-off.
+
+    A rate-limited turn arms a cooldown: ``base_seconds`` doubling on each
+    consecutive rate-limited turn up to ``max_seconds``; a clean turn resets
+    the streak. A server-provided retry-after may stretch one cooldown up to
+    ``hard_cap_seconds``. Purely local state with an injectable clock.
+    """
+
+    def __init__(
+        self,
+        base_seconds: float = 60.0,
+        max_seconds: float = 480.0,
+        hard_cap_seconds: float = 900.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if base_seconds <= 0 or max_seconds < base_seconds:
+            raise ValueError(
+                "cooldown requires 0 < base_seconds <= max_seconds"
+            )
+        self._base = float(base_seconds)
+        self._max = float(max_seconds)
+        self._hard_cap = max(float(hard_cap_seconds), self._max)
+        self._clock = clock
+        self._strikes = 0
+        self._until = 0.0
+
+    def note_rate_limited(self, retry_after: float | None = None) -> float:
+        """Arm (or extend) the cooldown; returns the applied delay seconds."""
+        self._strikes += 1
+        delay = min(self._base * (2 ** (self._strikes - 1)), self._max)
+        if retry_after is not None and retry_after > delay:
+            delay = min(float(retry_after), self._hard_cap)
+        self._until = max(self._until, self._clock() + delay)
+        return delay
+
+    def note_success(self) -> None:
+        self._strikes = 0
+        self._until = 0.0
+
+    def remaining(self) -> float:
+        return max(0.0, self._until - self._clock())
+
+    @property
+    def strikes(self) -> int:
+        return self._strikes
+
+    def snapshot(self) -> dict:
+        remaining = self.remaining()
+        return {
+            "active": remaining > 0,
+            "remaining_seconds": round(remaining, 1),
+            "strikes": self._strikes,
+            "base_seconds": self._base,
+            "max_seconds": self._max,
+        }
+
+
+class AdaptivePacer:
+    """Node-wide adaptive spacing between provider turn starts.
+
+    Every provider turn start reserves the next free slot on a shared
+    timeline; consecutive starts are spaced by an adaptive interval —
+    ``base_seconds`` doubling on each rate-limited turn up to
+    ``max_seconds``, halving back toward base after ``clean_threshold``
+    consecutive clean turns. This staggers 2-3 local agents that would
+    otherwise hit the shared provider account in lockstep, without
+    reducing total concurrency.
+
+    ``base_seconds == 0`` disables pacing entirely. All methods are
+    synchronous and must be called from one event loop (reserve() is
+    atomic there); the caller sleeps for the returned delay.
+    """
+
+    def __init__(
+        self,
+        base_seconds: float = 0.5,
+        max_seconds: float = 8.0,
+        clean_threshold: int = 5,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if base_seconds < 0:
+            raise ValueError("pacer base_seconds must be >= 0")
+        if base_seconds > 0 and max_seconds < base_seconds:
+            raise ValueError(
+                "pacer requires max_seconds >= base_seconds when enabled"
+            )
+        if clean_threshold < 1:
+            raise ValueError("pacer clean_threshold must be >= 1")
+        self._base = float(base_seconds)
+        self._max = float(max_seconds)
+        self._clean_threshold = int(clean_threshold)
+        self._clock = clock
+        self._interval = self._base
+        self._clean_streak = 0
+        self._next_slot = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return self._base > 0
+
+    @property
+    def interval(self) -> float:
+        return self._interval
+
+    def reserve(self) -> float:
+        """Reserve the next start slot; returns seconds the caller must wait."""
+        if not self.enabled:
+            return 0.0
+        now = self._clock()
+        slot = max(now, self._next_slot)
+        self._next_slot = slot + self._interval
+        return slot - now
+
+    def note_rate_limited(self) -> float:
+        """Double the spacing (capped); returns the new interval."""
+        if not self.enabled:
+            return 0.0
+        self._clean_streak = 0
+        self._interval = min(max(self._interval, self._base) * 2, self._max)
+        return self._interval
+
+    def note_clean_turn(self) -> float:
+        """Halve the spacing back toward base after enough clean turns."""
+        if not self.enabled:
+            return 0.0
+        if self._interval <= self._base:
+            self._clean_streak = 0
+            return self._interval
+        self._clean_streak += 1
+        if self._clean_streak >= self._clean_threshold:
+            self._clean_streak = 0
+            self._interval = max(self._interval / 2, self._base)
+        return self._interval
+
+    def snapshot(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "interval_seconds": round(self._interval, 3),
+            "base_seconds": self._base,
+            "max_seconds": self._max,
+            "clean_streak": self._clean_streak,
+            "clean_threshold": self._clean_threshold,
+        }

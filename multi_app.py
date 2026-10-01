@@ -27,7 +27,7 @@ from typing import Any
 import aiohttp
 import yaml
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError as OpenAIRateLimitError
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 from slack_sdk.http_retry.builtin_async_handlers import (
@@ -42,10 +42,14 @@ from control_auth import (
     require_slack_human_id,
 )
 from multi_core import (
+    AdaptivePacer,
     EventDeduper,
     ProjectPolicy,
+    ProviderCooldown,
+    ProviderRateLimitedError,
     TurnBudget,
     build_activation_prompt,
+    build_freshness_recheck_prompt,
     canonical_github_repo,
     classify_sender,
     constrain_handoff_targets,
@@ -55,7 +59,11 @@ from multi_core import (
     filter_context_messages,
     flatten_event_text,
     format_github_claim_protocol,
+    is_rate_limit_signal,
     is_slack_file_url,
+    is_verbatim_duplicate,
+    latest_message_ts,
+    latest_non_self_text,
     tag_continuation_lines,
     format_channel_guidance,
     format_roles,
@@ -69,11 +77,13 @@ from multi_core import (
     neutralize_handoff_envelopes,
     parse_codex_events,
     parse_command,
+    parse_freshness_decision,
     parse_handoff,
     next_patrol_deadline,
     registered_agent_mentions,
     safe_filename,
     scrub_slack_token_env,
+    select_freshness_messages,
     should_activate,
     split_markdown,
     split_message,
@@ -102,6 +112,117 @@ _ALL_EFFORTS = CLAUDE_EFFORTS | CODEX_EFFORTS | OPENAI_EFFORTS
 DEFAULT_OPENAI_MODEL = "gpt-5.6-sol"
 # Placeholder so the OpenAI SDK can talk to a local CLI Proxy that may not need a real key.
 LOCAL_OPENAI_API_KEY_PLACEHOLDER = "sk-local"
+
+
+def provider_cooldown_from_env() -> ProviderCooldown:
+    """Build the per-agent provider cooldown from env; invalid values fail startup."""
+
+    def read(name: str, default: float) -> float:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return default
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{name} must be a number of seconds (got: {raw!r})"
+            ) from exc
+        if value <= 0:
+            raise RuntimeError(f"{name} must be positive (got: {raw!r})")
+        return value
+
+    base = read("PROVIDER_COOLDOWN_BASE_SECONDS", 60.0)
+    max_seconds = read("PROVIDER_COOLDOWN_MAX_SECONDS", 480.0)
+    if max_seconds < base:
+        raise RuntimeError(
+            "PROVIDER_COOLDOWN_MAX_SECONDS must be >= "
+            "PROVIDER_COOLDOWN_BASE_SECONDS"
+        )
+    return ProviderCooldown(base_seconds=base, max_seconds=max_seconds)
+
+
+def provider_pacer_from_env() -> AdaptivePacer:
+    """Build the node-wide turn pacer from env; invalid values fail startup.
+
+    ``PROVIDER_PACER_BASE_SECONDS=0`` disables pacing.
+    """
+
+    def read_float(name: str, default: float, *, minimum: float) -> float:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return default
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{name} must be a number of seconds (got: {raw!r})"
+            ) from exc
+        if value < minimum:
+            raise RuntimeError(
+                f"{name} must be >= {minimum:g} (got: {raw!r})"
+            )
+        return value
+
+    base = read_float("PROVIDER_PACER_BASE_SECONDS", 0.5, minimum=0.0)
+    max_seconds = read_float("PROVIDER_PACER_MAX_SECONDS", 8.0, minimum=0.0)
+    raw_threshold = os.environ.get("PROVIDER_PACER_CLEAN_TURNS", "").strip()
+    if raw_threshold:
+        try:
+            clean_threshold = int(raw_threshold)
+        except ValueError as exc:
+            raise RuntimeError(
+                "PROVIDER_PACER_CLEAN_TURNS must be an integer "
+                f"(got: {raw_threshold!r})"
+            ) from exc
+    else:
+        clean_threshold = 5
+    if base > 0 and max_seconds < base:
+        raise RuntimeError(
+            "PROVIDER_PACER_MAX_SECONDS must be >= PROVIDER_PACER_BASE_SECONDS"
+        )
+    if clean_threshold < 1:
+        raise RuntimeError("PROVIDER_PACER_CLEAN_TURNS must be >= 1")
+    return AdaptivePacer(
+        base_seconds=base,
+        max_seconds=max_seconds,
+        clean_threshold=clean_threshold,
+    )
+
+
+def _provider_error_retry_after(exc: BaseException) -> float | None:
+    """Retry-after seconds from an API error's HTTP response, when present."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    try:
+        raw = headers.get("retry-after")
+    except Exception:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def classify_provider_rate_limit(
+    exc: BaseException,
+) -> tuple[bool, float | None]:
+    """``(is_rate_limit, retry_after_seconds)`` for a failed runtime turn.
+
+    Timeouts are never rate limits (retrying immediately against a slow
+    provider is the caller's existing behavior to keep).
+    """
+    if isinstance(exc, ProviderRateLimitedError):
+        return True, exc.retry_after
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return False, None
+    if isinstance(exc, OpenAIRateLimitError):
+        return True, _provider_error_retry_after(exc)
+    if is_rate_limit_signal(str(exc)):
+        return True, _provider_error_retry_after(exc)
+    return False, None
 
 
 def normalize_openai_base_url(value: str, *, agent_name: str = "") -> str:
@@ -2417,6 +2538,7 @@ class SlackAgent:
         repo_spec: RepoSpec | None = None,
         patrol_index: int = 0,
         patrol_count: int = 1,
+        turn_pacer: AdaptivePacer | None = None,
     ) -> None:
         self.cfg = cfg
         self.budget = budget
@@ -2471,6 +2593,13 @@ class SlackAgent:
         # thread_key → previous session summary (injected into new session after rollover)
         self.thread_summaries: dict[str, str] = {}
         self.deduper = EventDeduper()
+        # Per-agent AI-provider back-off; armed on rate-limited turns,
+        # reset by a clean turn (Slack and patrol turns share it).
+        self._provider_cooldown = provider_cooldown_from_env()
+        # Node-wide turn pacer: production injects one shared instance into
+        # every local agent so their provider turn starts are staggered; the
+        # fallback keeps isolated/programmatic construction usable.
+        self._turn_pacer = turn_pacer or provider_pacer_from_env()
         # channel → (monotonic time, guidance text); TTL cache to avoid API on every message
         self._channel_guidance_cache: dict[str, tuple[float, str]] = {}
         # (Slack team, channel) → (monotonic time, member IDs or failed lookup)
@@ -2576,6 +2705,27 @@ class SlackAgent:
         plan = self._active_execution_plan()
         return plan.execution_path if plan is not None else self.cfg.workspace
 
+    async def _pace_turn_start(self) -> None:
+        """Reserve a slot on the node-wide turn timeline and wait for it.
+
+        Called immediately before every provider call (Slack, freshness
+        recheck, and patrol turns) so 2-3 local agents never start turns in
+        lockstep against the shared provider account. reserve() is atomic on
+        the event loop; the sleep happens outside any lock and before the
+        per-turn provider timeout window opens.
+        """
+        delay = self._turn_pacer.reserve()
+        if delay <= 0:
+            return
+        log = logger.info if delay >= 1.0 else logger.debug
+        log(
+            "agent %s pacing turn start: %.2fs (interval %.2fs)",
+            self.name,
+            delay,
+            self._turn_pacer.interval,
+        )
+        await asyncio.sleep(delay)
+
     def _mark_quota_runtime_started(self) -> QuotaReservation | None:
         reservation = _CURRENT_QUOTA_RESERVATION.get()
         if reservation is not None:
@@ -2584,8 +2734,25 @@ class SlackAgent:
 
     def _settle_quota_usage(self, usage: ProviderTokenUsage) -> None:
         reservation = _CURRENT_QUOTA_RESERVATION.get()
-        if reservation is not None:
-            self.quota_tracker.settle(reservation, usage)
+        if reservation is None:
+            return
+        if reservation.done:
+            # A second runtime turn inside one admitted activation (the
+            # freshness recheck) lands after the reservation settled; charge
+            # it to the same owner ledger instead of dropping the usage.
+            normalized = usage.normalized()
+            self.quota_tracker.record(
+                reservation.owner,
+                total_tokens=normalized.total_tokens,
+                input_tokens=normalized.input_tokens,
+                output_tokens=normalized.output_tokens,
+                cache_tokens=normalized.cache_tokens,
+                agent_name=reservation.agent_name,
+                runtime=reservation.runtime,
+                estimated=not normalized.complete,
+            )
+            return
+        self.quota_tracker.settle(reservation, usage)
 
     def _project_policy(self, channel: str) -> ProjectPolicy | None:
         return self.projects_by_channel.get(channel)
@@ -4471,6 +4638,12 @@ class SlackAgent:
                                 "`git pull` で最新化。他の agent に見せる成果は "
                                 "commit & push 済みであること。タスクの正は GitHub Issues)"
                             )
+                        # Freshness baseline AFTER context fetch (backfilled
+                        # history must not count as mid-turn arrivals): the
+                        # newest locally-known ts before the turn starts.
+                        freshness_baseline = self._freshness_baseline(
+                            channel, thread_ts, ts
+                        )
                         result = await self._run_turn(
                             prompt,
                             thread_key,
@@ -4498,6 +4671,28 @@ class SlackAgent:
                         )
                         result = "⚠️ エラーが発生しました。サーバーログを確認してください。"
 
+                    # Post-time freshness gate: messages that arrived while
+                    # the turn ran get one re-decide pass; a verbatim
+                    # duplicate of the latest non-self message never posts.
+                    skip_post = False
+                    if (
+                        turn_ok
+                        and thread_ts
+                        and self._freshness_recheck_enabled()
+                    ):
+                        result, skip_post = await self._freshness_gate(
+                            result,
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            baseline_ts=freshness_baseline,
+                            thread_key=thread_key,
+                            gen=gen,
+                            allowed_agent_names=allowed_agent_names,
+                            project_id=(
+                                policy.project_id if policy is not None else ""
+                            ),
+                        )
+
                     # last_seen is in-process redelivery bookkeeping and always applies;
                     # persistence is skipped when the thread was cleared mid-turn, or the
                     # deleted row would come straight back with this turn's state.
@@ -4515,7 +4710,8 @@ class SlackAgent:
 
                     # Post results as new messages (not chat_update): message_changed is classified
                     # as system and ignored, so peers would never see mentions.
-                    await self._post_result(channel, thread_ts, result)
+                    if not skip_post:
+                        await self._post_result(channel, thread_ts, result)
                     ok = turn_ok
                 finally:
                     await self._set_reaction(
@@ -4658,6 +4854,157 @@ class SlackAgent:
                     mention_kwargs["thread_ts"] = thread_ts
                 await self.app.client.chat_postMessage(**mention_kwargs)
 
+    @staticmethod
+    def _freshness_recheck_enabled() -> bool:
+        """Reply freshness gate toggle (`FRESHNESS_RECHECK`, default on)."""
+        value = os.environ.get("FRESHNESS_RECHECK", "1").strip().lower()
+        return value not in {"0", "false", "no", "off"}
+
+    def _thread_snapshot_messages(
+        self,
+        channel: str,
+        thread_ts: str,
+        allowed_agent_names: set[str] | frozenset[str] | None,
+    ) -> list[dict]:
+        """Authority-filtered local transcript read (zero Slack API calls)."""
+        snapshot = self.transcript_store.read_thread(
+            self._transcript_team_id(), channel, thread_ts
+        )
+        policy = self._project_policy(channel)
+        allowed_humans, allow_any_human = self._allowed_humans_for(policy)
+        peer_bot_ids = self.roster.peer_bot_ids(self.name, allowed_agent_names)
+        return filter_context_messages(
+            snapshot.messages,
+            self_bot_id=self.bot_id,
+            self_user_id=self.user_id,
+            peer_bot_ids=peer_bot_ids,
+            allowed_humans=allowed_humans,
+            feed_bot_ids=self.feed_bot_ids,
+            allow_any_human=allow_any_human,
+        )
+
+    def _freshness_baseline(
+        self, channel: str, thread_ts: str | None, trigger_ts: str
+    ) -> str:
+        """Newest locally-known ts before the turn starts.
+
+        Arrivals newer than this gate posting; local read only, degrading to
+        the trigger ts so a transcript failure can never block the turn.
+        """
+        if not thread_ts:
+            return trigger_ts
+        latest = ""
+        try:
+            snapshot = self.transcript_store.read_thread(
+                self._transcript_team_id(), channel, thread_ts
+            )
+            latest = latest_message_ts(snapshot.messages)
+        except Exception:
+            logger.warning(
+                "agent %s freshness baseline read failed (using trigger ts)",
+                self.name,
+                exc_info=True,
+            )
+        try:
+            if latest and float(latest) > float(trigger_ts):
+                return latest
+        except ValueError:
+            pass
+        return trigger_ts
+
+    async def _freshness_gate(
+        self,
+        result: str,
+        *,
+        channel: str,
+        thread_ts: str,
+        baseline_ts: str,
+        thread_key: str,
+        gen: tuple[int, int],
+        allowed_agent_names: set[str] | frozenset[str] | None,
+        project_id: str,
+    ) -> tuple[str, bool]:
+        """Post-time freshness gate. Returns ``(final_result, skip_post)``.
+
+        One local re-read of the shared transcript: peer/allowed-human
+        messages that arrived while the turn ran trigger exactly one
+        re-decide pass (keep / revise / withdraw); a verbatim duplicate of
+        the latest non-self message is suppressed. Every failure fails open
+        so an already-computed reply is never lost to the gate itself.
+        """
+        try:
+            messages = self._thread_snapshot_messages(
+                channel, thread_ts, allowed_agent_names
+            )
+        except Exception:
+            logger.warning(
+                "agent %s freshness gate transcript read failed (fail-open)",
+                self.name,
+                exc_info=True,
+            )
+            return result, False
+        peer_bot_ids = self.roster.peer_bot_ids(self.name, allowed_agent_names)
+        newer = select_freshness_messages(
+            messages,
+            baseline_ts=baseline_ts,
+            self_user_id=self.user_id,
+            self_bot_id=self.bot_id,
+            peer_bot_ids=peer_bot_ids,
+            feed_bot_ids=self.feed_bot_ids,
+        )
+        final = result
+        if newer:
+            block = format_thread_context(
+                newer,
+                name_of=self._display_name_of,
+                self_user_id=self.user_id,
+            )
+            if block:
+                logger.info(
+                    "agent %s freshness recheck: %d mid-turn message(s) thread=%s",
+                    self.name,
+                    len(newer),
+                    thread_key,
+                )
+                try:
+                    decision_raw = await self._run_turn(
+                        build_freshness_recheck_prompt(result, block),
+                        thread_key,
+                        gen,
+                        allowed_agent_names=allowed_agent_names,
+                        project_id=project_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "agent %s freshness recheck turn failed (fail-open)",
+                        self.name,
+                        exc_info=True,
+                    )
+                    decision_raw = ""
+                decision, revised = parse_freshness_decision(decision_raw)
+                if decision == "skip":
+                    logger.info(
+                        "agent %s freshness recheck withdrew the reply thread=%s",
+                        self.name,
+                        thread_key,
+                    )
+                    return final, True
+                if decision == "revise":
+                    final = revised
+        latest_peer = latest_non_self_text(
+            messages,
+            self_user_id=self.user_id,
+            self_bot_id=self.bot_id,
+        )
+        if is_verbatim_duplicate(final, latest_peer):
+            logger.warning(
+                "agent %s suppressed verbatim duplicate reply thread=%s",
+                self.name,
+                thread_key,
+            )
+            return final, True
+        return final, False
+
     async def patrol_loop(self) -> None:
         """Patrol heartbeat: periodically acquire todo issue leases and report.
 
@@ -4726,6 +5073,16 @@ class SlackAgent:
 
     async def _run_patrol_once(self, prompt: str, channel: str) -> None:
         """Run patrol and consume a deferred snapshot on every exit path."""
+        cooldown_wait = self._provider_cooldown.remaining()
+        if cooldown_wait > 0:
+            # Unlike a Slack mention, a skipped patrol round retries at the
+            # next epoch anyway; do not hold node capacity to wait it out.
+            logger.warning(
+                "agent %s patrol skipped: provider cooldown %.1fs remaining",
+                self.name,
+                cooldown_wait,
+            )
+            return
         config_snapshot = replace(
             self.cfg, allowed_tools=list(self.cfg.allowed_tools)
         )
@@ -4765,6 +5122,24 @@ class SlackAgent:
                 repo_snapshot=repo_snapshot,
                 admission=admission,
             )
+        except Exception as exc:
+            rate_limited, retry_after = classify_provider_rate_limit(exc)
+            if rate_limited:
+                delay = self._provider_cooldown.note_rate_limited(retry_after)
+                self._turn_pacer.note_rate_limited()
+                logger.warning(
+                    "agent %s patrol provider rate-limited (strike %d, "
+                    "cooldown %.0fs, pacer interval %.2fs): %s",
+                    self.name,
+                    self._provider_cooldown.strikes,
+                    delay,
+                    self._turn_pacer.interval,
+                    str(exc)[:300],
+                )
+            raise
+        else:
+            self._provider_cooldown.note_success()
+            self._turn_pacer.note_clean_turn()
         finally:
             _CURRENT_QUOTA_RESERVATION.reset(quota_token)
             if quota_reservation is not None:
@@ -4882,6 +5257,7 @@ class SlackAgent:
                 )
                 result_text = ""
                 provider_usage: ProviderTokenUsage | None = None
+                await self._pace_turn_start()
                 self._mark_quota_runtime_started()
                 async with asyncio.timeout(config_snapshot.claude_timeout):
                     async for message in query(prompt=prompt, options=options):
@@ -5275,7 +5651,65 @@ class SlackAgent:
         file ingestion; using it (instead of re-snapshotting here) closes the
         window where a !reset landing during preprocessing would become the new
         baseline and the cleared session would be silently recreated.
+
+        A provider rate limit arms the per-agent cooldown and the turn is
+        retried once after it expires; a Slack mention must not be lost, so
+        the turn waits instead of being skipped. A turn that starts while a
+        cooldown is armed also waits first. Timeouts and other errors keep
+        their existing single-attempt behavior.
         """
+        for attempt in (0, 1):
+            wait = self._provider_cooldown.remaining()
+            if wait > 0:
+                logger.warning(
+                    "agent %s provider cooldown active: waiting %.1fs "
+                    "before turn thread=%s",
+                    self.name,
+                    wait,
+                    thread_key,
+                )
+                await asyncio.sleep(wait)
+            try:
+                result = await self._dispatch_turn(
+                    prompt,
+                    thread_key,
+                    gen,
+                    allowed_agent_names=allowed_agent_names,
+                    project_id=project_id,
+                )
+            except Exception as exc:
+                rate_limited, retry_after = classify_provider_rate_limit(exc)
+                if not rate_limited:
+                    raise
+                delay = self._provider_cooldown.note_rate_limited(retry_after)
+                self._turn_pacer.note_rate_limited()
+                logger.warning(
+                    "agent %s provider rate-limited (strike %d, cooldown "
+                    "%.0fs, pacer interval %.2fs) thread=%s: %s",
+                    self.name,
+                    self._provider_cooldown.strikes,
+                    delay,
+                    self._turn_pacer.interval,
+                    thread_key,
+                    str(exc)[:300],
+                )
+                if attempt == 0:
+                    continue
+                raise
+            self._provider_cooldown.note_success()
+            self._turn_pacer.note_clean_turn()
+            return result
+        raise AssertionError("unreachable: _run_turn retry loop exhausted")
+
+    async def _dispatch_turn(
+        self,
+        prompt: str,
+        thread_key: str,
+        gen: tuple[int, int],
+        *,
+        allowed_agent_names: set[str] | frozenset[str] | None = None,
+        project_id: str = "",
+    ) -> str:
         active_config = self._active_execution_config()
         if active_config.runtime == "codex":
             return await self._run_codex(
@@ -5363,6 +5797,7 @@ class SlackAgent:
                 cmd += ["-c", "sandbox_workspace_write.network_access=true"]
             cmd.append(prompt)
 
+        await self._pace_turn_start()
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -5432,14 +5867,25 @@ class SlackAgent:
                         exc_info=True,
                     )
             raise
+        stderr_text = stderr.decode(errors="replace")
         if proc.returncode != 0:
             logger.warning(
                 "agent %s codex exec rc=%s stderr=%s",
                 self.name,
                 proc.returncode,
-                stderr.decode(errors="replace")[-2000:],
+                stderr_text[-2000:],
             )
         parsed = parse_codex_events(stdout.decode(errors="replace"))
+        # A rate-limited codex run reports through an error event or stderr;
+        # surface it as a typed error so _run_turn can cool down and retry.
+        error_message = str(parsed.get("error_message") or "")
+        if is_rate_limit_signal(error_message) or (
+            proc.returncode != 0 and is_rate_limit_signal(stderr_text)
+        ):
+            raise ProviderRateLimitedError(
+                (error_message or stderr_text.strip())[-500:]
+                or "codex runtime rate limited"
+            )
         return (
             parsed["last_message"] or "",
             parsed["thread_id"],
@@ -5595,6 +6041,7 @@ class SlackAgent:
         if active_config.effort in OPENAI_EFFORTS:
             request["reasoning"] = {"effort": active_config.effort}
 
+        await self._pace_turn_start()
         self._mark_quota_runtime_started()
         async with asyncio.timeout(active_config.claude_timeout):
             response = await client.responses.create(**request)
@@ -5728,6 +6175,8 @@ class SlackAgent:
         pending_session = ""
         pending_stats: dict[str, int] | None = None
         provider_usage: ProviderTokenUsage | None = None
+        result_is_error = False
+        await self._pace_turn_start()
         self._mark_quota_runtime_started()
         async with asyncio.timeout(active_config.claude_timeout):
             async for message in query(prompt=prompt, options=options):
@@ -5738,6 +6187,9 @@ class SlackAgent:
                     pending_session = message.data.get("session_id") or ""
                 elif isinstance(message, ResultMessage):
                     result_text = message.result or ""
+                    result_is_error = bool(
+                        getattr(message, "is_error", False)
+                    )
                     usage = getattr(message, "usage", None) or {}
                     input_tokens = sum(
                         int(usage.get(k) or 0)
@@ -5774,6 +6226,14 @@ class SlackAgent:
                     )
         if provider_usage is not None:
             self._settle_quota_usage(provider_usage)
+        # A rate-limited CLI turn arrives as an error ResultMessage, not an
+        # exception; surface it as one so _run_turn can cool down and retry.
+        # Raised after quota settlement and before any session write-back, so
+        # the retry resumes the pre-turn session.
+        if result_is_error and is_rate_limit_signal(result_text):
+            raise ProviderRateLimitedError(
+                result_text or "claude runtime rate limited"
+            )
         if gen != self._turn_generation(thread_key):
             logger.warning(
                 "agent %s discarding claude turn session (state cleared mid-turn)",
@@ -6402,6 +6862,8 @@ class SlackAgent:
                 else None
             ),
             **runtime_status,
+            "provider_cooldown": self._provider_cooldown.snapshot(),
+            "turn_pacer": self._turn_pacer.snapshot(),
             "busy_threads": sum(1 for t in threads if t["busy"]),
             "session_count": len(self.sessions),
             "patrol": bool(
@@ -6507,6 +6969,14 @@ class SlackAgent:
             "- Slackで崩れるため表(テーブル)は使わない。箇条書きと短い段落で構成する。見出しよりも太字を使う。\n"
             "- 協働ルール: 依頼は1メッセージ1件。スレッドで既出の情報を繰り返さない。"
             "相槌や確認だけの返信はしない。返信は要点のみ。\n"
+            "- 協調原則: 実際に投稿済みのスレッド内容だけを前提に行動し、"
+            "役割分担や発言順の推測で先回りしない。完了条件は依頼された"
+            "タスクの消化であり、全員が一度ずつ発言することではない。"
+            "担当 agent が不在・無応答なら、待ち続けずに対応可能な者が"
+            "次のタスクを引き取る。\n"
+            "- 人間の依頼は字面の抜け穴ではなく意図に沿って実行する。"
+            "協調の都合で成果物の内容を曲げず、直前の他者の発言を"
+            "そのまま繰り返す投稿はしない。\n"
             "- 運用コマンド: `!status <@agent>` でセッション状態確認、"
             "`!reset <@agent>` でセッションリセット、"
             "`!roles <@agent>` でチーム構成と各担当の職責を表示できる"
@@ -7805,6 +8275,9 @@ async def main() -> None:
         name: index for index, name in enumerate(patrol_roster)
     }
     patrol_count = max(1, len(patrol_roster))
+    # One node-wide pacer: all local agents share the provider account, so
+    # their turn starts are staggered on one timeline.
+    turn_pacer = provider_pacer_from_env()
     agents = [
         SlackAgent(
             cfg,
@@ -7830,6 +8303,7 @@ async def main() -> None:
             repo_spec=repo_specs.get(cfg.name),
             patrol_index=patrol_positions.get(cfg.name, 0),
             patrol_count=patrol_count,
+            turn_pacer=turn_pacer,
         )
         for cfg in configs
     ]
