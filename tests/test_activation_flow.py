@@ -676,3 +676,25 @@ def test_finished_activation_leaves_no_ledger_row(tmp_path, monkeypatch):
         "dev", team_id="T_TEST", max_age_seconds=3600, limit=10
     ) == []
     store.close()
+
+
+def test_batched_turn_clears_ledger_rows_of_absorbed_triggers(
+    tmp_path, monkeypatch
+):
+    from state_store import StateStore
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    store = StateStore(str(tmp_path / "ledger.db"))
+    agent._store = store
+    _wire(agent, ["answer"])
+    first, second = _event(ts="101.0"), _event(ts="102.0")
+    for event in (first, second):
+        agent._register_pending_trigger("C1:100.0", event)
+        agent._ledger_record(event, agent.build_execution_plan(event))
+    _activate(agent, first)
+    rows = store.take_interrupted_activations(
+        "dev", team_id="T_TEST", max_age_seconds=3600, limit=10
+    )
+    # Only the holder's own row remains until its task callback clears it.
+    assert [row["trigger_ts"] for row in rows] == ["101.0"]
+    store.close()

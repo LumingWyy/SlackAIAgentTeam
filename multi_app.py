@@ -5265,6 +5265,11 @@ class SlackAgent:
                             add=done_reaction,
                             remove="hourglass_flowing_sand",
                         )
+                    # Batched triggers are answered now; a crash before their
+                    # own (no-op) tasks run must not report them as cut off.
+                    for trigger in batch:
+                        if trigger is not event:
+                            self._ledger_clear(trigger)
 
                 # After all result chunks are posted, check whether context rollover is needed (still under lock)
                 await self._maybe_rollover(
