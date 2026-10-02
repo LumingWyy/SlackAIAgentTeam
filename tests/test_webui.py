@@ -68,6 +68,198 @@ def test_issues_cache_has_hard_limit(monkeypatch):
     assert "acme/repo-0" not in webui._issues_cache
 
 
+class _IssuesRequest(dict):
+    """Minimal aiohttp request stand-in: a principal plus query parameters."""
+
+    def __init__(self, query=None):
+        super().__init__()
+        self[webui._CONTROL_PRINCIPAL_KEY] = webui.ControlPrincipal(
+            user_id="", is_admin=True, legacy=True
+        )
+        self.query = query or {}
+
+
+def _issues_fixture(monkeypatch, raw, env=None, outcomes=None):
+    import json as _json
+
+    calls = []
+
+    async def fake_issues(repo):
+        calls.append(repo)
+        return (outcomes or {}).get(repo, ([{"number": 1, "title": repo, "url": ""}], ""))
+
+    monkeypatch.setattr(webui, "read_yaml", lambda: raw)
+    monkeypatch.setattr(webui, "read_env_file", lambda: dict(env or {}))
+    monkeypatch.setattr(webui.shutil, "which", lambda _name: "/bin/gh")
+    monkeypatch.setattr(webui, "_gh_issues", fake_issues)
+    webui._issues_cache.clear()
+
+    def fetch(query=None):
+        response = asyncio.run(webui.h_issues(_IssuesRequest(query)))
+        return _json.loads(response.text)
+
+    return fetch, calls
+
+
+def test_one_unreachable_repo_does_not_hide_the_other_issues(monkeypatch):
+    fetch, _calls = _issues_fixture(
+        monkeypatch,
+        {"agents": [
+            {"name": "a", "github_repo": "acme/live"},
+            {"name": "b", "github_repo": "acme/gone"},
+        ]},
+        outcomes={"acme/gone": ([], "GraphQL: Could not resolve to a Repository")},
+    )
+    data = fetch()
+    assert [issue["repo"] for issue in data["issues"]] == ["acme/live"]
+    assert data["errors"] == [
+        {"repo": "acme/gone", "error": "GraphQL: Could not resolve to a Repository"}
+    ]
+    assert data["error"].startswith("acme/gone: ")
+
+
+def test_issues_skip_optional_agents_multi_app_does_not_start(monkeypatch):
+    """pm/qa without tokens fall back to the global repo but never run."""
+    raw = {
+        "github": {"repo": "acme/stale-default"},
+        "agents": [
+            {"name": "dev", "github_repo": "acme/live"},
+            {"name": "pm", "optional": True},
+            {"name": "qa", "optional": True},
+        ],
+    }
+    fetch, calls = _issues_fixture(
+        monkeypatch, raw, env={"QA_SLACK_BOT_TOKEN": "x", "QA_SLACK_APP_TOKEN": "y"}
+    )
+    for name in ("PM_SLACK_BOT_TOKEN", "PM_SLACK_APP_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    data = fetch()
+    # qa has both tokens, so its fallback repo is watched; pm has none.
+    assert data["repos"] == ["acme/live", "acme/stale-default"]
+    env_less, _ = _issues_fixture(monkeypatch, raw)
+    assert env_less()["repos"] == ["acme/live"]
+
+
+def test_refresh_now_bypasses_the_cache_but_not_within_five_seconds(monkeypatch):
+    fetch, calls = _issues_fixture(
+        monkeypatch, {"agents": [{"name": "a", "github_repo": "acme/live"}]}
+    )
+    clock = {"now": 1000.0}
+    import time as _time
+
+    monkeypatch.setattr(_time, "monotonic", lambda: clock["now"])
+    fetch()
+    clock["now"] += 3
+    fetch({"refresh": "1"})
+    assert calls == ["acme/live"]  # too soon: the cached answer stands
+    clock["now"] += 3
+    fetch()
+    assert calls == ["acme/live"]  # plain polling keeps the 30s cache
+    fetch({"refresh": "1"})
+    assert calls == ["acme/live", "acme/live"]
+
+
+def test_issue_panel_renders_errors_beside_issues_and_shows_refresh_feedback():
+    script = _main_script(webui.INDEX_HTML)
+    assert 'id="issues-refresh" onclick="loadIssues(true)"' in webui.INDEX_HTML
+    assert "/api/issues'+(manual?'?refresh=1':'')" in script
+    render = script[script.index("function renderIssues(d){") :]
+    render = render[: render.index("async function copyRules")]
+    assert "if(d.error){" not in render  # the old early return hid every issue
+    assert "head+its.map(" in render
+    for key in ("tasks.loading", "tasks.updated", "tasks.notfound"):
+        assert script.count(f"'{key}':") == 3, key
+
+
+def test_issues_mirror_startup_for_remote_and_openai_agents(monkeypatch):
+    """Remote entries and an optional OpenAI agent without key/base URL never start here."""
+    raw = {
+        "node": {"id": "n1"},
+        "agents": [
+            {"name": "dev", "node_id": "n1", "github_repo": "acme/live"},
+            {"name": "far", "node_id": "n2", "github_repo": "acme/remote"},
+            {"name": "ask", "node_id": "n1", "optional": True, "runtime": "openai",
+             "github_repo": "acme/openai"},
+        ],
+    }
+    tokens = {"ASK_SLACK_BOT_TOKEN": "x", "ASK_SLACK_APP_TOKEN": "y"}
+    raw["agents"][2]["runtime"] = " OpenAI "  # normalised like parse_agent_fields
+    for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "AGENT_NODE_ID"):
+        monkeypatch.delenv(name, raising=False)
+    fetch, _calls = _issues_fixture(monkeypatch, raw, env=tokens)
+    assert fetch()["repos"] == ["acme/live"]
+    fetch, _calls = _issues_fixture(
+        monkeypatch, raw, env={**tokens, "OPENAI_API_KEY": "sk-x"}
+    )
+    assert fetch()["repos"] == ["acme/live", "acme/openai"]
+
+
+def test_node_id_from_dotenv_decides_which_agents_are_local(monkeypatch):
+    """multi_app loads AGENT_NODE_ID from .env; the console must agree."""
+    monkeypatch.delenv("AGENT_NODE_ID", raising=False)
+    monkeypatch.setattr(webui, "read_env_file", lambda: {"AGENT_NODE_ID": "n2"})
+    raw = {"agents": [{"name": "near", "node_id": "n2"}, {"name": "far", "node_id": "n1"}]}
+    assert [e["name"] for e in webui._local_entries(raw)] == ["near"]
+    monkeypatch.setenv("AGENT_NODE_ID", "n1")  # the process env still wins
+    assert [e["name"] for e in webui._local_entries(raw)] == ["far"]
+
+
+def test_every_bundled_manifest_can_read_the_bot_profile():
+    """Slack-name sync calls users.info / bots.info, which need users:read."""
+    import yaml as _yaml
+
+    for name in ("slack-app-manifest.yaml", "slack-app-manifest-agent.yaml"):
+        manifest = _yaml.safe_load((webui.BASE_DIR / name).read_text(encoding="utf-8"))
+        assert "users:read" in manifest["oauth_config"]["scopes"]["bot"], name
+
+
+def test_monitor_card_can_stop_and_resume_an_agent():
+    html = webui.INDEX_HTML
+    script = _main_script(html)
+    assert 'data-action="stop" data-busy=' in script
+    assert "a.stopped?" in script and "a.paused" not in script  # see status_snapshot
+    assert 'data-action="resume"' in script
+    assert "if(a.kind==='stop')return t('stop.confirm'" in script  # inline confirm first
+    assert "else if(a.kind==='stop')await stopAgent(a.agent);" in script
+    assert "'/stop'" in script and "'/resume'" in script
+    for key in ("btn.stop", "btn.resume", "st.paused", "stop.confirm", "toast.stop", "toast.resume"):
+        assert script.count(f"'{key}':") == 3, key
+
+
+def test_monitor_card_shows_and_syncs_the_slack_name():
+    script = _main_script(webui.INDEX_HTML)
+    assert "${slackIdentity(a.slack)}" in script
+    assert 'data-action="sync-slack"' in script
+    assert "else if(action==='sync-slack')syncSlack(n);" in script
+    assert "safeHttpUrl(sl.app_home_url" in script  # link only to a vetted URL
+    for key in ("slack.lbl", "slack.sync", "slack.edit", "slack.hint", "slack.unknown", "toast.slack"):
+        assert script.count(f"'{key}':") == 3, key
+    routes = {(r.method, r.resource.canonical) for r in webui.make_app().router.routes() if r.resource}
+    assert ("POST", "/api/live/{name}/slack-identity") in routes
+
+
+def test_stop_and_resume_proxy_to_the_admin_api(monkeypatch):
+    sent, timeouts = [], []
+
+    async def fake_admin_post(path, body, *, timeout=5):
+        sent.append(path)
+        timeouts.append(timeout)
+        return {"ok": True, "paused": path.endswith("/stop")}, 200
+
+    monkeypatch.setattr(webui, "_admin_post", fake_admin_post)
+    monkeypatch.setattr(webui, "read_yaml", lambda: {"agents": [{"name": "dev"}]})
+    for handler, path in ((webui.h_live_stop, "/agents/dev/stop"), (webui.h_live_resume, "/agents/dev/resume")):
+        request = _IssuesRequest()
+        request.match_info = {"name": "dev"}
+        response = asyncio.run(handler(request))
+        assert response.status == 200
+        assert sent[-1] == path
+    assert timeouts[0] > 20  # stop waits up to 20s for cancelled work
+    routes = {(r.method, r.resource.canonical) for r in webui.make_app().router.routes() if r.resource}
+    assert ("POST", "/api/live/{name}/stop") in routes
+    assert ("POST", "/api/live/{name}/resume") in routes
+
+
 def test_gh_issues_timeout_kills_and_reaps_process(monkeypatch):
     class Process:
         returncode = None
@@ -336,6 +528,20 @@ def test_guide_i18n_and_prompt_templates_cover_all_languages():
         assert script.count(f"{prompt}:") >= 3
         assert f'data-guide-prompt="{prompt}"' in html
     assert script.count('HANDOFF {"target_agent_id"') == 3
+
+
+def test_guide_reviewer_template_writes_the_review_back_to_the_pr():
+    """Findings land on the PR as inline threads plus a verdict comment, in every language."""
+    script = _main_script(webui.INDEX_HTML)
+    start = script.index("const GUIDE_PROMPTS={")
+    prompts = script[start : script.index("};", start)]
+    reviewers = prompts.split("reviewer:[")[1:]
+    assert len(reviewers) == 3
+    for block in reviewers:
+        block = block.split("].join(GUIDE_NL)")[0]
+        assert "gh api repos/{owner}/{repo}/pulls/<N>/reviews" in block
+        assert "COMMENT" in block and "thread" in block
+        assert "Slack" in block and "<sha>" in block
 
 
 def test_guide_progress_and_copy_are_local_only_and_text_safe():
@@ -1709,3 +1915,422 @@ def test_webui_security_headers_cover_generic_500_and_http_exception(caplog):
     assert forbidden_response.status == 403
     assert forbidden_body == "preserved forbidden body"
     assert "unhandled webui request path=/boom" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Local workspace settings and the on-demand control token
+# ---------------------------------------------------------------------------
+
+
+def _workspace_app(tmp_path, monkeypatch, yaml_text):
+    target = tmp_path / "agents.yaml"
+    monkeypatch.setattr(webui, "AGENTS_YAML", target)
+    monkeypatch.setattr(webui, "ENV_FILE", tmp_path / ".env")
+    target.write_text(yaml_text, encoding="utf-8")
+
+    async def _fake_reload():
+        return {"ok": False, "error": "offline"}
+
+    monkeypatch.setattr(webui, "_admin_reload", _fake_reload)
+    reachable = {"acme/gone"}
+
+    async def _fake_reachable(repo):
+        # no network in tests: "acme/gone" stands for a deleted repository
+        return None if not repo else repo not in reachable
+
+    monkeypatch.setattr(webui, "_repo_reachable", _fake_reachable)
+
+    async def _signed_in():
+        return {"installed": True, "logged_in": True, "login": "alice"}
+
+    monkeypatch.setattr(webui, "_gh_status", _signed_in)
+    return target
+
+
+_REAL_GH_STATUS = webui._gh_status
+
+
+def _git_repo(path, origin):
+    path.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "remote", "add", "origin", origin], check=True)
+    return path
+
+
+def _post_workspace(body, name="a"):
+    async def _run():
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async with TestClient(TestServer(webui.make_app())) as client:
+            resp = await client.post(f"/api/agents/{name}/workspace", json=body)
+            if resp.content_type != "application/json":
+                return {"ok": False, "status": resp.status}
+            return await resp.json()
+
+    return asyncio.run(_run())
+
+
+def test_workspace_check_reports_git_facts_and_mismatch(tmp_path, monkeypatch):
+    _workspace_app(
+        tmp_path, monkeypatch,
+        "github:\n  repo: acme/old\nagents:\n- name: a\n  persona: p\n",
+    )
+    repo = _git_repo(tmp_path / "widgets", "https://github.com/acme/widgets.git")
+    data = _post_workspace({"workspace": str(repo), "dry_run": True})
+    assert data["ok"] is True and data["git"] is True
+    assert data["branch"] == "main"
+    assert data["origin_repo"] == "acme/widgets"
+    # The inherited github.repo disagrees with origin: preflight would disable it.
+    assert data["github_repo"] == "acme/old" and data["mismatch"] is True
+    data = _post_workspace(
+        {"workspace": str(repo), "github_repo": "acme/widgets", "dry_run": True}
+    )
+    assert data["mismatch"] is False
+
+
+def test_workspace_save_writes_path_and_repo(tmp_path, monkeypatch):
+    target = _workspace_app(
+        tmp_path, monkeypatch,
+        "github:\n  repo: acme/old\nagents:\n- name: a\n  persona: p\n  github_repo: acme/x\n",
+    )
+    repo = _git_repo(tmp_path / "widgets", "git@github.com:acme/widgets.git")
+    data = _post_workspace({"workspace": str(repo), "github_repo": "acme/widgets"})
+    assert data["ok"] is True
+    entry = yaml.safe_load(target.read_text(encoding="utf-8"))["agents"][0]
+    assert entry["workspace"] == str(repo)
+    assert entry["github_repo"] == "acme/widgets"
+    # Empty clears the agent's own repo so it inherits again; omitted keeps it.
+    _post_workspace({"workspace": str(repo), "github_repo": ""})
+    entry = yaml.safe_load(target.read_text(encoding="utf-8"))["agents"][0]
+    assert "github_repo" not in entry
+    _post_workspace({"workspace": str(repo), "github_repo": "acme/widgets"})
+    _post_workspace({"workspace": str(repo)})
+    entry = yaml.safe_load(target.read_text(encoding="utf-8"))["agents"][0]
+    assert entry["github_repo"] == "acme/widgets"
+
+
+def test_workspace_rejects_bad_input_without_writing(tmp_path, monkeypatch):
+    target = _workspace_app(
+        tmp_path, monkeypatch, "agents:\n- name: a\n  persona: p\n  workspace: /keep\n"
+    )
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    for body, error in (
+        ({"workspace": ""}, "required"),
+        ({"workspace": "relative/dir"}, "absolute"),
+        ({"workspace": str(tmp_path / "missing")}, "does not exist"),
+        ({"workspace": str(plain), "github_repo": "not a repo"}, "OWNER/REPO"),
+    ):
+        data = _post_workspace(body)
+        assert data["ok"] is False and error in data["error"], body
+    # An agent this caller cannot see is refused before anything is read.
+    assert _post_workspace({"workspace": str(plain)}, name="ghost")["ok"] is False
+    assert yaml.safe_load(target.read_text(encoding="utf-8"))["agents"][0]["workspace"] == "/keep"
+    # A directory that is not a git repo is allowed but flagged.
+    data = _post_workspace({"workspace": str(plain), "dry_run": True})
+    assert data["ok"] is True and data["git"] is False
+
+
+def test_control_token_is_asked_in_place_only_after_a_401():
+    script = _main_script(webui.INDEX_HTML)
+    assert "window.prompt" not in script
+    assert "if(r.status===401){CONTROL_REQUIRED=true;showUnlock(!!controlToken());}" in script
+    assert "if(!CONTROL_REQUIRED||controlToken())return;" in script
+    # A rejected token is dropped so it is not resent on every poll.
+    assert "if(rejected)saveControlToken('');" in script
+    for key in ("unlock.title", "unlock.hint", "unlock.save", "unlock.bad"):
+        assert script.count(f"'{key}':") >= 3, key
+
+
+def test_workspace_editor_is_localised():
+    script = _main_script(webui.INDEX_HTML)
+    for key in ("ws.title", "ws.edit", "ws.path", "ws.repo", "ws.check", "ws.unset",
+                "ws.nogit", "ws.branch", "ws.mismatch", "ws.useorigin"):
+        assert script.count(f"'{key}':") >= 3, key
+    assert "/workspace'" in script and "dry_run" in script
+
+
+def test_manifest_json_feeds_slacks_prefilled_create_link(tmp_path, monkeypatch):
+    _workspace_app(tmp_path, monkeypatch, "agents:\n- name: a\n  persona: Builds things\n")
+
+    async def _run():
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async with TestClient(TestServer(webui.make_app())) as client:
+            text = await (await client.get("/api/manifest/a")).text()
+            data = await (await client.get("/api/manifest/a?format=json")).json()
+            return text, data
+
+    text, data = asyncio.run(_run())
+    assert data["manifest"] == yaml.safe_load(text)
+    assert data["manifest"]["settings"]["socket_mode_enabled"] is True
+    script = _main_script(webui.INDEX_HTML)
+    assert "https://api.slack.com/apps?new_app=1&manifest_json='" in script
+    assert "encodeURIComponent(JSON.stringify(m.manifest))" in script
+
+
+def test_guide_links_straight_to_slack_apps_and_the_setup_skill():
+    html = webui.INDEX_HTML
+    assert (
+        '<a class="btn line" href="https://api.slack.com/apps" target="_blank" '
+        'rel="noopener noreferrer">'
+    ) in html
+    script = _main_script(html)
+    for key in ("guide.open.slack", "guide.slack.do5", "wz.create"):
+        assert script.count(f"'{key}':") >= 3, key
+    assert "/slack-app-setup" in script
+
+
+def test_guide_walks_a_new_agent_into_slack_in_every_language():
+    """Creating, restarting, inviting and @mentioning a new agent are spelled out."""
+    html = webui.INDEX_HTML
+    steps = [f"guide.join.s{n}" for n in range(1, 8)]
+    for key in ("guide.join.title", "guide.join.sub", *steps, "guide.join.tip"):
+        assert f'data-i18n="{key}"' in html, key
+    script = _main_script(html)
+    for key in steps:
+        assert script.count(f"'{key}':") == 3, key
+    for needle in ("/invite @", "connections:write", "multi_app"):
+        assert script.count(needle) >= 3, needle
+
+
+def test_workspace_check_flags_a_repo_github_cannot_find(tmp_path, monkeypatch):
+    _workspace_app(
+        tmp_path, monkeypatch,
+        "github:\n  repo: acme/gone\nagents:\n- name: a\n  persona: p\n",
+    )
+    repo = _git_repo(tmp_path / "gone", "https://github.com/acme/gone.git")
+    data = _post_workspace({"workspace": str(repo), "dry_run": True})
+    assert data["ok"] is True and data["mismatch"] is False
+    assert data["repo_reachable"] is False
+    data = _post_workspace(
+        {"workspace": str(repo), "github_repo": "acme/widgets", "dry_run": True}
+    )
+    assert data["repo_reachable"] is True
+
+
+def test_monitor_cards_can_set_the_workspace_without_losing_input():
+    script = _main_script(webui.INDEX_HTML)
+    roster = script[script.index("$('#roster').innerHTML=ags.map"):script.index("function stageModel")]
+    assert 'data-action="edit-workspace"' in roster
+    assert "workspaceEditor(a.workspace" in roster
+    assert "configured_github_repo" in roster
+    # an open editor pauses the 5s re-render
+    assert "!WS_EDITING.size)loadLive();" in script
+    for key in ("ws.setup", "ws.ok", "ws.badrepo", "ws.ghoff", "guide.local.ws", "guide.goto.ws"):
+        assert script.count(f"'{key}':") >= 3, key
+    assert "function openWorkspaceSettings()" in script
+
+
+# ---------------------------------------------------------------------------
+# Folder picking for the workspace editor
+# ---------------------------------------------------------------------------
+
+
+def _fs_get(path_query):
+    async def _run():
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async with TestClient(TestServer(webui.make_app())) as client:
+            return await (await client.get("/api/fs/dirs", params={"path": path_query})).json()
+
+    return asyncio.run(_run())
+
+
+def _fs_pick(body=None):
+    async def _run():
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async with TestClient(TestServer(webui.make_app())) as client:
+            return await (await client.post("/api/fs/pick-dir", json=body or {})).json()
+
+    return asyncio.run(_run())
+
+
+def test_dir_browser_lists_folders_under_home_only(tmp_path, monkeypatch):
+    _workspace_app(tmp_path, monkeypatch, "agents:\n- name: a\n  persona: p\n")
+    home = tmp_path / "home"
+    (home / "workspace" / "widgets" / ".git").mkdir(parents=True)
+    (home / "workspace" / "notes").mkdir()
+    (home / "workspace" / ".cache").mkdir()
+    (home / "workspace" / "README.txt").write_text("x")
+    monkeypatch.setenv("HOME", str(home))
+    data = _fs_get("~/workspace")
+    assert data["ok"] is True
+    assert data["path"] == "~/workspace" and data["parent"] == "~"
+    assert [(d["name"], d["git"]) for d in data["dirs"]] == [("notes", False), ("widgets", True)]
+    assert data["dirs"][1]["path"] == "~/workspace/widgets"
+    assert _fs_get("~")["parent"] == ""
+    assert _fs_get("/")["ok"] is False
+    assert _fs_get(str(tmp_path))["ok"] is False  # the parent of home
+    assert _fs_get("~/missing")["ok"] is False
+
+
+def test_folder_dialog_returns_the_picked_path(tmp_path, monkeypatch):
+    _workspace_app(tmp_path, monkeypatch, "agents:\n- name: a\n  persona: p\n")
+    home = tmp_path / "home"
+    (home / "workspace" / "widgets").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(webui, "_folder_dialog_argv", lambda start, prompt: ["dialog", start])
+    outcomes = iter([(0, f"{home}/workspace/widgets/\n", ""), (1, "", "User canceled. (-128)")])
+    seen = []
+
+    async def fake_run(argv, timeout=15.0):
+        seen.append(argv)
+        return next(outcomes)
+
+    monkeypatch.setattr(webui, "_run", fake_run)
+    assert _fs_pick({"start": "~/workspace/nope"}) == {"ok": True, "path": "~/workspace/widgets"}
+    # the dialog opens at the nearest existing folder
+    assert seen[0] == ["dialog", str(home / "workspace")]
+    assert _fs_pick() == {"ok": False, "error": "cancelled"}
+    monkeypatch.setattr(webui, "_folder_dialog_argv", lambda start, prompt: None)
+    assert _fs_pick() == {"ok": False, "error": "unavailable"}
+
+
+def test_macos_folder_dialog_passes_paths_as_arguments(monkeypatch):
+    monkeypatch.setattr(webui.sys, "platform", "darwin")
+    monkeypatch.setattr(webui.shutil, "which", lambda name: "/usr/bin/" + name)
+    argv = webui._folder_dialog_argv('/tmp/a "b"', "Choose")
+    assert argv[0] == "osascript"
+    # paths reach AppleScript through argv, never spliced into the script text
+    assert argv[-2:] == ['/tmp/a "b"', "Choose"]
+    assert not any('a "b"' in arg for arg in argv[:-2])
+    monkeypatch.setattr(webui.sys, "platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    assert webui._folder_dialog_argv("/tmp", "x") is None
+
+
+def test_workspace_editor_offers_pick_and_browse():
+    script = _main_script(webui.INDEX_HTML)
+    assert 'data-action="pick-dir"' in script and 'data-action="browse-dir"' in script
+    assert "/api/fs/pick-dir" in script and "/api/fs/dirs?path=" in script
+    for key in ("ws.pick", "ws.browse", "ws.pickfail", "ws.up", "ws.choose", "ws.close", "ws.nodirs"):
+        assert script.count(f"'{key}':") >= 3, key
+
+
+# ---------------------------------------------------------------------------
+# GitHub repo picker / create
+# ---------------------------------------------------------------------------
+
+
+def _fake_gh(monkeypatch, *, repos=None, fail=None, create_rc=0):
+    import json
+
+    calls = []
+
+    async def fake_run(argv, timeout=15.0):
+        calls.append(argv)
+        if fail and fail in argv:
+            return 1, "", "HTTP 401: Bad credentials"
+        if argv[:3] == ["gh", "api", "user"]:
+            return 0, "alice\n", ""
+        if argv[:3] == ["gh", "api", "user/orgs"]:
+            return 0, "acme\n", ""
+        if argv[:3] == ["gh", "repo", "list"]:
+            return 0, json.dumps((repos or {}).get(argv[3], [])), ""
+        if argv[:3] == ["gh", "repo", "create"]:
+            if create_rc:
+                return create_rc, "", "GraphQL: Name already exists on this account"
+            return 0, f"https://github.com/{argv[3]}\n", ""
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(webui, "_run", fake_run)
+    # the real status check, driven by the fake gh above
+    monkeypatch.setattr(webui, "_gh_status", _REAL_GH_STATUS)
+    return calls
+
+
+def _gh_call(method, path, **kwargs):
+    async def _run():
+        from aiohttp.test_utils import TestClient, TestServer
+
+        async with TestClient(TestServer(webui.make_app())) as client:
+            return await (await client.request(method, path, **kwargs)).json()
+
+    return asyncio.run(_run())
+
+
+def test_repo_picker_lists_repos_per_owner(tmp_path, monkeypatch):
+    _workspace_app(tmp_path, monkeypatch, "agents:\n- name: a\n  persona: p\n")
+    _fake_gh(monkeypatch, repos={
+        "alice": [
+            {"nameWithOwner": "alice/old", "isPrivate": False, "isArchived": True, "updatedAt": "2026-01-01T00:00:00Z"},
+            {"nameWithOwner": "alice/new", "isPrivate": True, "isArchived": False, "updatedAt": "2026-09-01T00:00:00Z", "description": "d"},
+        ],
+        "acme": [{"nameWithOwner": "acme/widgets", "updatedAt": "2026-05-01T00:00:00Z"}],
+    })
+    data = _gh_call("GET", "/api/github/repos")
+    assert data["ok"] is True and data["owner"] == "alice"
+    assert data["owners"] == ["alice", "acme"]
+    assert [r["name"] for r in data["repos"]] == ["alice/new", "alice/old"]
+    assert data["repos"][0]["private"] is True and data["repos"][1]["archived"] is True
+    data = _gh_call("GET", "/api/github/repos?owner=acme")
+    assert [r["name"] for r in data["repos"]] == ["acme/widgets"]
+    assert _gh_call("GET", "/api/github/repos?owner=evil")["ok"] is False
+
+
+def test_repo_picker_reports_gh_failures(tmp_path, monkeypatch):
+    _workspace_app(tmp_path, monkeypatch, "agents:\n- name: a\n  persona: p\n")
+    _fake_gh(monkeypatch, fail="user")
+    data = _gh_call("GET", "/api/github/repos")
+    assert data["ok"] is False and data["error"] == "gh is not signed in"
+    assert data["gh"] == {"installed": True, "logged_in": False, "login": ""}
+
+
+def test_gh_status_distinguishes_missing_and_signed_out(tmp_path, monkeypatch):
+    _workspace_app(tmp_path, monkeypatch, "agents:\n- name: a\n  persona: p\n")
+    monkeypatch.setattr(webui, "_gh_status", _REAL_GH_STATUS)
+    answers = iter([(-1, "", "gh not found"), (1, "", "not logged in"), (0, "alice\n", "")])
+
+    async def fake_run(argv, timeout=15.0):
+        return next(answers)
+
+    monkeypatch.setattr(webui, "_run", fake_run)
+    assert _gh_call("GET", "/api/github/status") == {
+        "ok": True, "installed": False, "logged_in": False, "login": ""}
+    assert _gh_call("GET", "/api/github/status")["logged_in"] is False
+    assert _gh_call("GET", "/api/github/status")["login"] == "alice"
+
+
+def test_workspace_check_reports_gh_state_instead_of_a_bad_repo(tmp_path, monkeypatch):
+    _workspace_app(
+        tmp_path, monkeypatch,
+        "github:\n  repo: acme/gone\nagents:\n- name: a\n  persona: p\n",
+    )
+
+    async def signed_out():
+        return {"installed": True, "logged_in": False, "login": ""}
+
+    monkeypatch.setattr(webui, "_gh_status", signed_out)
+    repo = _git_repo(tmp_path / "gone", "https://github.com/acme/gone.git")
+    data = _post_workspace({"workspace": str(repo), "dry_run": True})
+    # gh cannot see anything while signed out: no false "repo unreachable"
+    assert data["gh"]["logged_in"] is False
+    assert data["repo_reachable"] is None
+    script = _main_script(webui.INDEX_HTML)
+    assert "function ghStatusHint(gh)" in script
+    for key in ("ws.ghmissing", "ws.ghlogin", "ws.gotoauth", "ws.ghmissingshort", "ws.ghloginshort"):
+        assert script.count(f"'{key}':") >= 3, key
+
+
+def test_create_repo_is_private_by_default_and_validated(tmp_path, monkeypatch):
+    _workspace_app(tmp_path, monkeypatch, "agents:\n- name: a\n  persona: p\n")
+    calls = _fake_gh(monkeypatch)
+    data = _gh_call("POST", "/api/github/repos", json={"repo": "alice/agent-sandbox"})
+    assert data == {"ok": True, "repo": "alice/agent-sandbox", "url": "https://github.com/alice/agent-sandbox"}
+    assert calls[-1] == ["gh", "repo", "create", "alice/agent-sandbox", "--private"]
+    assert _gh_call("POST", "/api/github/repos", json={"repo": "bad name; rm"})["ok"] is False
+    assert calls[-1][3] == "alice/agent-sandbox"  # nothing ran for the bad name
+    _fake_gh(monkeypatch, create_rc=1)
+    data = _gh_call("POST", "/api/github/repos", json={"repo": "alice/agent-sandbox"})
+    assert data["ok"] is False and "already exists" in data["error"]
+
+
+def test_repo_field_offers_picker_and_create():
+    script = _main_script(webui.INDEX_HTML)
+    for action in ("pick-repo", "repo-choose", "repo-inherit", "create-repo-ask", "create-repo-yes"):
+        assert f"'{action}'" in script or f'"{action}"' in script, action
+    for key in ("ws.search", "ws.inherit", "ws.private", "ws.norepos", "ws.ghfail",
+                "ws.create", "ws.createq", "ws.createbtn", "ws.created", "ws.loading"):
+        assert script.count(f"'{key}':") >= 3, key

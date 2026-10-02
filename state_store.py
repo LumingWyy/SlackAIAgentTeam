@@ -220,6 +220,26 @@ CREATE TABLE IF NOT EXISTS activation_ledger (
 )
 """
 
+# Agents an operator stopped from the console. Operational state, not
+# configuration: a stopped agent stays stopped across restarts until resumed.
+_AGENT_PAUSE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS agent_pause (
+    agent      TEXT PRIMARY KEY,
+    paused_at  REAL NOT NULL
+)
+"""
+
+# Threads whose turn an operator stop interrupted: the next turn there is told
+# so. Kept next to the session the stop preserved, so a restart keeps both.
+_STOPPED_THREADS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS stopped_threads (
+    agent       TEXT NOT NULL,
+    thread_key  TEXT NOT NULL,
+    stopped_at  REAL NOT NULL,
+    PRIMARY KEY (agent, thread_key)
+)
+"""
+
 
 class StateStoreLockError(RuntimeError):
     """Raised when another live StateStore already owns the same DB path."""
@@ -291,6 +311,8 @@ class StateStore:
             self._migrate_worktree_schema(conn)
             conn.execute(_CODEX_USAGE_BASELINES_SCHEMA)
             conn.execute(_ACTIVATION_LEDGER_SCHEMA)
+            conn.execute(_AGENT_PAUSE_SCHEMA)
+            conn.execute(_STOPPED_THREADS_SCHEMA)
             conn.commit()
             self._conn = conn
             self._harden_file_perms()
@@ -1433,6 +1455,57 @@ class StateStore:
             if now - float(row[3]) <= max_age_seconds
         ]
         return recent[:limit]
+
+    def set_agent_paused(
+        self, agent: str, paused: bool, *, now: float | None = None
+    ) -> None:
+        if paused:
+            self._exec(
+                "INSERT OR REPLACE INTO agent_pause (agent, paused_at) "
+                "VALUES (?, ?)",
+                (agent, time.time() if now is None else now),
+            )
+        else:
+            self._exec("DELETE FROM agent_pause WHERE agent = ?", (agent,))
+
+    def mark_thread_stopped(
+        self, agent: str, thread_key: str, *, now: float | None = None
+    ) -> None:
+        self._exec(
+            "INSERT OR REPLACE INTO stopped_threads (agent, thread_key, stopped_at) "
+            "VALUES (?, ?, ?)",
+            (agent, thread_key, time.time() if now is None else now),
+        )
+
+    def clear_thread_stopped(self, agent: str, thread_key: str) -> None:
+        self._exec(
+            "DELETE FROM stopped_threads WHERE agent = ? AND thread_key = ?",
+            (agent, thread_key),
+        )
+
+    def stopped_threads(self, agent: str) -> set[str]:
+        if self._conn is None:
+            return set()
+        try:
+            rows = self._conn.execute(
+                "SELECT thread_key FROM stopped_threads WHERE agent = ?", (agent,)
+            ).fetchall()
+        except sqlite3.Error:
+            logger.warning("stopped threads read failed", exc_info=True)
+            return set()
+        return {str(row[0]) for row in rows}
+
+    def agent_paused(self, agent: str) -> bool:
+        if self._conn is None:
+            return False
+        try:
+            row = self._conn.execute(
+                "SELECT 1 FROM agent_pause WHERE agent = ?", (agent,)
+            ).fetchone()
+        except sqlite3.Error:
+            logger.warning("agent pause read failed", exc_info=True)
+            return False
+        return row is not None
 
     def load_codex_usage_baseline(
         self, session_id: str

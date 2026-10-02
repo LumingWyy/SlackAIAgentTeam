@@ -1072,16 +1072,52 @@ _GH_MERGE_API_RE = re.compile(
 )
 
 
+# gh flags that never take a value. Any other flag written without "=" eats
+# the next word, which is how gh's command parser (cobra) reads them too.
+_GH_BOOLEAN_FLAGS = frozenset({"-h", "--help", "--version"})
+
+
+def _gh_command_words(args: list[str]) -> list[str]:
+    """Positional words of a ``gh`` call, with flags and their values dropped.
+
+    ``gh --repo R pr merge`` and ``gh -R R pr merge`` both yield
+    ``["pr", "merge"]``; global flags may come before the subcommand.
+    """
+    words: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            words.extend(args[index + 1 :])
+            break
+        if arg.startswith("-") and arg != "-":
+            takes_value = (
+                "=" not in arg
+                and arg not in _GH_BOOLEAN_FLAGS
+                and (arg.startswith("--") or len(arg) == 2)
+            )
+            index += 2 if takes_value else 1
+            continue
+        words.append(arg)
+        index += 1
+    return words
+
+
 def gh_merge_violation(args: list[str]) -> str:
     """Why an agent's ``gh`` invocation would merge; "" when it would not.
 
     Covers ``gh pr merge`` (including ``--auto``), the REST merge endpoints,
-    GraphQL merge mutations, and aliases (an alias could hide a merge).
+    GraphQL merge mutations, and aliases (an alias could hide a merge), with
+    global flags such as ``--repo`` before or after the subcommand.
     """
-    words = [arg for arg in args if not arg.startswith("-")]
-    # "merge" within two words of "pr" also covers ``gh pr --repo R merge``.
-    if words[:1] == ["pr"] and "merge" in words[1:3]:
-        return "merging a pull request is human-only"
+    words = _gh_command_words(args)
+    if words[:1] == ["pr"]:
+        # Fail closed: also read every non-flag word, in case a flag of
+        # unexpected arity hid "merge" from the parse above.
+        loose = [arg for arg in args if not arg.startswith("-")]
+        after_pr = loose[loose.index("pr") + 1 :]
+        if words[1:2] == ["merge"] or "merge" in after_pr[:2]:
+            return "merging a pull request is human-only"
     if words[:1] == ["alias"] and words[1:2] in (["set"], ["import"]):
         return "defining gh aliases is not allowed for agents"
     if words[:1] == ["api"] and any(_GH_MERGE_API_RE.search(arg) for arg in args):
@@ -2345,6 +2381,66 @@ def is_side_effect_tool(name: str) -> bool:
     return str(name or "") not in READ_ONLY_TOOL_NAMES
 
 
+_SLACK_APP_ID_RE = re.compile(r"A[A-Z0-9]{6,20}")
+
+
+def slack_identity(user: dict | None, bot: dict | None) -> dict[str, str]:
+    """What Slack shows for a bot, from ``users.info`` + ``bots.info``.
+
+    Messages show ``display_name`` (a bot's is usually empty, so Slack falls
+    back to ``real_name``, the App Home "Display Name (Bot Name)"); the app
+    name and username are separate settings and do not change it.
+    """
+    user = user or {}
+    bot = bot or {}
+    profile = user.get("profile") or {}
+    app_id = str(bot.get("app_id") or "")
+    if not _SLACK_APP_ID_RE.fullmatch(app_id):
+        app_id = ""
+    return {
+        "display_name": str(
+            profile.get("display_name") or profile.get("real_name") or user.get("name") or ""
+        ),
+        "username": str(user.get("name") or ""),
+        "app_name": str(bot.get("name") or ""),
+        "app_id": app_id,
+        "app_home_url": (
+            f"https://api.slack.com/apps/{app_id}/app-home" if app_id else ""
+        ),
+    }
+
+
+def format_stopped_notice(agent: str, *, interrupted: bool = False) -> str:
+    """Slack notice for a thread that reached an agent its operator stopped."""
+    if interrupted:
+        return (
+            f"⏹ {agent} は操作者が停止しました。このスレッドの作業は中断しています。"
+            "再開はコンソールの「監視」から行えます。"
+        )
+    return (
+        f"⏸️ {agent} は停止中のため、このメッセージには応答しません。"
+        "再開はコンソールの「監視」から行えます。"
+    )
+
+
+def context_window_tokens(usage: dict | None) -> int:
+    """Prompt tokens of ONE API call: fresh + cache read + cache write.
+
+    Only meaningful for a single call. A Claude ``ResultMessage.usage`` sums
+    every call of the turn, and each tool step re-reads the whole context, so
+    that total overstates the context window several times over.
+    """
+    usage = usage or {}
+    return sum(
+        int(usage.get(key) or 0)
+        for key in (
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        )
+    )
+
+
 @dataclass
 class TurnSignals:
     """Evidence collected while one runtime turn streams.
@@ -2359,6 +2455,9 @@ class TurnSignals:
     rate_limit_seen: bool = False
     resets_at: float | None = None
     error_text: str = ""
+    # Prompt size of the latest top-level API call (the live context window);
+    # None until a call reports usage. See ``context_window_tokens``.
+    context_tokens: int | None = None
 
     def rate_limit_error(
         self, cause_text: str = "", *, now: float
