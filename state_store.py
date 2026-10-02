@@ -229,6 +229,17 @@ CREATE TABLE IF NOT EXISTS agent_pause (
 )
 """
 
+# Threads whose turn an operator stop interrupted: the next turn there is told
+# so. Kept next to the session the stop preserved, so a restart keeps both.
+_STOPPED_THREADS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS stopped_threads (
+    agent       TEXT NOT NULL,
+    thread_key  TEXT NOT NULL,
+    stopped_at  REAL NOT NULL,
+    PRIMARY KEY (agent, thread_key)
+)
+"""
+
 
 class StateStoreLockError(RuntimeError):
     """Raised when another live StateStore already owns the same DB path."""
@@ -301,6 +312,7 @@ class StateStore:
             conn.execute(_CODEX_USAGE_BASELINES_SCHEMA)
             conn.execute(_ACTIVATION_LEDGER_SCHEMA)
             conn.execute(_AGENT_PAUSE_SCHEMA)
+            conn.execute(_STOPPED_THREADS_SCHEMA)
             conn.commit()
             self._conn = conn
             self._harden_file_perms()
@@ -1455,6 +1467,33 @@ class StateStore:
             )
         else:
             self._exec("DELETE FROM agent_pause WHERE agent = ?", (agent,))
+
+    def mark_thread_stopped(
+        self, agent: str, thread_key: str, *, now: float | None = None
+    ) -> None:
+        self._exec(
+            "INSERT OR REPLACE INTO stopped_threads (agent, thread_key, stopped_at) "
+            "VALUES (?, ?, ?)",
+            (agent, thread_key, time.time() if now is None else now),
+        )
+
+    def clear_thread_stopped(self, agent: str, thread_key: str) -> None:
+        self._exec(
+            "DELETE FROM stopped_threads WHERE agent = ? AND thread_key = ?",
+            (agent, thread_key),
+        )
+
+    def stopped_threads(self, agent: str) -> set[str]:
+        if self._conn is None:
+            return set()
+        try:
+            rows = self._conn.execute(
+                "SELECT thread_key FROM stopped_threads WHERE agent = ?", (agent,)
+            ).fetchall()
+        except sqlite3.Error:
+            logger.warning("stopped threads read failed", exc_info=True)
+            return set()
+        return {str(row[0]) for row in rows}
 
     def agent_paused(self, agent: str) -> bool:
         if self._conn is None:

@@ -166,13 +166,20 @@ def _entry_owner(
     return owner
 
 
+def _env_node_id() -> str:
+    """AGENT_NODE_ID as multi_app sees it: the process env wins over .env."""
+    return str(
+        os.environ.get("AGENT_NODE_ID")
+        or read_env_file().get("AGENT_NODE_ID")
+        or ""
+    )
+
+
 def _local_entries(raw: dict[str, Any]) -> list[dict[str, Any]]:
     node_cfg = raw.get("node") or {}
     if not isinstance(node_cfg, dict):
         raise RuntimeError("node must be a mapping")
-    node_id = str(
-        node_cfg.get("id") or os.environ.get("AGENT_NODE_ID") or ""
-    ).strip()
+    node_id = str(node_cfg.get("id") or _env_node_id()).strip()
     separate_roster = _roster_path(raw) is not None
     result: list[dict[str, Any]] = []
     for entry in raw.get("agents") or []:
@@ -236,8 +243,7 @@ def _build_webui_authenticator(
     node_cfg = raw.get("node") or {}
     node_id = str(
         (node_cfg.get("id") if isinstance(node_cfg, dict) else "")
-        or os.environ.get("AGENT_NODE_ID")
-        or ""
+        or _env_node_id()
     ).strip()
     local_entries = _local_entries(raw)
     distributed = bool(node_id) or len(local_entries) != len(all_entries)
@@ -1463,7 +1469,9 @@ def _starts_on_this_node(
 
     if not all(present(name) for name in token_env_names(entry, defaults)):
         return False
-    runtime = entry.get("runtime") or defaults.get("runtime") or "claude"
+    runtime = str(
+        entry.get("runtime") or defaults.get("runtime") or "claude"
+    ).strip().lower()
     if runtime != "openai":
         return True
     key_env = (
@@ -1571,7 +1579,9 @@ async def h_channel_rules(request: web.Request) -> web.Response:
     return web.json_response({"template": text, "repo": repo, "error": ""})
 
 
-async def _admin_post(path: str, body: dict) -> tuple[dict, int]:
+async def _admin_post(
+    path: str, body: dict, *, timeout: float = 5
+) -> tuple[dict, int]:
     """POST to the running multi_app admin API; returns (json, status).
 
     Connection failure → ({ok: False, error}, 502) so callers can degrade gracefully.
@@ -1588,7 +1598,7 @@ async def _admin_post(path: str, body: dict) -> tuple[dict, int]:
                 f"{ADMIN_BASE}{path}",
                 json=body,
                 headers=headers,
-                timeout=5,
+                timeout=timeout,
             ) as resp:
                 return await resp.json(), resp.status
     except Exception as exc:
@@ -1704,18 +1714,23 @@ async def h_live_restart(request: web.Request) -> web.Response:
     return web.json_response(data, status=status)
 
 
-async def _live_agent_action(request: web.Request, action: str) -> web.Response:
+async def _live_agent_action(
+    request: web.Request, action: str, *, timeout: float = 5
+) -> web.Response:
     name = request.match_info["name"]
     if not NAME_RE.match(name):
         raise web.HTTPBadRequest(text="invalid name")
     _require_agent_access(request, name, read_yaml())
-    data, status = await _admin_post(f"/agents/{name}/{action}", {})
+    data, status = await _admin_post(
+        f"/agents/{name}/{action}", {}, timeout=timeout
+    )
     return web.json_response(data, status=status)
 
 
 async def h_live_stop(request: web.Request) -> web.Response:
     """Stop an agent: running work is cancelled, new work refused until resumed."""
-    return await _live_agent_action(request, "stop")
+    # multi_app waits up to STOP_WAIT_SECONDS (20s) for cancelled work.
+    return await _live_agent_action(request, "stop", timeout=30)
 
 
 async def h_live_resume(request: web.Request) -> web.Response:

@@ -183,6 +183,7 @@ def test_issues_mirror_startup_for_remote_and_openai_agents(monkeypatch):
         ],
     }
     tokens = {"ASK_SLACK_BOT_TOKEN": "x", "ASK_SLACK_APP_TOKEN": "y"}
+    raw["agents"][2]["runtime"] = " OpenAI "  # normalised like parse_agent_fields
     for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "AGENT_NODE_ID"):
         monkeypatch.delenv(name, raising=False)
     fetch, _calls = _issues_fixture(monkeypatch, raw, env=tokens)
@@ -191,6 +192,25 @@ def test_issues_mirror_startup_for_remote_and_openai_agents(monkeypatch):
         monkeypatch, raw, env={**tokens, "OPENAI_API_KEY": "sk-x"}
     )
     assert fetch()["repos"] == ["acme/live", "acme/openai"]
+
+
+def test_node_id_from_dotenv_decides_which_agents_are_local(monkeypatch):
+    """multi_app loads AGENT_NODE_ID from .env; the console must agree."""
+    monkeypatch.delenv("AGENT_NODE_ID", raising=False)
+    monkeypatch.setattr(webui, "read_env_file", lambda: {"AGENT_NODE_ID": "n2"})
+    raw = {"agents": [{"name": "near", "node_id": "n2"}, {"name": "far", "node_id": "n1"}]}
+    assert [e["name"] for e in webui._local_entries(raw)] == ["near"]
+    monkeypatch.setenv("AGENT_NODE_ID", "n1")  # the process env still wins
+    assert [e["name"] for e in webui._local_entries(raw)] == ["far"]
+
+
+def test_every_bundled_manifest_can_read_the_bot_profile():
+    """Slack-name sync calls users.info / bots.info, which need users:read."""
+    import yaml as _yaml
+
+    for name in ("slack-app-manifest.yaml", "slack-app-manifest-agent.yaml"):
+        manifest = _yaml.safe_load((webui.BASE_DIR / name).read_text(encoding="utf-8"))
+        assert "users:read" in manifest["oauth_config"]["scopes"]["bot"], name
 
 
 def test_monitor_card_can_stop_and_resume_an_agent():
@@ -219,10 +239,11 @@ def test_monitor_card_shows_and_syncs_the_slack_name():
 
 
 def test_stop_and_resume_proxy_to_the_admin_api(monkeypatch):
-    sent = []
+    sent, timeouts = [], []
 
-    async def fake_admin_post(path, body):
+    async def fake_admin_post(path, body, *, timeout=5):
         sent.append(path)
+        timeouts.append(timeout)
         return {"ok": True, "paused": path.endswith("/stop")}, 200
 
     monkeypatch.setattr(webui, "_admin_post", fake_admin_post)
@@ -233,6 +254,7 @@ def test_stop_and_resume_proxy_to_the_admin_api(monkeypatch):
         response = asyncio.run(handler(request))
         assert response.status == 200
         assert sent[-1] == path
+    assert timeouts[0] > 20  # stop waits up to 20s for cancelled work
     routes = {(r.method, r.resource.canonical) for r in webui.make_app().router.routes() if r.resource}
     assert ("POST", "/api/live/{name}/stop") in routes
     assert ("POST", "/api/live/{name}/resume") in routes

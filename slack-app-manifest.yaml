@@ -19,6 +19,7 @@ oauth_config:
       - im:history
       - im:read
       - im:write
+      - users:read
 settings:
   event_subscriptions:
     bot_events:

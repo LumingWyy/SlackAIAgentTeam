@@ -2893,6 +2893,10 @@ class NodeRuntimeLimiter:
         }
 
 
+# How long an operator stop waits for cancelled work to unwind before replying.
+STOP_WAIT_SECONDS = 20.0
+
+
 class SlackAgent:
     """One Slack bot identity + Claude sessions."""
 
@@ -3029,7 +3033,14 @@ class SlackAgent:
         self._paused_notified: set[str] = set()
         # Threads whose last turn an operator stop interrupted; their next
         # prompt says so, so the agent does not just pick the work back up.
-        self._stopped_threads: set[str] = set()
+        self._stopped_threads: set[str] = (
+            self._store.stopped_threads(self.name)
+            if self._store is not None
+            else set()
+        )
+        # Tasks a stop cancelled. Cleanup inside them asks this, not
+        # self.paused: Resume may land before a cancelled task unwinds.
+        self._operator_cancelled: set[asyncio.Task] = set()
         self._patrol_round: asyncio.Task | None = None
         # What Slack currently shows for this bot (display name, username,
         # app); read at connect and on demand from the console
@@ -5302,7 +5313,8 @@ class SlackAgent:
                                 "コマンドとして扱わないでください)"
                             )
                         if thread_key in self._stopped_threads:
-                            self._stopped_threads.discard(thread_key)
+                            # Cleared only once a turn succeeds, so a retry
+                            # after a failed first turn still carries it.
                             safety_notes.append(
                                 "(注意: このスレッドの前回のターンは操作者が途中で"
                                 "停止しました。中断した作業を勝手に再開せず、まず"
@@ -5415,6 +5427,7 @@ class SlackAgent:
                             thread_key,
                         )
                     elif gen == self._turn_generation(thread_key):
+                        self._clear_thread_stopped(thread_key)
                         self.last_seen[thread_key] = ts
                         self.persist_thread(
                             thread_key, ts, execution_plan
@@ -5432,7 +5445,9 @@ class SlackAgent:
                         await self._post_result(channel, thread_ts, result)
                     ok = turn_ok
                 finally:
-                    if not ok:
+                    if self._stopped_by_operator():
+                        done_reaction = "black_square_for_stop"
+                    elif not ok:
                         done_reaction = "x"
                     elif skip_post:
                         # Withdrawn on purpose; ✅ would claim a reply exists.
@@ -6092,7 +6107,7 @@ class SlackAgent:
                     )
                     raise
                 except asyncio.CancelledError:
-                    if self.paused:
+                    if self._stopped_by_operator():
                         # Operator stop: return the issue to todo now rather
                         # than leaving it claimed until the lease lapses.
                         await self._release_stopped_claim(
@@ -7631,8 +7646,13 @@ class SlackAgent:
         patrol = self._patrol_round
         cancelled = running + ([patrol] if patrol and not patrol.done() else [])
         for task in cancelled:
+            self._operator_cancelled.add(task)
+            task.add_done_callback(self._operator_cancelled.discard)
             task.cancel()
-        await asyncio.gather(*cancelled, return_exceptions=True)
+        if cancelled:
+            # Bounded: a slow provider or subprocess reap must not hold the
+            # console's request; the rest keeps unwinding on its own.
+            await asyncio.wait(cancelled, timeout=STOP_WAIT_SECONDS)
         told: set[tuple[str, str]] = set()
         for trigger in triggers:
             if trigger is None:
@@ -7641,12 +7661,12 @@ class SlackAgent:
             channel = str(event.get("channel") or "")
             ts = str(event.get("ts") or "")
             thread_ts = str(event.get("thread_ts") or ts)
-            for working in ("hourglass_flowing_sand", "inbox_tray"):
+            for working in ("hourglass_flowing_sand", "inbox_tray", "x"):
                 await self._set_reaction(client, channel, ts, remove=working)
             await self._set_reaction(
                 client, channel, ts, add="black_square_for_stop"
             )
-            self._stopped_threads.add(f"{channel}:{thread_ts}")
+            self._mark_thread_stopped(f"{channel}:{thread_ts}")
             if (channel, thread_ts) in told:
                 continue
             told.add((channel, thread_ts))
@@ -7669,6 +7689,23 @@ class SlackAgent:
     def resume(self) -> None:
         self.set_paused(False)
 
+    def _stopped_by_operator(self) -> bool:
+        """Whether the running task is unwinding because of an operator stop."""
+        task = asyncio.current_task()
+        return task is not None and task in self._operator_cancelled
+
+    def _mark_thread_stopped(self, thread_key: str) -> None:
+        self._stopped_threads.add(thread_key)
+        if self._store is not None:
+            self._store.mark_thread_stopped(self.name, thread_key)
+
+    def _clear_thread_stopped(self, thread_key: str) -> None:
+        if thread_key not in self._stopped_threads:
+            return
+        self._stopped_threads.discard(thread_key)
+        if self._store is not None:
+            self._store.clear_thread_stopped(self.name, thread_key)
+
     def _keep_stopped_session(
         self, thread_key: str, gen: tuple[int, int], session_id: str
     ) -> None:
@@ -7679,7 +7716,7 @@ class SlackAgent:
         stopped turn had already done. Other cancellations (timeouts,
         shutdown) keep the pre-turn session as before.
         """
-        if not (self.paused and session_id):
+        if not (session_id and self._stopped_by_operator()):
             return
         if gen != self._turn_generation(thread_key):
             return

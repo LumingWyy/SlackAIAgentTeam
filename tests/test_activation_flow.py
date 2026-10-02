@@ -742,6 +742,7 @@ def test_stop_cancels_running_work_and_tells_each_thread(tmp_path, monkeypatch):
     assert "中断" in notices[0]["text"]
     assert {"add": "black_square_for_stop", "remove": None} in rec.reactions
     assert {"add": None, "remove": "hourglass_flowing_sand"} in rec.reactions
+    assert not any(r["add"] == "x" for r in rec.reactions)  # stopped, not failed
 
 
 def test_stop_survives_a_restart_until_resumed(tmp_path, monkeypatch):
@@ -822,6 +823,7 @@ def test_interrupted_first_turn_keeps_its_session_only_on_operator_stop(
         await started.wait()
         if operator_stop:
             agent.set_paused(True)
+            agent._operator_cancelled.add(turn)
         turn.cancel()
         await asyncio.gather(turn, return_exceptions=True)
 
@@ -832,15 +834,18 @@ def test_interrupted_first_turn_keeps_its_session_only_on_operator_stop(
 def test_turn_after_a_stop_is_told_not_to_pick_the_work_back_up(tmp_path, monkeypatch):
     agent = _build_agent(tmp_path, monkeypatch)
     started = asyncio.Event()
-    replies = iter(["hang", "ok", "ok"])
+    replies = iter(["hang", "fail", "ok", "ok"])
 
     rec = _wire(agent, ["unused"])
 
     async def fake_run_turn(prompt, thread_key, gen, **kwargs):
         rec.turns.append(prompt)
-        if next(replies) == "hang":
+        reply = next(replies)
+        if reply == "hang":
             started.set()
             await asyncio.sleep(3600)
+        if reply == "fail":
+            raise RuntimeError("provider blew up")
         return "done"
 
     agent._run_turn = fake_run_turn
@@ -853,14 +858,15 @@ def test_turn_after_a_stop_is_told_not_to_pick_the_work_back_up(tmp_path, monkey
         await started.wait()
         await agent.stop()
         agent.resume()
-        await agent._activate_inner(_event(ts="103.0"), object(), _say)
-        await agent._activate_inner(_event(ts="105.0"), object(), _say)
+        for ts in ("103.0", "105.0", "107.0"):
+            await agent._activate_inner(_event(ts=ts), object(), _say)
 
     asyncio.run(scenario())
     note = "操作者が途中で停止しました"
     assert note not in rec.turns[0]
-    assert note in rec.turns[1]  # the first turn after the stop
-    assert note not in rec.turns[2]  # said once
+    assert note in rec.turns[1]  # the first turn after the stop (it fails)
+    assert note in rec.turns[2]  # so the retry still carries it
+    assert note not in rec.turns[3]  # cleared once a turn succeeded
 
 
 # ---------------------------------------------------------------------------
@@ -918,3 +924,98 @@ def test_status_reports_stopped_apart_from_cooldown_paused_admissions(
     snapshot = agent.status_snapshot()
     assert snapshot["stopped"] is True
     assert snapshot["paused"] == 0  # still the limiter's count
+
+
+def test_resume_before_a_cancelled_task_unwinds_still_counts_as_a_stop(
+    tmp_path, monkeypatch
+):
+    """Cleanup asks whether its own task was stopped, not the live flag."""
+    agent = _build_agent(tmp_path, monkeypatch)
+    seen = []
+    started = asyncio.Event()
+
+    async def work():
+        try:
+            started.set()
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.05)  # Resume lands while this unwinds
+            seen.append(agent._stopped_by_operator())
+            raise
+
+    async def scenario():
+        task = asyncio.create_task(work())
+        agent._tasks.add(task)
+        await started.wait()
+        stopping = asyncio.create_task(agent.stop())
+        await asyncio.sleep(0)
+        agent.resume()
+        await stopping
+
+    asyncio.run(scenario())
+    assert seen == [True]
+    assert agent.paused is False
+
+
+def test_stop_replies_within_its_bound_when_work_is_slow_to_unwind(
+    tmp_path, monkeypatch
+):
+    import time as _time
+
+    import multi_app
+
+    monkeypatch.setattr(multi_app, "STOP_WAIT_SECONDS", 0.05)
+    agent = _build_agent(tmp_path, monkeypatch)
+    started = asyncio.Event()
+
+    async def stubborn():
+        try:
+            started.set()
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await asyncio.sleep(1.0)
+            raise
+
+    async def scenario():
+        task = asyncio.create_task(stubborn())
+        agent._tasks.add(task)
+        await started.wait()
+        begin = _time.monotonic()
+        result = await agent.stop()
+        elapsed = _time.monotonic() - begin
+        await asyncio.gather(task, return_exceptions=True)
+        return result, elapsed
+
+    result, elapsed = asyncio.run(scenario())
+    assert result["cancelled"] == 1
+    assert elapsed < 0.8
+
+
+def test_stop_note_survives_a_restart(tmp_path, monkeypatch):
+    from multi_app import Roster, SlackAgent, load_agents_config
+    from multi_core import TurnBudget
+    from state_store import StateStore
+
+    yaml_path = tmp_path / "agents.yaml"
+    yaml_path.write_text("agents:\n  - name: dev\n    persona: x\n", encoding="utf-8")
+    monkeypatch.setenv("DEV_SLACK_BOT_TOKEN", "xoxb-dev")
+    monkeypatch.setenv("DEV_SLACK_APP_TOKEN", "xapp-dev")
+    configs, _ = load_agents_config(str(yaml_path))
+
+    def boot(store):
+        return SlackAgent(
+            configs[0], budget=TurnBudget(8), roster=Roster(),
+            allowed_humans=set(), store=store,
+        )
+
+    store = StateStore(str(tmp_path / "state.db"))
+    boot(store)._mark_thread_stopped("C1:100.0")
+    store.close()
+    store = StateStore(str(tmp_path / "state.db"))
+    agent = boot(store)
+    assert "C1:100.0" in agent._stopped_threads
+    agent._clear_thread_stopped("C1:100.0")
+    store.close()
+    store = StateStore(str(tmp_path / "state.db"))
+    assert boot(store)._stopped_threads == set()
+    store.close()
