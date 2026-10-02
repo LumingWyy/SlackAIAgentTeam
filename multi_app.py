@@ -5427,7 +5427,6 @@ class SlackAgent:
                             thread_key,
                         )
                     elif gen == self._turn_generation(thread_key):
-                        self._clear_thread_stopped(thread_key)
                         self.last_seen[thread_key] = ts
                         self.persist_thread(
                             thread_key, ts, execution_plan
@@ -5444,6 +5443,10 @@ class SlackAgent:
                     if not skip_post:
                         await self._post_result(channel, thread_ts, result)
                     ok = turn_ok
+                    if ok and gen == self._turn_generation(thread_key):
+                        # Only once the reply is out: a failed post is retried
+                        # and the retry should still carry the stop note.
+                        self._clear_thread_stopped(thread_key)
                 finally:
                     if self._stopped_by_operator():
                         done_reaction = "black_square_for_stop"

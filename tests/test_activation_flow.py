@@ -1019,3 +1019,23 @@ def test_stop_note_survives_a_restart(tmp_path, monkeypatch):
     store = StateStore(str(tmp_path / "state.db"))
     assert boot(store)._stopped_threads == set()
     store.close()
+
+
+def test_stop_note_stays_when_the_reply_could_not_be_posted(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    rec = _wire(agent, ["done"])
+    agent._mark_thread_stopped("C1:100.0")
+    attempts = []
+
+    async def flaky_post(_channel, _thread_ts, result):
+        attempts.append(result)
+        if len(attempts) == 1:
+            raise RuntimeError("slack is down")
+        rec.posts.append(result)
+
+    agent._post_result = flaky_post
+    _activate(agent, _event(ts="101.0"))  # the failed post is logged, not raised
+    assert "C1:100.0" in agent._stopped_threads  # nothing reached the thread
+    _activate(agent, _event(ts="103.0"))
+    assert "C1:100.0" not in agent._stopped_threads
+    assert "操作者が途中で停止しました" in rec.turns[1]
