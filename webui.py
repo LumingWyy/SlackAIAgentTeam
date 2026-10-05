@@ -4495,7 +4495,12 @@ function watchCard(el, longId){
   const h=typeof longId==='string'?document.getElementById(longId):longId;
   if(h) h.classList.toggle('on', long);
 }
-async function loadCfg(){loadRules();const st=await j('/api/state');
+// Setup can be opened before Monitor ever loaded: read the Slack names too.
+async function syncLiveSlack(){
+  try{const st=await j('/api/live/state');
+    LIVE_SLACK=Object.fromEntries((st.agents||[]).map(a=>[a.name,a.slack||null]));}catch(e){}
+}
+async function loadCfg(){loadRules();const [st]=await Promise.all([j('/api/state'),syncLiveSlack()]);
   $('#agents').innerHTML=st.agents.map(a=>`
   <div class="card" data-agent="${esc(a.name)}">
     <div class="head">

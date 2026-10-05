@@ -244,6 +244,8 @@ def test_card_titles_show_the_slack_name_with_the_internal_name_beside(tmp_path)
     script = _main_script(webui.INDEX_HTML)
     assert script.count("agentTitleHtml(a.name,") == 2  # monitor and setup cards
     assert "LIVE_SLACK=Object.fromEntries(" in script
+    # Setup reads the Slack names itself; it may be opened before Monitor.
+    assert "const [st]=await Promise.all([j('/api/state'),syncLiveSlack()]);" in script
     assert script.count("'nm.internal':") == 3
     node = shutil.which("node")
     if node is None:
