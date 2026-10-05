@@ -1039,3 +1039,29 @@ def test_stop_note_stays_when_the_reply_could_not_be_posted(tmp_path, monkeypatc
     _activate(agent, _event(ts="103.0"))
     assert "C1:100.0" not in agent._stopped_threads
     assert "操作者が途中で停止しました" in rec.turns[1]
+
+
+def test_slack_name_is_reread_periodically(tmp_path, monkeypatch):
+    import multi_app
+
+    monkeypatch.setattr(multi_app, "SLACK_IDENTITY_REFRESH_SECONDS", 0.01)
+    agent = _build_agent(tmp_path, monkeypatch)
+    calls = []
+
+    async def refresh():
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("slack hiccup")  # a failure never ends the loop
+        return {}
+
+    agent.refresh_slack_identity = refresh
+
+    async def scenario():
+        loop = asyncio.create_task(agent.slack_identity_loop())
+        while len(calls) < 3:
+            await asyncio.sleep(0.01)
+        loop.cancel()
+        await asyncio.gather(loop, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert len(calls) >= 3

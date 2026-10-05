@@ -7,6 +7,7 @@ the whole <script> became a syntax error -> setLang undefined -> language switch
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 
@@ -236,6 +237,35 @@ def test_monitor_card_shows_and_syncs_the_slack_name():
         assert script.count(f"'{key}':") == 3, key
     routes = {(r.method, r.resource.canonical) for r in webui.make_app().router.routes() if r.resource}
     assert ("POST", "/api/live/{name}/slack-identity") in routes
+
+
+def test_card_titles_show_the_slack_name_with_the_internal_name_beside(tmp_path):
+    """Renames happen in Slack; the console title follows, agents.yaml's name stays."""
+    script = _main_script(webui.INDEX_HTML)
+    assert script.count("agentTitleHtml(a.name,") == 2  # monitor and setup cards
+    assert "LIVE_SLACK=Object.fromEntries(" in script
+    assert script.count("'nm.internal':") == 3
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed")
+    start = script.index("function agentTitleHtml(")
+    body = script[start : script.index("let MODELS=", start)]
+    harness = tmp_path / "title.js"
+    harness.write_text(
+        "const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');"
+        "const t=k=>k;" + body +
+        "console.log(JSON.stringify(["
+        "agentTitleHtml('dev',null),"
+        "agentTitleHtml('dev',{display_name:'dev',app_name:'Agent (x)'}),"
+        "agentTitleHtml('dev',{display_name:'developer',app_name:'Agent (x)'}),"
+        "agentTitleHtml('dev',{display_name:'',app_name:'Agent <x>'})]));",
+        encoding="utf-8",
+    )
+    out = json.loads(subprocess.run([node, str(harness)], capture_output=True, text=True, check=True).stdout)
+    assert out[0] == '<span class="nm">dev</span>'
+    assert out[1] == '<span class="nm">dev</span>'  # Slack still shows "dev"
+    assert out[2].startswith('<span class="nm">developer</span><span class="nm-id"') and ">dev</span>" in out[2]
+    assert '<span class="nm">Agent &lt;x></span>' in out[3]  # escaped
 
 
 def test_stop_and_resume_proxy_to_the_admin_api(monkeypatch):

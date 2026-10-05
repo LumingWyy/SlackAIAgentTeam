@@ -2895,6 +2895,8 @@ class NodeRuntimeLimiter:
 
 # How long an operator stop waits for cancelled work to unwind before replying.
 STOP_WAIT_SECONDS = 20.0
+# Renames happen in Slack; re-read each bot's Slack name this often.
+SLACK_IDENTITY_REFRESH_SECONDS = 900.0
 
 
 class SlackAgent:
@@ -3688,6 +3690,18 @@ class SlackAgent:
                 "agent %s could not read its Slack profile", self.name,
                 exc_info=True,
             )
+
+    async def slack_identity_loop(self) -> None:
+        """Keep the Slack name current without a manual Sync."""
+        while True:
+            await asyncio.sleep(SLACK_IDENTITY_REFRESH_SECONDS)
+            try:
+                await self.refresh_slack_identity()
+            except Exception:
+                logger.debug(
+                    "agent %s Slack profile refresh failed", self.name,
+                    exc_info=True,
+                )
 
     async def refresh_slack_identity(self) -> dict[str, Any]:
         """Re-read what Slack shows for this bot (renames happen in Slack)."""
@@ -9865,6 +9879,7 @@ async def main() -> None:
     await asyncio.gather(
         *[h.start_async() for h in handlers],
         *[a.patrol_loop() for a in patrol_agents],
+        *[a.slack_identity_loop() for a in agents],
         watch_live_coverage(
             handlers,
             transcript_store,

@@ -2841,6 +2841,8 @@ a:hover{text-decoration-color:var(--accent)}
 .state.paused{color:var(--ink-2);background:var(--tile)}.state.paused::before{border-radius:1.5px;background:var(--ink-2)}
 .btn.line.stop{color:var(--crit)}
 .slackid{align-items:baseline;flex-wrap:wrap}.slackname{font-weight:600;color:var(--ink)}
+.nm-id{font-family:var(--mono);font-size:.72rem;color:var(--faint);padding:1px 6px;border:1px solid var(--line);
+  border-radius:var(--pill);white-space:nowrap}
 .btn.line.stop:hover{border-color:color-mix(in oklch,var(--crit) 45%,var(--line-2))}
 .rtline{font-family:var(--mono);font-size:.76rem;color:var(--ink-2)}
 .node .aux{margin-left:auto;font-family:var(--mono);font-size:.72rem;color:var(--faint)}
@@ -3603,6 +3605,14 @@ function safeHttpUrl(value){
   try{const u=new URL(String(value||''),location.origin);
     return (u.protocol==='http:'||u.protocol==='https:')?u.href:'';}catch(e){return '';}
 }
+// agent name → what Slack shows for its bot (from the live state)
+let LIVE_SLACK={};
+// The title is the Slack name (renames happen in Slack); agents.yaml's name
+// stays visible beside it because commands, env vars and @handoffs use it.
+function agentTitleHtml(name,sl){
+  const shown=(sl&&(sl.display_name||sl.app_name))||name;
+  return `<span class="nm">${esc(shown)}</span>${shown!==name?`<span class="nm-id" title="${esc(t('nm.internal'))}">${esc(name)}</span>`:''}`;
+}
 let MODELS={claude:[''],codex:[''],openai:[''],sources:{},current:{}}, MODELS_READY=false,
   MODELS_LOADING=null, NEWRT='claude', PENDING=Object.create(null);
 
@@ -3644,7 +3654,7 @@ const I18N={
    'empty.noagents':'没有智能体。请在「构成」添加并启动 multi_app。',
    'st.busy':'运行中','st.idle':'待机','st.off':'未连接','model.def':'既定模型',
    'model.custom':'自定义模型 id','model.custom.hint':'任意模型名，如 grok-4.5 / Antigravity 转出模型；回车确认',
-   'lbl.runtime':'runtime','lbl.model':'模型','lbl.replylang':'回复语言','toast.lang':'✓ {n} 回复语言 → {l}','lbl.effort':'推理强度','toast.effort':'✓ {n} 推理强度 → {e}','btn.restart':'会话重启','slack.lbl':'Slack 名称','slack.sync':'同步','slack.edit':'改显示名','slack.hint':'Slack 消息上显示的是 App Home 里的 Display Name (Bot Name)；App 名和用户名不会改变它','slack.unknown':'尚未读取（连接后点同步）','toast.slack':'✓ {n} 在 Slack 显示为「{d}」','btn.stop':'停止','btn.resume':'恢复','st.paused':'已停止','stop.confirm':'停止 {n}：中断进行中的 {c} 个任务（巡检领取的 issue 退回 todo），之后不接新任务，直到点「恢复」。','toast.stop':'⏹ {n} 已停止（中断 {c} 个任务）','toast.resume':'▶ {n} 已恢复',
+   'lbl.runtime':'runtime','lbl.model':'模型','lbl.replylang':'回复语言','toast.lang':'✓ {n} 回复语言 → {l}','lbl.effort':'推理强度','toast.effort':'✓ {n} 推理强度 → {e}','btn.restart':'会话重启','nm.internal':'控制台内部名（agents.yaml）：命令、环境变量和 @交接都用它','slack.lbl':'Slack 名称','slack.sync':'同步','slack.edit':'改显示名','slack.hint':'Slack 消息上显示的是 App Home 里的 Display Name (Bot Name)；App 名和用户名不会改变它','slack.unknown':'尚未读取（连接后点同步）','toast.slack':'✓ {n} 在 Slack 显示为「{d}」','btn.stop':'停止','btn.resume':'恢复','st.paused':'已停止','stop.confirm':'停止 {n}：中断进行中的 {c} 个任务（巡检领取的 issue 退回 todo），之后不接新任务，直到点「恢复」。','toast.stop':'⏹ {n} 已停止（中断 {c} 个任务）','toast.resume':'▶ {n} 已恢复',
    'confirm.q':'{n} 切换到 {m}？','btn.apply':'应用','btn.cancel':'取消',
    'threads.cap':'线程 {a} / {b}','th.run':'运行中','th.wait':'待机','th.left':'剩余',
    'aux':'会话 {s} · 巡逻 {p}','tk':'tok',
@@ -3713,7 +3723,7 @@ const I18N={
    'empty.noagents':'エージェントがありません。「構成」で追加し multi_app を起動してください。',
    'st.busy':'実行中','st.idle':'待機','st.off':'未接続','model.def':'既定モデル',
    'model.custom':'カスタムモデル id','model.custom.hint':'任意のモデル名（例: grok-4.5 / Antigravity）。Enter で確定',
-   'lbl.runtime':'runtime','lbl.model':'モデル','lbl.replylang':'返信言語','toast.lang':'✓ {n} 返信言語 → {l}','lbl.effort':'推論強度','toast.effort':'✓ {n} 推論強度 → {e}','btn.restart':'セッション再起動','slack.lbl':'Slack 名','slack.sync':'同期','slack.edit':'表示名を変更','slack.hint':'Slack のメッセージには App Home の Display Name (Bot Name) が表示されます。App 名やユーザー名では変わりません','slack.unknown':'未取得（接続後に同期）','toast.slack':'✓ {n} は Slack で「{d}」と表示されます','btn.stop':'停止','btn.resume':'再開','st.paused':'停止中','stop.confirm':'{n} を停止します：実行中の {c} 件を中断し（巡回で取った issue は todo に戻します）、「再開」するまで新しい依頼を受けません。','toast.stop':'⏹ {n} を停止（{c} 件中断）','toast.resume':'▶ {n} を再開',
+   'lbl.runtime':'runtime','lbl.model':'モデル','lbl.replylang':'返信言語','toast.lang':'✓ {n} 返信言語 → {l}','lbl.effort':'推論強度','toast.effort':'✓ {n} 推論強度 → {e}','btn.restart':'セッション再起動','nm.internal':'内部名（agents.yaml）：コマンド・環境変数・@ハンドオフで使います','slack.lbl':'Slack 名','slack.sync':'同期','slack.edit':'表示名を変更','slack.hint':'Slack のメッセージには App Home の Display Name (Bot Name) が表示されます。App 名やユーザー名では変わりません','slack.unknown':'未取得（接続後に同期）','toast.slack':'✓ {n} は Slack で「{d}」と表示されます','btn.stop':'停止','btn.resume':'再開','st.paused':'停止中','stop.confirm':'{n} を停止します：実行中の {c} 件を中断し（巡回で取った issue は todo に戻します）、「再開」するまで新しい依頼を受けません。','toast.stop':'⏹ {n} を停止（{c} 件中断）','toast.resume':'▶ {n} を再開',
    'confirm.q':'{n} を {m} に切り替えますか？','btn.apply':'適用','btn.cancel':'取消',
    'threads.cap':'スレッド {a} / {b}','th.run':'実行中','th.wait':'待機','th.left':'残',
    'aux':'セッション {s} · 巡回 {p}','tk':'tok',
@@ -3782,7 +3792,7 @@ const I18N={
    'empty.noagents':'No agents. Add one under Setup and start multi_app.',
    'st.busy':'Running','st.idle':'Idle','st.off':'Offline','model.def':'default model',
    'model.custom':'custom model id','model.custom.hint':'Any model id (e.g. grok-4.5 / Antigravity). Press Enter',
-   'lbl.runtime':'runtime','lbl.model':'model','lbl.replylang':'Reply language','toast.lang':'✓ {n} reply language → {l}','lbl.effort':'Reasoning effort','toast.effort':'✓ {n} effort → {e}','btn.restart':'Restart session','slack.lbl':'Slack name','slack.sync':'Sync','slack.edit':'Change display name','slack.hint':'Slack messages show the App Home Display Name (Bot Name); the app name and username do not change it','slack.unknown':'not read yet (sync once connected)','toast.slack':'✓ {n} shows in Slack as “{d}”','btn.stop':'Stop','btn.resume':'Resume','st.paused':'Stopped','stop.confirm':'Stop {n}: interrupt {c} running task(s) (a patrol issue goes back to todo) and take no new work until you click Resume.','toast.stop':'⏹ {n} stopped ({c} task(s) interrupted)','toast.resume':'▶ {n} resumed',
+   'lbl.runtime':'runtime','lbl.model':'model','lbl.replylang':'Reply language','toast.lang':'✓ {n} reply language → {l}','lbl.effort':'Reasoning effort','toast.effort':'✓ {n} effort → {e}','btn.restart':'Restart session','nm.internal':'internal name (agents.yaml), used by commands, env vars and @handoffs','slack.lbl':'Slack name','slack.sync':'Sync','slack.edit':'Change display name','slack.hint':'Slack messages show the App Home Display Name (Bot Name); the app name and username do not change it','slack.unknown':'not read yet (sync once connected)','toast.slack':'✓ {n} shows in Slack as “{d}”','btn.stop':'Stop','btn.resume':'Resume','st.paused':'Stopped','stop.confirm':'Stop {n}: interrupt {c} running task(s) (a patrol issue goes back to todo) and take no new work until you click Resume.','toast.stop':'⏹ {n} stopped ({c} task(s) interrupted)','toast.resume':'▶ {n} resumed',
    'confirm.q':'Switch {n} to {m}?','btn.apply':'Apply','btn.cancel':'Cancel',
    'threads.cap':'threads {a} / {b}','th.run':'running','th.wait':'idle','th.left':'left',
    'aux':'sessions {s} · patrol {p}','tk':'tok',
@@ -4342,6 +4352,7 @@ async function loadRules(){try{const d=await j('/api/channel-rules');$('#rules-p
 async function loadLive(){
   loadIssues();
   const st=await j('/api/live/state'), on=st.online, ags=st.agents||[];
+  LIVE_SLACK=Object.fromEntries(ags.map(a=>[a.name,a.slack||null]));
   $('#beacon').className='beacon '+(on?'live':'down');
   $('#beacon-t').textContent=on?t('status.live'):t('status.down');
   const liveRepos=[...new Set(ags.map(a=>a.github_repo).filter(Boolean))];
@@ -4385,7 +4396,7 @@ async function loadLive(){
       ||`<div class="empty">—</div>`;
     return `<div class="node" data-agent="${esc(a.name)}" data-runtime="${esc(a.runtime)}" style="animation-delay:${i*60}ms">
       <div class="head">
-        <span class="nm">${esc(a.name)}</span>
+        ${agentTitleHtml(a.name,a.slack)}
         <span class="state ${c}">${s}</span>
         ${cfgPending?`<span class="state work" title="${esc((cfgPending.fields||[]).join(', '))}">${t('cfg.pending')}</span>`:''}
         <span class="rtline">${esc(a.runtime)} · ${dispModel}</span>
@@ -4488,7 +4499,7 @@ async function loadCfg(){loadRules();const st=await j('/api/state');
   $('#agents').innerHTML=st.agents.map(a=>`
   <div class="card" data-agent="${esc(a.name)}">
     <div class="head">
-      <span class="nm">${esc(a.name)}</span>
+      ${agentTitleHtml(a.name,LIVE_SLACK[a.name])}
       <span class="chip">${esc(a.runtime)} · ${a.optional?t('cfg.optional'):t('cfg.required')}</span>
       <span class="tok">bot <span class="${a.bot_set?'ok':'ng'}">${a.bot_set?'✓':'—'}</span>
         · app <span class="${a.app_set?'ok':'ng'}">${a.app_set?'✓':'—'}</span>
