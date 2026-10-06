@@ -356,6 +356,16 @@ DM では人間は `@` なしで会話可能（peer の DM 引き継ぎはしな
 
 Slack ではどちらも 250 文字までなので、Slack 上の約束事だけを書き、詳しいルールは対象リポジトリの `AGENTS.md` に置きます（codex はそのまま読み、`@AGENTS.md` だけを書いた `CLAUDE.md` を置けば Claude も読みます）。topic・説明・ピン留めのテンプレートは [`channel-rules-template.md`](channel-rules-template.md)、`AGENTS.md` の出発点は [`templates/repo-AGENTS.md`](templates/repo-AGENTS.md)。
 
+## 添付と HTML レポート
+
+Slack の各ターンには専用の添付ディレクトリがあり、パスは環境変数 `SLACK_AGENT_OUTBOX` に入ります（`SLACK_AGENT_OUTBOX_ROOT` 配下、既定は `~/.slack-agent-team/outbox`）。agent がそこに保存したファイルは返信と一緒にスレッドへアップロードされ、ディレクトリは削除されます。送るのは通常ファイルだけで、1 ターン最大 5 件・各 10 MB まで、種類は html・png・jpg・gif・svg・pdf・md・txt・csv・json。それ以外は「添付しなかった」と返信します。Slack App には `files:write`（manifest に記載済み）が必要です。
+
+図や表が要る報告（比較、設計の説明、指摘の多いレビューや QA の結果）には、短い Markdown 下書きから 1 ページの HTML を作る [answer-me-with-html](https://github.com/QingYunA/answer-me-with-html) スキルを使えます。
+
+1. agent を動かす各マシンにインストール（サードパーティのコードなので先に確認を。同梱の Node 20+ CLI を実行します）: `npx skills add QingYunA/answer-me-with-html -g -y -a claude-code`（Codex の agent には `-a codex` も）。
+2. agent ごとに `skills: [answer-me-with-html]` で有効化（`defaults` でも可。`team.yaml` の `skills:` でチーム全体）。Claude の agent はここに書いたスキルだけを読み込みます。
+3. agent は `--no-open -o "$SLACK_AGENT_OUTBOX/<名前>.html"` で render し、Slack には結論を 2〜3 行だけ書きます。ページは添付で届きます。普段の返信ではページを作りません。
+
 ## 協調の摩擦対策
 
 1 メッセージ 1 依頼、既出情報の繰り返し禁止、相槌のみ禁止、ターン予算（既定 12）、`dx` による交通整理。

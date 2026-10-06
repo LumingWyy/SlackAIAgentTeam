@@ -419,6 +419,16 @@ On activation, agents load channel **topic** and **purpose** (5 min cache) as ch
 
 Slack caps each at 250 characters, so keep only the Slack conventions there and put the detailed rules in the target repository's `AGENTS.md` (Codex reads it; a `CLAUDE.md` containing `@AGENTS.md` makes Claude read it too). [`channel-rules-template.md`](channel-rules-template.md) has a topic, a description and a pinned-message template; [`templates/repo-AGENTS.md`](templates/repo-AGENTS.md) is the starting point for `AGENTS.md`.
 
+## Attachments and HTML reports
+
+Each Slack turn gets a private outbox directory in `SLACK_AGENT_OUTBOX` (under `SLACK_AGENT_OUTBOX_ROOT`, default `~/.slack-agent-team/outbox`). Files the agent saves there are uploaded to the thread with its reply, then the directory is deleted. Only regular files are sent, at most 5 per turn and 10 MB each, of the types html, png, jpg, gif, svg, pdf, md, txt, csv, json; anything else is listed back as not attached. The Slack app needs `files:write` (in the manifest).
+
+For reports that need diagrams or tables (comparisons, design explanations, reviews or QA results with several findings), agents can use the [answer-me-with-html](https://github.com/QingYunA/answer-me-with-html) skill, which renders a one-page HTML from a short Markdown draft:
+
+1. On every machine that runs agents, install it (third-party code: read it first; it runs a bundled Node 20+ CLI): `npx skills add QingYunA/answer-me-with-html -g -y -a claude-code` (add `-a codex` for Codex agents).
+2. Enable it per agent with `skills: [answer-me-with-html]` (or under `defaults`; `skills:` in `team.yaml` does this for a whole team). Claude agents then load only the skills listed there.
+3. The agent renders with `--no-open -o "$SLACK_AGENT_OUTBOX/<name>.html"`, writes a 2–3 line conclusion in Slack, and the page arrives as an attachment. It does not make pages for ordinary replies.
+
 ## Collaboration friction controls
 
 | Control | Behavior |

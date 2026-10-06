@@ -278,6 +278,9 @@ def build_person_config(
     }
     if person.get("reply_language"):
         defaults["reply_language"] = str(person["reply_language"])
+    if team.get("skills"):
+        # Claude skills every agent may use (each person installs them on their machine)
+        defaults["skills"] = [str(name) for name in team["skills"]]
     agents = [
         {
             "name": agent["name"],

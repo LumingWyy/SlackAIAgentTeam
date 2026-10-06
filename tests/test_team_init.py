@@ -207,3 +207,18 @@ def test_generated_files_are_gitignored():
     lines = (team_init.BASE_DIR / ".gitignore").read_text(encoding="utf-8").splitlines()
     for pattern in ("team.yaml", "team-roster.yaml", "/team/"):
         assert pattern in lines
+
+
+def test_team_skills_reach_every_agent_and_load(tmp_path, monkeypatch):
+    from multi_app import load_agents_config
+
+    team = _team(tmp_path)
+    team["skills"] = ["answer-me-with-html"]
+    team_init.build(team, tmp_path / "out")
+    for name in ("BOB_DEV", "BOB_REV", "BOB_QA", "DX"):
+        monkeypatch.setenv(f"{name}_SLACK_BOT_TOKEN", "xoxb-x")
+        monkeypatch.setenv(f"{name}_SLACK_APP_TOKEN", "xapp-x")
+    configs, _ = load_agents_config(str(tmp_path / "out" / "bob" / "agents.yaml"))
+    assert {c.name: c.skills for c in configs} == {
+        name: ["answer-me-with-html"] for name in ("bob_dev", "bob_rev", "bob_qa", "dx")
+    }

@@ -404,6 +404,16 @@ DM 中人类可无 `@` 对话（peer 不会在 DM 中交接）。
 
 Slack 里两者各限 250 字，所以只放 Slack 上的约定；详细规则写进目标仓库的 `AGENTS.md`（codex 直接读；再放一个内容为 `@AGENTS.md` 的 `CLAUDE.md`，Claude 也会读）。[`channel-rules-template.md`](channel-rules-template.md) 里有 topic、说明和置顶消息的模板；`AGENTS.md` 可以从 [`templates/repo-AGENTS.md`](templates/repo-AGENTS.md) 开始改。
 
+## 附件与 HTML 报告
+
+每个 Slack 轮次都有一个私有附件目录，路径在环境变量 `SLACK_AGENT_OUTBOX` 里（位于 `SLACK_AGENT_OUTBOX_ROOT` 下，默认 `~/.slack-agent-team/outbox`）。agent 存进去的文件会随回复上传到线程，随后目录被删除。只发送普通文件，每轮最多 5 个、每个 10 MB 以内，类型限 html、png、jpg、gif、svg、pdf、md、txt、csv、json；其余文件会回帖说明未附加。Slack App 需要 `files:write`（manifest 里已有）。
+
+需要图表的报告（方案对比、设计说明、指出多处问题的 review 或 QA 结果），agent 可以用 [answer-me-with-html](https://github.com/QingYunA/answer-me-with-html) skill：从一份简短的 Markdown 草稿生成一页 HTML。
+
+1. 在每台运行 agent 的机器上安装（第三方代码，请先审阅；它会运行自带的 Node 20+ CLI）：`npx skills add QingYunA/answer-me-with-html -g -y -a claude-code`（Codex agent 再加 `-a codex`）。
+2. 按 agent 启用：`skills: [answer-me-with-html]`（也可写在 `defaults` 下；`team.yaml` 的 `skills:` 会对整队启用）。Claude agent 只会加载这里列出的 skill。
+3. agent 用 `--no-open -o "$SLACK_AGENT_OUTBOX/<名字>.html"` 渲染，在 Slack 里只写 2〜3 行结论，页面作为附件出现。普通回复不会生成页面。
+
 ## 协作摩擦控制
 
 | 控制 | 行为 |

@@ -2381,6 +2381,62 @@ def is_side_effect_tool(name: str) -> bool:
     return str(name or "") not in READ_ONLY_TOOL_NAMES
 
 
+# Files an agent leaves in its per-turn outbox are attached to its Slack reply.
+OUTBOX_MAX_FILES = 5
+OUTBOX_MAX_BYTES = 10 * 1024 * 1024
+OUTBOX_EXTENSIONS = frozenset(
+    {".html", ".htm", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".pdf",
+     ".md", ".txt", ".csv", ".json"}
+)
+HTML_REPORT_SKILL = "answer-me-with-html"
+_SKILL_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+
+
+def select_outbox_files(
+    entries: list[tuple[str, int, str]],
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Split outbox entries ``(name, size, kind)`` into attachable names and
+    ``(name, reason)`` rejections. ``kind`` is "file", "symlink" or "other".
+
+    Only regular files with an allowed extension and size are attached, at
+    most OUTBOX_MAX_FILES, in name order; nothing else in the outbox leaves
+    the machine.
+    """
+    accepted: list[str] = []
+    rejected: list[tuple[str, str]] = []
+    for name, size, kind in sorted(entries):
+        ext = ("." + name.rsplit(".", 1)[1].lower()) if "." in name.lstrip(".") else ""
+        if kind != "file":
+            rejected.append((name, "not a regular file"))
+        elif ext not in OUTBOX_EXTENSIONS:
+            rejected.append((name, "file type not allowed"))
+        elif size > OUTBOX_MAX_BYTES:
+            rejected.append((name, "larger than 10 MB"))
+        elif size == 0:
+            rejected.append((name, "empty"))
+        elif len(accepted) >= OUTBOX_MAX_FILES:
+            rejected.append((name, f"more than {OUTBOX_MAX_FILES} files"))
+        else:
+            accepted.append(name)
+    return accepted, rejected
+
+
+def parse_skills(value: object, *, agent: str) -> list[str]:
+    """``skills:`` of an agent: Claude skill names to enable for it."""
+    if value is None or value == "":
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"agent {agent}: skills must be a list of skill names")
+    skills: list[str] = []
+    for item in value:
+        name = str(item).strip()
+        if not _SKILL_NAME_RE.fullmatch(name):
+            raise ValueError(f"agent {agent}: invalid skill name {item!r}")
+        if name not in skills:
+            skills.append(name)
+    return skills
+
+
 _SLACK_APP_ID_RE = re.compile(r"A[A-Z0-9]{6,20}")
 
 
