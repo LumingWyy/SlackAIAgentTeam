@@ -2421,10 +2421,24 @@ def select_outbox_files(
     return accepted, rejected
 
 
-def parse_skills(value: object, *, agent: str) -> list[str]:
-    """``skills:`` of an agent: Claude skill names to enable for it."""
+def outbox_safe_name(name: str) -> str:
+    """A filename fit to show in Slack: letters, digits, ``. _ -`` and spaces.
+
+    Rejected names are echoed back in a reply, and anything else (newlines,
+    ``<!channel>``, a ``HANDOFF {...}`` line) would be read as message text.
+    """
+    cleaned = re.sub(r"[^\w. -]", "_", str(name)).strip(" .") or "file"
+    return cleaned[:80]
+
+
+def parse_skills(value: object, *, agent: str) -> list[str] | None:
+    """``skills:`` of an agent: the Claude skills to enable for it.
+
+    None (not configured) keeps the CLI's own defaults; an explicit empty
+    list means no skills at all.
+    """
     if value is None or value == "":
-        return []
+        return None
     if not isinstance(value, list):
         raise ValueError(f"agent {agent}: skills must be a list of skill names")
     skills: list[str] = []

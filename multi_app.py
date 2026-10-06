@@ -81,6 +81,7 @@ from multi_core import (
     context_window_tokens,
     format_stopped_notice,
     HTML_REPORT_SKILL,
+    outbox_safe_name,
     parse_skills,
     select_outbox_files,
     slack_identity,
@@ -666,8 +667,9 @@ class AgentConfig:
     openai_api_key: str = field(default="", repr=False)
     reply_language: str = "日本語"
     effort: str = ""  # runtime-specific reasoning effort; empty = engine default
-    # Claude skills enabled for this agent (others installed on the machine stay off)
-    skills: list[str] = field(default_factory=list)
+    # Claude skills enabled for this agent; None keeps the CLI defaults, []
+    # turns every skill off (others installed on the machine stay off)
+    skills: list[str] | None = None
     # L1 teammate card (!roles / peer prompt). Empty → fall back to persona first line.
     card: str = ""
     # Collaboration metadata. Tokens remain local and are never copied into the
@@ -721,7 +723,7 @@ class ExecutionConfig:
     openai_api_key: str = field(repr=False)
     reply_language: str
     effort: str
-    skills: tuple[str, ...]
+    skills: tuple[str, ...] | None
     card: str
     owner: str
     owner_user_id: str
@@ -761,7 +763,7 @@ class ExecutionConfig:
             openai_api_key=config.openai_api_key,
             reply_language=config.reply_language,
             effort=config.effort,
-            skills=tuple(config.skills),
+            skills=tuple(config.skills) if config.skills is not None else None,
             card=config.card,
             owner=config.owner,
             owner_user_id=config.owner_user_id,
@@ -6208,7 +6210,11 @@ class SlackAgent:
                 if config_snapshot.effort in CLAUDE_EFFORTS
                 else None
             ),
-            skills=list(config_snapshot.skills) or None,
+            skills=(
+                list(config_snapshot.skills)
+                if config_snapshot.skills is not None
+                else None
+            ),
             disallowed_tools=list(AGENT_DISALLOWED_TOOLS),
             env=self._agent_env(),
         )
@@ -6315,7 +6321,11 @@ class SlackAgent:
                     channel=channel,
                     thread_ts=thread_ts,
                     file_uploads=[
-                        {"file": os.path.join(outbox, name), "filename": name, "title": name}
+                        {
+                            "file": os.path.join(outbox, name),
+                            "filename": outbox_safe_name(name),
+                            "title": outbox_safe_name(name),
+                        }
                         for name in accepted
                     ],
                 )
@@ -6335,7 +6345,10 @@ class SlackAgent:
                 channel,
                 thread_ts,
                 "📎 添付しなかったファイル: "
-                + "、".join(f"{name}（{reason}）" for name, reason in rejected[:5]),
+                + "、".join(
+                    f"{outbox_safe_name(name)}（{reason}）"
+                    for name, reason in rejected[:5]
+                ),
             )
 
     def _discard_outbox(self, outbox: str) -> None:
@@ -7573,7 +7586,11 @@ class SlackAgent:
             ),
             model=active_config.claude_model or None,
             effort=self._claude_effort(active_config),
-            skills=list(active_config.skills) or None,
+            skills=(
+                list(active_config.skills)
+                if active_config.skills is not None
+                else None
+            ),
             disallowed_tools=list(AGENT_DISALLOWED_TOOLS),
             env=self._agent_env(execution_plan),
         )
@@ -8541,7 +8558,7 @@ class SlackAgent:
                 "（1 ターン最大 5 件・各 10MB、html/png/jpg/gif/svg/pdf/md/txt/csv/json のみ）。"
                 "秘密情報を含むファイルは置かない。\n"
             )
-            if HTML_REPORT_SKILL in active_config.skills:
+            if HTML_REPORT_SKILL in (active_config.skills or ()):
                 base += (
                     f"- 報告ページ: 上記のような成果物は {HTML_REPORT_SKILL} スキルで 1 ページの HTML にし、"
                     '`--no-open -o "$SLACK_AGENT_OUTBOX/<短い英語名>.html"` を付けて render する。'
