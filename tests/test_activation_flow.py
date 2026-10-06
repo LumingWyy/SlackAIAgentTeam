@@ -1168,3 +1168,43 @@ def test_shutdown_cancels_running_turns_before_closing_slack():
 
     asyncio.run(scenario())
     assert order == ["turn reaped its children", "slack closed"]
+
+
+def test_shut_down_takes_no_new_work_and_reaps_turns_before_closing_slack(
+    tmp_path, monkeypatch
+):
+    import multi_app
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    order = []
+
+    async def scenario():
+        async def turn():
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                order.append("turn reaped")
+                raise
+
+        async def background_loop():
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                order.append("loop cancelled")
+                raise
+
+        agent._tasks.add(asyncio.create_task(turn()))
+        loop_task = asyncio.ensure_future(background_loop())
+        await asyncio.sleep(0)
+
+        async def close_client():
+            # A Slack event still arriving while connections close starts nothing.
+            await agent._on_message({"event_id": "late"}, _event(ts="200.0"), object(), _say)
+            order.append(f"slack closed, {len(agent._tasks)} turn(s) left")
+
+        agent.close_client = close_client
+        await multi_app.shut_down([loop_task], [], [agent])
+
+    asyncio.run(scenario())
+    assert order == ["loop cancelled", "turn reaped", "slack closed, 1 turn(s) left"]
+    assert all(task.done() for task in agent._tasks)  # the one reaped turn, nothing new

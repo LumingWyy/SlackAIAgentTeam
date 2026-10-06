@@ -3067,6 +3067,9 @@ class SlackAgent:
         # self.paused: Resume may land before a cancelled task unwinds.
         self._operator_cancelled: set[asyncio.Task] = set()
         self._patrol_round: asyncio.Task | None = None
+        # Set once the process is stopping: no new activation or patrol round
+        # may start while running ones are cancelled and Slack is closed.
+        self._shutting_down = False
         # What Slack currently shows for this bot (display name, username,
         # app); read at connect and on demand from the console
         self.slack_identity: dict[str, Any] = {}
@@ -3951,6 +3954,8 @@ class SlackAgent:
     async def _on_message(
         self, body: dict, event: dict, client: Any, say: Any
     ) -> None:
+        if self._shutting_down:
+            return  # the process is stopping; Slack redelivers to the next run
         # 0. Opportunistically reclaim idle thread memory (self-throttled, at most once per SWEEP_INTERVAL)
         self._sweep_thread_state()
 
@@ -5856,7 +5861,7 @@ class SlackAgent:
                 # A patrol-enabled but initially repo-less agent can become
                 # active after a verified per-agent repo reload.
                 await self.consume_pending_config()
-                if self.github_repo and not self.paused:
+                if self.github_repo and not self.paused and not self._shutting_down:
                     # Host-claim patrol: the claim tool picks and claims one
                     # issue before any provider turn is spent.
                     round_task = asyncio.create_task(
@@ -7832,6 +7837,10 @@ class SlackAgent:
 
     def resume(self) -> None:
         self.set_paused(False)
+
+    def begin_shutdown(self) -> None:
+        """Take no new work: the process is stopping."""
+        self._shutting_down = True
 
     def _stopped_by_operator(self) -> bool:
         """Whether the running task is unwinding because of an operator stop."""
@@ -10036,8 +10045,9 @@ async def main() -> None:
         if a.cfg.patrol_interval > 0 and a.patrol_channel
         and a.patrol_access()[0]
     ]
-    try:
-        await asyncio.gather(
+    background = [
+        asyncio.ensure_future(coroutine)
+        for coroutine in (
             *[h.start_async() for h in handlers],
             *[a.patrol_loop() for a in patrol_agents],
             *[a.slack_identity_loop() for a in agents],
@@ -10047,11 +10057,30 @@ async def main() -> None:
                 threshold_seconds=socket_gap_threshold,
             ),
         )
+    ]
+    try:
+        await asyncio.gather(*background)
     finally:
-        # Turns first: their cleanup kills and reaps codex / claude children,
-        # which must not outlive the stop while Slack connections close.
-        await cancel_running_turns(agents)
-        await close_slack_connections(handlers, agents)
+        await shut_down(background, handlers, agents)
+
+
+async def shut_down(
+    background: list[asyncio.Future], handlers: list[Any], agents: list[Any]
+) -> None:
+    """Stop in an order where nothing new starts and no child outlives us.
+
+    1. agents take no new work (events may still arrive until Socket Mode
+       closes; gather does not cancel its siblings when one of them fails);
+    2. the background loops and every running turn are cancelled; the turns'
+       cleanup kills and reaps their codex / claude children;
+    3. only then are the Slack connections closed, which can take seconds.
+    """
+    for agent in agents:
+        agent.begin_shutdown()
+    for task in background:
+        task.cancel()
+    await cancel_running_turns(agents)
+    await close_slack_connections(handlers, agents)
 
 
 async def cancel_running_turns(agents: list[Any], *, timeout: float = 5.0) -> None:
