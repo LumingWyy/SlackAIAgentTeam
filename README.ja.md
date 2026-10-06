@@ -297,6 +297,7 @@ admin port は localhost のみ（Alice 8766、Bob 8767）です。
 make run     # = .venv/bin/python multi_app.py
 make test
 make webui
+make stop    # 両方を停止（フォアグラウンドでもバックグラウンドでも）
 ```
 
 ## 使い方

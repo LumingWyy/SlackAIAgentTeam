@@ -112,3 +112,12 @@ def test_only_public_ca_certificates_reach_the_image():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY certs/ /usr/local/share/ca-certificates/extra/" in dockerfile
     assert "SLACK_AGENT_IMAGE=1" in dockerfile  # what the repo-file tests key their skip on
+
+
+def test_make_stop_patterns_cannot_match_their_own_shell():
+    """`sh -c "pkill -f multi_app.py"` would kill the recipe's own shell."""
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    assert "stop: stop-run stop-webui" in makefile
+    for pattern in ("[m]ulti_app\\.py$$", "[w]ebui\\.py$$"):
+        assert f"pkill -f '{pattern}'" in makefile
+    assert "pkill -f multi_app" not in makefile and "pkill -f webui" not in makefile

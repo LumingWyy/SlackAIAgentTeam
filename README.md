@@ -351,6 +351,7 @@ Compose notes:
 make run     # = .venv/bin/python multi_app.py
 make test
 make webui
+make stop    # stops both, whether started in the foreground or in the background
 ```
 
 Startup logs print the roster (name / user_id / workspace). Optional agents without tokens log a skip warning.

@@ -337,6 +337,7 @@ Compose 说明：
 make run     # = .venv/bin/python multi_app.py
 make test
 make webui
+make stop    # 停止两者（前台或后台启动的都可以）
 ```
 
 启动日志会打印 roster（name / user_id / workspace）。无 token 的 optional agent 会打 skip 警告。
