@@ -10048,7 +10048,24 @@ async def main() -> None:
             ),
         )
     finally:
+        # Turns first: their cleanup kills and reaps codex / claude children,
+        # which must not outlive the stop while Slack connections close.
+        await cancel_running_turns(agents)
         await close_slack_connections(handlers, agents)
+
+
+async def cancel_running_turns(agents: list[Any], *, timeout: float = 5.0) -> None:
+    """Cancel every running activation and patrol round, and wait for them."""
+    running = [
+        task
+        for agent in agents
+        for task in [*agent._tasks, getattr(agent, "_patrol_round", None)]
+        if task is not None and not task.done()
+    ]
+    for task in running:
+        task.cancel()
+    if running:
+        await asyncio.wait(running, timeout=timeout)
 
 
 async def close_slack_connections(handlers: list[Any], agents: list[Any]) -> None:

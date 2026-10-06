@@ -1135,3 +1135,36 @@ def test_shutdown_closes_every_connection_even_if_one_fails():
         )
     )
     assert closed == ["socket-a", "socket-b", "dev", "reviewer"]
+
+
+def test_shutdown_cancels_running_turns_before_closing_slack():
+    """A turn's children are reaped before shutdown spends time on Slack."""
+    import multi_app
+
+    order = []
+
+    async def scenario():
+        async def turn():
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                order.append("turn reaped its children")
+                raise
+
+        class Agent:
+            name = "dev"
+
+            def __init__(self):
+                self._tasks = {asyncio.create_task(turn())}
+                self._patrol_round = None
+
+            async def close_client(self):
+                order.append("slack closed")
+
+        agent = Agent()
+        await asyncio.sleep(0)
+        await multi_app.cancel_running_turns([agent])
+        await multi_app.close_slack_connections([], [agent])
+
+    asyncio.run(scenario())
+    assert order == ["turn reaped its children", "slack closed"]
