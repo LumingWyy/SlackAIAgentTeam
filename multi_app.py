@@ -3042,7 +3042,9 @@ class SlackAgent:
         ] = {}
         # thread_key → last activation time; basis for thread-level memory reclaim
         self._thread_touched: dict[str, float] = {}
-        self._last_sweep: float = 0.0
+        # -inf, not 0: monotonic time starts at boot, so on a freshly booted
+        # machine (or container VM) a 0 here skipped the first sweep.
+        self._last_sweep: float = float("-inf")
         self._slack_files_prepare_lock = threading.Lock()
         # Strong refs for fire-and-forget tasks so GC does not drop them mid-flight
         self._tasks: set[asyncio.Task] = set()

@@ -8766,6 +8766,26 @@ def test_restart_sessions_survives_inflight_turn(tmp_path, monkeypatch):
     assert agent.thread_stats.get("C:1") is None
 
 
+def test_first_sweep_runs_right_after_boot(tmp_path, monkeypatch):
+    """monotonic() starts at boot; a young clock must not skip the first sweep."""
+    import multi_app
+
+    agent, _gcfg, _p = _make_agent(
+        tmp_path,
+        monkeypatch,
+        """
+        agents:
+          - name: a
+            persona: x
+            workspace: /ws/a
+        """,
+    )
+    monkeypatch.setattr(multi_app.time, "monotonic", lambda: 1.0)
+    agent._thread_touched["C1:1.0"] = 1.0 - multi_app.THREAD_STATE_TTL_SECONDS * 2
+    agent._sweep_thread_state()
+    assert "C1:1.0" not in agent._thread_touched
+
+
 def test_sweep_forgets_thread_generation(tmp_path, monkeypatch):
     """Reset counters are reclaimed with the rest of a thread's idle state."""
     import multi_app
