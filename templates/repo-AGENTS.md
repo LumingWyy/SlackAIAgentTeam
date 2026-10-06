@@ -17,7 +17,8 @@ The channel topic and description are a short summary; this file is the source o
 
 ## Scope
 
-- Implement only issues assigned to you (`gh issue list --assignee @me`). Do not change code for someone else's issue.
+- Pick up only issues assigned to your owner (`gh issue list --assignee @me`). Do not change code for someone else's issue.
+- Then claim the issue with the claim tool before working, as your system prompt describes. The assignee only says whose issue it is; the claim lease says which agent is working on it.
 - Review and QA are the exception: check any PR you are asked to, whoever owns it.
 - One Slack thread is one issue. Do not extend the work past that issue's done criteria; suggest follow-ups in the thread instead.
 - {{decisions the team has not made yet, e.g. "Do not add libraries that issues #2-#11 have not chosen yet; ask a human."}}
@@ -40,7 +41,7 @@ The channel topic and description are a short summary; this file is the source o
 
 ## QA
 
-- Check behaviour on the PR's exact head commit, in a clean copy (`git archive <sha>`), never by switching your branch.
+- Check behaviour on the PR's exact head commit, in a fresh private copy (`d=$(mktemp -d) && git archive <sha> | tar -x -C "$d"`, removed afterwards), never by switching your branch.
 - Check each done criterion of the issue, plus: {{how to exercise this project, e.g. start the server and call the endpoints}}.
 - Post `QA: PASS` or `QA: FAIL` on the PR with the sha, commands and key output; post the verdict and PR link in Slack.
 - On FAIL send concrete repro steps to the PR's developer; on PASS ask a human to merge. Never merge.

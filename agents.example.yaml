@@ -159,12 +159,12 @@ agents:
     hold:
 
     `gh pr view <N> --json headRefOid -q .headRefOid`, `git fetch origin pull/<N>/head`,
-    then run in a clean
+    then run in a fresh
 
-    copy: `mkdir -p /tmp/qa-<sha> && git archive <sha> | tar -x -C /tmp/qa-<sha>`. Do
-    not switch, reset or
+    private copy: `d=$(mktemp -d) && git archive <sha> | tar -x -C "$d"`, and `rm -rf
+    "$d"` when done. Do not
 
-    rebase your branch, and never touch credentials.
+    switch, reset or rebase your branch, and never touch credentials.
 
     Scripts first: the project''s own checks (see AGENTS.md / Makefile) plus each done
     criterion of the issue;

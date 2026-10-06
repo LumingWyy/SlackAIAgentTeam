@@ -395,7 +395,7 @@ cp team.example.yaml team.yaml        # メンバー、Slack ユーザー ID、�
 python team_init.py build team.yaml   # -> team/team-roster.yaml、team/<key>/{agents.yaml,env.example}
 ```
 
-各自は `team/<key>/agents.yaml` と `team/<key>/team-roster.yaml` を自分の SlackAgentTeam フォルダにコピーし、`env.example` を `.env` にマージして、自分の Slack App 3 つ（`<key>_dev`、`<key>_rev`、`<key>_qa`）を作成します。Slack の ID は App のインストール後に決まります:
+各自は `team/<key>/agents.yaml` と `team/<key>/team-roster.yaml` を自分の SlackAgentTeam フォルダにコピーし、`env.example` を `.env` にマージして、自分の Slack App 3 つ（`<key>_dev`、`<key>_rev`、`<key>_qa`）を作成します。host を担当する人は、受け持つチーム agent（`pm`、`dx`、後述の `team_agents`）の App も 1 つずつ作ります。Slack の ID は App のインストール後に決まります:
 
 ```bash
 python team_init.py ids team.yaml --person <key> --write   # 本人の bot token で auth.test を呼んで ID を取得

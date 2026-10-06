@@ -129,7 +129,11 @@ def validate_team(team: dict[str, Any]) -> None:
         raise TeamError("team_agents must be a list")
     roles: set[str] = set()
     for entry in shared:
-        role = str((entry or {}).get("role") or "")
+        if not isinstance(entry, dict):
+            raise TeamError(
+                "each team_agents entry must be a mapping like {role: pm, host: <key>}"
+            )
+        role = str(entry.get("role") or "")
         if role not in TEAM_ROLES:
             raise TeamError(
                 f"team_agents role {role!r}: one of {', '.join(TEAM_ROLES)}"
@@ -193,7 +197,8 @@ def _card(person: dict[str, Any], role: str) -> str:
     label = _person_label(person)
     if role == "dev":
         return (
-            f"{label}'s developer. Implements issues assigned to {label}; asks "
+            f"{label}'s developer. Implements issues assigned to {label}, claiming "
+            "each with the claim tool first; asks "
             f"{agent_name(person['key'], 'rev')} for review unless a human names "
             "another reviewer; fixes what review or QA sends back."
         )
@@ -269,17 +274,26 @@ def build_roster(team: dict[str, Any]) -> dict[str, Any]:
     return roster
 
 
-def _template_personas() -> dict[str, str]:
+def _template_agents() -> dict[str, dict[str, Any]]:
+    """name -> {persona, allowed_tools?} from agents.example.yaml.
+
+    A role's tool limit travels with its persona: dx is read-only there, and
+    the generated dx must not fall back to the write-capable defaults.
+    """
     raw = yaml.safe_load(AGENTS_TEMPLATE.read_text(encoding="utf-8")) or {}
-    return {
-        str(entry.get("name")): str(entry.get("persona") or "")
-        for entry in raw.get("agents") or []
-        if isinstance(entry, dict)
-    }
+    agents: dict[str, dict[str, Any]] = {}
+    for entry in raw.get("agents") or []:
+        if not isinstance(entry, dict):
+            continue
+        spec: dict[str, Any] = {"persona": str(entry.get("persona") or "")}
+        if "allowed_tools" in entry:
+            spec["allowed_tools"] = list(entry["allowed_tools"])
+        agents[str(entry.get("name"))] = spec
+    return agents
 
 
 def build_person_config(
-    team: dict[str, Any], person: dict[str, Any], personas: dict[str, str]
+    team: dict[str, Any], person: dict[str, Any], templates: dict[str, dict[str, Any]]
 ) -> dict[str, Any]:
     workspace = str(person["workspace"]).strip()
     defaults: dict[str, Any] = {
@@ -294,14 +308,17 @@ def build_person_config(
     if team.get("skills"):
         # Claude skills every agent may use (each person installs them on their machine)
         defaults["skills"] = [str(name) for name in team["skills"]]
-    agents = [
-        {
+    agents = []
+    for agent in hosted(team, person):
+        template = templates.get(agent["persona"], {})
+        entry: dict[str, Any] = {
             "name": agent["name"],
             "runtime": agent["runtime"],
-            "persona": personas.get(agent["persona"], ""),
+            "persona": template.get("persona", ""),
         }
-        for agent in hosted(team, person)
-    ]
+        if "allowed_tools" in template:
+            entry["allowed_tools"] = list(template["allowed_tools"])
+        agents.append(entry)
     return {
         "roster": ROSTER_FILE,
         "node": {"id": str(person["node_id"]), "max_concurrency": 2, "max_queue": 10},
@@ -345,7 +362,7 @@ def _dump(data: dict[str, Any]) -> str:
 
 def build(team: dict[str, Any], out: Path) -> list[Path]:
     """Write every generated file under ``out``; returns the paths written."""
-    personas = _template_personas()
+    templates = _template_agents()
     written: list[Path] = []
     out.mkdir(parents=True, exist_ok=True)
     roster_text = _dump(build_roster(team))
@@ -356,7 +373,7 @@ def build(team: dict[str, Any], out: Path) -> list[Path]:
         folder = out / person["key"]
         folder.mkdir(exist_ok=True)
         files = {
-            "agents.yaml": _dump(build_person_config(team, person, personas)),
+            "agents.yaml": _dump(build_person_config(team, person, templates)),
             ROSTER_FILE: roster_text,
             "env.example": env_example(team, person),
         }

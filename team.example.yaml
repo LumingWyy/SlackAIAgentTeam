@@ -17,7 +17,7 @@ daily_total_tokens: 250000         # optional: per-person daily AI token budget
 # pm turns vague requests into assigned issues; dx keeps threads from looping.
 team_agents:
   - role: pm
-    host: alice                    # runs on Alice's machine, on her quota
+    host: alice                    # runs on Alice's machine, on her quota; Alice creates its Slack App too
   - role: dx
     host: bob
 

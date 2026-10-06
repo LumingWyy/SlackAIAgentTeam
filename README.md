@@ -472,7 +472,7 @@ cp team.example.yaml team.yaml        # people, Slack user ids, machines, repo, 
 python team_init.py build team.yaml   # -> team/team-roster.yaml, team/<key>/{agents.yaml,env.example}
 ```
 
-Each person then copies `team/<key>/agents.yaml` and `team/<key>/team-roster.yaml` into their SlackAgentTeam folder, merges `env.example` into `.env`, and creates their three Slack Apps (`<key>_dev`, `<key>_rev`, `<key>_qa`). Slack ids exist only after the apps are installed:
+Each person then copies `team/<key>/agents.yaml` and `team/<key>/team-roster.yaml` into their SlackAgentTeam folder, merges `env.example` into `.env`, and creates their three Slack Apps (`<key>_dev`, `<key>_rev`, `<key>_qa`), plus one app for each team agent they host (`pm`, `dx`; see `team_agents` below). Slack ids exist only after the apps are installed:
 
 ```bash
 python team_init.py ids team.yaml --person <key> --write   # reads them via auth.test with that person's bot tokens

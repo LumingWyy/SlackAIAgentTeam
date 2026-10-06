@@ -139,6 +139,7 @@ def test_env_example_names_the_variables_and_holds_no_values(tmp_path):
         (lambda t: t["team_agents"].append({"role": "pm", "host": "bob"}), "twice"),
         (lambda t: t["team_agents"][0].update(host="carol"), "host must be"),
         (lambda t: t["team_agents"][0].update(role="ceo"), "one of pm, dx"),
+        (lambda t: t.update(team_agents=["pm", "dx"]), "must be a mapping"),
     ],
 )
 def test_bad_team_files_are_rejected(tmp_path, change, message):
@@ -249,3 +250,20 @@ def test_a_small_daily_quota_still_produces_a_loadable_roster(tmp_path, monkeypa
     team["reservation_tokens"] = 20000
     with pytest.raises(TeamError, match="cannot exceed"):
         team_init.validate_team(team)
+
+
+def test_team_agents_keep_the_template_tool_limits(tmp_path):
+    """dx is read-only in agents.example.yaml; generating it must not widen that."""
+    team = _team(tmp_path)
+    team_init.build(team, tmp_path / "out")
+    bob = yaml.safe_load((tmp_path / "out" / "bob" / "agents.yaml").read_text(encoding="utf-8"))
+    tools = {a["name"]: a.get("allowed_tools") for a in bob["agents"]}
+    assert tools["dx"] == ["Read", "Glob", "Grep"]
+    assert tools["bob_dev"] is None  # roles without a limit use the defaults
+
+
+def test_developer_card_says_to_claim_before_working(tmp_path):
+    team = _team(tmp_path)
+    roster = team_init.build_roster(team)
+    card = next(a["card"] for a in roster["agents"] if a["name"] == "alice_dev")
+    assert "claiming each with the claim tool first" in card

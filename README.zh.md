@@ -455,7 +455,7 @@ cp team.example.yaml team.yaml        # 成员、Slack 用户 ID、机器名、�
 python team_init.py build team.yaml   # -> team/team-roster.yaml、team/<key>/{agents.yaml,env.example}
 ```
 
-之后每人把 `team/<key>/agents.yaml` 和 `team/<key>/team-roster.yaml` 复制到自己的 SlackAgentTeam 目录，把 `env.example` 合并进 `.env`，并创建自己的三个 Slack App（`<key>_dev`、`<key>_rev`、`<key>_qa`）。Slack ID 要等 App 安装后才有：
+之后每人把 `team/<key>/agents.yaml` 和 `team/<key>/team-roster.yaml` 复制到自己的 SlackAgentTeam 目录，把 `env.example` 合并进 `.env`，并创建自己的三个 Slack App（`<key>_dev`、`<key>_rev`、`<key>_qa`）；担任 host 的人还要为自己托管的团队 agent（`pm`、`dx`，见下文 `team_agents`）各建一个。Slack ID 要等 App 安装后才有：
 
 ```bash
 python team_init.py ids team.yaml --person <key> --write   # 用本人的 bot token 调 auth.test 读出 ID

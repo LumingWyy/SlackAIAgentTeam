@@ -102,6 +102,7 @@ def test_repo_agents_template_tells_how_claude_reads_it():
     text = (ROOT / "templates" / "repo-AGENTS.md").read_text(encoding="utf-8")
     assert "CLAUDE.md" in text and "`@AGENTS.md`" in text
     assert "--assignee @me" in text
+    assert "claim tool" in text  # the assignee picks the issue; the claim lease decides who works on it
 
 
 def test_template_qa_checks_the_pr_commit_and_writes_back():
@@ -109,6 +110,7 @@ def test_template_qa_checks_the_pr_commit_and_writes_back():
     personas = {a["name"]: a["persona"] for a in raw["agents"]}
     qa = personas["qa"]
     assert "headRefOid" in qa and "git archive" in qa  # the PR's exact commit, clean copy
+    assert "mktemp -d" in qa and "/tmp/qa-" not in qa  # fresh private dir, not a guessable path
     assert "gh pr comment" in qa and "QA: PASS" in qa and "QA: FAIL" in qa
     assert "Never merge" in qa
     assert "hand the PR to the QA agent" in personas["reviewer"]
