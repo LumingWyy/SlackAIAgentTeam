@@ -114,10 +114,42 @@ def test_only_public_ca_certificates_reach_the_image():
     assert "SLACK_AGENT_IMAGE=1" in dockerfile  # what the repo-file tests key their skip on
 
 
-def test_make_stop_patterns_cannot_match_their_own_shell():
-    """`sh -c "pkill -f multi_app.py"` would kill the recipe's own shell."""
+def test_make_stop_stops_only_this_checkouts_processes(tmp_path):
+    """Another clone's multi_app (here: a fake one elsewhere) must keep running."""
+    import shutil
+    import subprocess
+    import sys
+    import time
+
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
-    assert "stop: stop-run stop-webui" in makefile
-    for pattern in ("[m]ulti_app\\.py$$", "[w]ebui\\.py$$"):
-        assert f"pkill -f '{pattern}'" in makefile
-    assert "pkill -f multi_app" not in makefile and "pkill -f webui" not in makefile
+    assert "@sh scripts/stop-local.sh run" in makefile
+    assert "@sh scripts/stop-local.sh webui" in makefile
+    assert "pkill" not in makefile
+
+    checkout, other = tmp_path / "checkout", tmp_path / "other-clone"
+    (checkout / "scripts").mkdir(parents=True)
+    other.mkdir()
+    shutil.copy(ROOT / "scripts" / "stop-local.sh", checkout / "scripts" / "stop-local.sh")
+    for folder in (checkout, other):
+        (folder / "multi_app.py").write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+    mine = subprocess.Popen([sys.executable, "multi_app.py"], cwd=checkout)
+    theirs = subprocess.Popen([sys.executable, "multi_app.py"], cwd=other)
+    try:
+        time.sleep(0.5)
+        out = subprocess.run(
+            ["sh", str(checkout / "scripts" / "stop-local.sh"), "run"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+        assert "stopped multi_app" in out
+        assert mine.wait(timeout=10) is not None
+        assert theirs.poll() is None  # the other clone's process is untouched
+        again = subprocess.run(
+            ["sh", str(checkout / "scripts" / "stop-local.sh"), "run"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+        assert "multi_app was not running" in again
+    finally:
+        for proc in (mine, theirs):
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()

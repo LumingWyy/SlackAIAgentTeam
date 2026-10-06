@@ -17,6 +17,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import sys
 import threading
@@ -9784,9 +9785,26 @@ def restore_agent_state_from_store(
     return restored
 
 
+def install_shutdown_signals(loop: Any, task: asyncio.Task) -> None:
+    """Treat SIGTERM like Ctrl+C: cancel the main task instead of dying.
+
+    Python's default SIGTERM ends the process at once, so codex / Claude
+    child processes of a running turn were left behind, still working. A
+    cancelled main task unwinds asyncio.run, which cancels every activation;
+    their cleanup kills and reaps those children before the process exits.
+    """
+    try:
+        loop.add_signal_handler(signal.SIGTERM, task.cancel)
+    except (NotImplementedError, RuntimeError):  # e.g. not the main thread
+        logger.debug("SIGTERM handler not installed", exc_info=True)
+
+
 async def main() -> None:
     load_dotenv()
     logging.basicConfig(level=logging.INFO)
+    current = asyncio.current_task()
+    if current is not None:
+        install_shutdown_signals(asyncio.get_running_loop(), current)
 
     config_path = os.environ.get("AGENTS_CONFIG", "agents.yaml")
     if ensure_agents_config(config_path):
@@ -10018,17 +10036,47 @@ async def main() -> None:
         if a.cfg.patrol_interval > 0 and a.patrol_channel
         and a.patrol_access()[0]
     ]
-    await asyncio.gather(
-        *[h.start_async() for h in handlers],
-        *[a.patrol_loop() for a in patrol_agents],
-        *[a.slack_identity_loop() for a in agents],
-        watch_live_coverage(
-            handlers,
-            transcript_store,
-            threshold_seconds=socket_gap_threshold,
-        ),
-    )
+    try:
+        await asyncio.gather(
+            *[h.start_async() for h in handlers],
+            *[a.patrol_loop() for a in patrol_agents],
+            *[a.slack_identity_loop() for a in agents],
+            watch_live_coverage(
+                handlers,
+                transcript_store,
+                threshold_seconds=socket_gap_threshold,
+            ),
+        )
+    finally:
+        await close_slack_connections(handlers, agents)
+
+
+async def close_slack_connections(handlers: list[Any], agents: list[Any]) -> None:
+    """Close Socket Mode connections, then each agent's HTTP session.
+
+    Best effort with a short bound: shutdown must finish even if Slack does
+    not answer. Running turns are cancelled afterwards by asyncio.run.
+    """
+    for handler in handlers:
+        try:
+            await asyncio.wait_for(handler.close_async(), timeout=5)
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            logger.debug("socket mode close failed", exc_info=True)
+    for agent in agents:
+        try:
+            await asyncio.wait_for(agent.close_client(), timeout=5)
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            logger.debug("agent %s client close failed", agent.name, exc_info=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # make stop (SIGTERM) or Ctrl+C: running turns were cancelled and
+        # their child processes reaped on the way out.
+        logger.info("multi_app stopped")

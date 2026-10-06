@@ -1065,3 +1065,73 @@ def test_slack_name_is_reread_periodically(tmp_path, monkeypatch):
 
     asyncio.run(scenario())
     assert len(calls) >= 3
+
+
+def test_sigterm_cancels_the_main_task_instead_of_killing_the_process():
+    """make stop sends SIGTERM; running turns must unwind and reap their children."""
+    import signal
+
+    import multi_app
+
+    registered = {}
+
+    class Loop:
+        def add_signal_handler(self, sig, callback):
+            registered[sig] = callback
+
+    async def scenario():
+        main = asyncio.create_task(asyncio.sleep(3600))
+        multi_app.install_shutdown_signals(Loop(), main)
+        registered[signal.SIGTERM]()  # what the loop calls on SIGTERM
+        try:
+            await main
+        except asyncio.CancelledError:
+            return "cancelled"
+        return "kept running"
+
+    assert asyncio.run(scenario()) == "cancelled"
+
+
+def test_shutdown_signals_tolerate_loops_without_signal_support():
+    import multi_app
+
+    class Loop:
+        def add_signal_handler(self, sig, callback):
+            raise NotImplementedError
+
+    async def scenario():
+        task = asyncio.create_task(asyncio.sleep(0))
+        multi_app.install_shutdown_signals(Loop(), task)  # must not raise
+        await task
+
+    asyncio.run(scenario())
+
+
+def test_shutdown_closes_every_connection_even_if_one_fails():
+    import multi_app
+
+    closed = []
+
+    class Handler:
+        def __init__(self, name, fail=False):
+            self.name, self.fail = name, fail
+
+        async def close_async(self):
+            closed.append(self.name)
+            if self.fail:
+                raise RuntimeError("socket already gone")
+
+    class Agent:
+        def __init__(self, name):
+            self.name = name
+
+        async def close_client(self):
+            closed.append(self.name)
+
+    asyncio.run(
+        multi_app.close_slack_connections(
+            [Handler("socket-a", fail=True), Handler("socket-b")],
+            [Agent("dev"), Agent("reviewer")],
+        )
+    )
+    assert closed == ["socket-a", "socket-b", "dev", "reviewer"]
