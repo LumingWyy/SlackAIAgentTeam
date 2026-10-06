@@ -292,6 +292,20 @@ def test_stop_and_resume_proxy_to_the_admin_api(monkeypatch):
     assert ("POST", "/api/live/{name}/resume") in routes
 
 
+def test_channel_rules_fill_the_repo_the_agents_actually_use(monkeypatch):
+    def rules(raw):
+        monkeypatch.setattr(webui, "read_yaml", lambda: raw)
+        return json.loads(asyncio.run(webui.h_channel_rules(_IssuesRequest())).text)
+
+    stale_default = {"github": {"repo": "acme/stale"}}
+    one = rules({**stale_default, "agents": [
+        {"name": "a", "github_repo": "acme/live"}, {"name": "b", "github_repo": "acme/live"}]})
+    assert one["repo"] == "acme/live" and "repo: acme/live" in one["template"]
+    two = rules({**stale_default, "agents": [
+        {"name": "a", "github_repo": "acme/live"}, {"name": "b", "github_repo": "acme/other"}]})
+    assert two["repo"] == "" and "{{OWNER/REPO}}" in two["template"]
+
+
 def test_gh_issues_timeout_kills_and_reaps_process(monkeypatch):
     class Process:
         returncode = None

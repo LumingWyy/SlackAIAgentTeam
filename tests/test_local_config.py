@@ -75,3 +75,30 @@ def test_every_generated_agents_yaml_is_gitignored():
     lines = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert "agents.yaml" in lines
     assert "/agents.yaml" not in lines
+
+
+def test_template_personas_route_by_role_not_by_agent_name():
+    """Teams rename agents (alice_dev, ...); a persona naming @dev would break."""
+    import re
+
+    raw = yaml.safe_load(AGENTS_EXAMPLE.read_text(encoding="utf-8"))
+    for agent in raw["agents"]:
+        mentions = set(re.findall(r"@([a-z_]+)", agent.get("persona") or ""))
+        assert mentions <= {"agent"}, (agent["name"], mentions)  # "!status <@agent>" is a placeholder
+
+
+def test_channel_template_fits_slack_limits_once_filled():
+    import re
+
+    text = (ROOT / "channel-rules-template.md").read_text(encoding="utf-8")
+    topic, description = re.findall(r"```\n(.*?)\n```", text, re.S)[:2]
+    project = "x" * 30
+    repo = "some-organisation/some-long-repository-name"
+    assert len(topic.replace("{{PROJECT}}", project)) <= 250
+    assert len(description.replace("{{OWNER/REPO}}", repo)) <= 250
+
+
+def test_repo_agents_template_tells_how_claude_reads_it():
+    text = (ROOT / "templates" / "repo-AGENTS.md").read_text(encoding="utf-8")
+    assert "CLAUDE.md" in text and "`@AGENTS.md`" in text
+    assert "--assignee @me" in text

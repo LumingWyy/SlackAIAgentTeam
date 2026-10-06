@@ -1568,12 +1568,21 @@ CHANNEL_RULES_TEMPLATE = BASE_DIR / "channel-rules-template.md"
 
 
 async def h_channel_rules(request: web.Request) -> web.Response:
-    """Shared channel-rules template (for Slack topic/purpose); fill {{repo}} from config."""
+    """Shared channel-rules template (Slack topic/purpose); fills in the repo.
+
+    The repo is the one the agents actually use (per-agent github_repo, else
+    the shared default), filled in only when that is a single repo.
+    """
     try:
         text = CHANNEL_RULES_TEMPLATE.read_text(encoding="utf-8")
     except OSError:
         return web.json_response({"template": "", "error": "template not found"})
-    repo = (read_yaml().get("github") or {}).get("repo") or ""
+    raw = read_yaml()
+    try:
+        repos = _configured_github_repos(raw, _visible_entries(request, raw))
+    except ValueError:
+        repos = []
+    repo = repos[0] if len(repos) == 1 else ""
     if repo:
         text = text.replace("{{OWNER/REPO}}", repo)
     return web.json_response({"template": text, "repo": repo, "error": ""})
@@ -3860,7 +3869,7 @@ const GUIDE_PROMPTS={
       '不要写代码，也不要声称访问过本地仓库；需要事实时要求提供 Issue、PR 或文件摘录。'
     ].join(GUIDE_NL),
     task:[
-      '@alice/developer 处理 TASK-123',
+      '@alice_dev 处理 TASK-123',
       '',
       '目标：<最终要得到什么>',
       '背景：<相关 Issue / PR / 现状>',
@@ -3869,9 +3878,9 @@ const GUIDE_PROMPTS={
       '1. <可验证结果一>',
       '2. <测试与失败路径>',
       '交付物：PR URL + 测试命令与结果',
-      '完成后：只 handoff 给 bob/reviewer'
+      '完成后：只 handoff 给 bob_rev'
     ].join(GUIDE_NL),
-    handoff:'HANDOFF {"target_agent_id":"bob/reviewer","task_id":"TASK-123","goal":"独立审查 PR","done_criteria":["测试通过","无 Critical/Important","给出文件行号证据"],"artifact":"https://github.com/ORG/REPO/pull/123"}'
+    handoff:'HANDOFF {"target_agent_id":"bob_rev","task_id":"TASK-123","goal":"独立审查 PR","done_criteria":["测试通过","无 Critical/Important","给出文件行号证据"],"artifact":"https://github.com/ORG/REPO/pull/123"}'
   },
   ja:{
     channel:[
@@ -3906,7 +3915,7 @@ const GUIDE_PROMPTS={
       'コードを書かず、ローカル repo を見たと主張しません。必要なら Issue、PR、抜粋を要求します。'
     ].join(GUIDE_NL),
     task:[
-      '@alice/developer TASK-123 を対応してください',
+      '@alice_dev TASK-123 を対応してください',
       '',
       '目的：<最終的に得たいもの>',
       '背景：<Issue / PR / 現状>',
@@ -3915,9 +3924,9 @@ const GUIDE_PROMPTS={
       '1. <検証可能な結果>',
       '2. <テストと失敗経路>',
       '成果物：PR URL + テストコマンドと結果',
-      '完了後：bob/reviewer 1人だけへ handoff'
+      '完了後：bob_rev 1人だけへ handoff'
     ].join(GUIDE_NL),
-    handoff:'HANDOFF {"target_agent_id":"bob/reviewer","task_id":"TASK-123","goal":"PR を独立レビュー","done_criteria":["テスト合格","Critical/Important なし","ファイル行の証拠"],"artifact":"https://github.com/ORG/REPO/pull/123"}'
+    handoff:'HANDOFF {"target_agent_id":"bob_rev","task_id":"TASK-123","goal":"PR を独立レビュー","done_criteria":["テスト合格","Critical/Important なし","ファイル行の証拠"],"artifact":"https://github.com/ORG/REPO/pull/123"}'
   },
   en:{
     channel:[
@@ -3952,7 +3961,7 @@ const GUIDE_PROMPTS={
       'Do not write code or claim local repository access. Ask for an Issue, PR, or excerpt when facts are needed.'
     ].join(GUIDE_NL),
     task:[
-      '@alice/developer handle TASK-123',
+      '@alice_dev handle TASK-123',
       '',
       'Goal: <the final outcome>',
       'Context: <Issue / PR / current behavior>',
@@ -3961,9 +3970,9 @@ const GUIDE_PROMPTS={
       '1. <verifiable result>',
       '2. <tests and failure path>',
       'Deliverable: PR URL + test commands and results',
-      'When done: hand off only to bob/reviewer'
+      'When done: hand off only to bob_rev'
     ].join(GUIDE_NL),
-    handoff:'HANDOFF {"target_agent_id":"bob/reviewer","task_id":"TASK-123","goal":"Independently review the PR","done_criteria":["tests pass","no Critical/Important findings","file-line evidence included"],"artifact":"https://github.com/ORG/REPO/pull/123"}'
+    handoff:'HANDOFF {"target_agent_id":"bob_rev","task_id":"TASK-123","goal":"Independently review the PR","done_criteria":["tests pass","no Critical/Important findings","file-line evidence included"],"artifact":"https://github.com/ORG/REPO/pull/123"}'
   }
 };
 let LANG='zh';
