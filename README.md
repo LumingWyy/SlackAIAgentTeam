@@ -19,6 +19,8 @@ Multiple agents run Socket Mode in one Python process. In channels, an agent spe
 | `agent_guard.py`, `agent_guard_bin/` | `gh` / `git` guard on the agent PATH: agents open PRs, humans merge |
 | `agents.yaml` | This machine's agent definitions (`card` / persona, ownership, node, projects, workspaces, repos). Local and gitignored like `.env`; created from `agents.example.yaml` on first run |
 | `agents.example.yaml` | Tracked template for `agents.yaml` (no personal workspaces or repos) |
+| `team_init.py` / `team.example.yaml` | Generate a multi-person team's roster and per-person configs from one file |
+| `templates/repo-AGENTS.md` | Starting point for the target repository's `AGENTS.md` (detailed agent rules) |
 | `agents.distributed.example.yaml` | Two humans × two local agents distributed example |
 | `slack-app-manifest-agent.yaml` | Slack App manifest template (one App per agent) |
 | `.env.example` | Env var template (multi-agent tokens) |
@@ -415,6 +417,8 @@ Example: `!status <@U_DEV>`. Mainly for humans and `dx`.
 
 On activation, agents load channel **topic** and **purpose** (5 min cache) as channel ops rules at the top of the prompt. Put rules in the channel topic/description.
 
+Slack caps each at 250 characters, so keep only the Slack conventions there and put the detailed rules in the target repository's `AGENTS.md` (Codex reads it; a `CLAUDE.md` containing `@AGENTS.md` makes Claude read it too). [`channel-rules-template.md`](channel-rules-template.md) has a topic, a description and a pinned-message template; [`templates/repo-AGENTS.md`](templates/repo-AGENTS.md) is the starting point for `AGENTS.md`.
+
 ## Collaboration friction controls
 
 | Control | Behavior |
@@ -448,6 +452,26 @@ reset, run commands, authorize handoffs, or supply instructions to an agent.
 7. **Remote agent classified as unknown bot** — every host needs that logical entry's `slack_user_id` and `slack_bot_id`.
 
 ## Multi-host deploy
+
+### Team setup in one file (`team_init.py`)
+
+For a team where every person runs a developer and a reviewer on their own machine, describe the team once and generate everything:
+
+```bash
+cp team.example.yaml team.yaml        # people, Slack user ids, machines, repo, channel
+python team_init.py build team.yaml   # -> team/team-roster.yaml, team/<key>/{agents.yaml,env.example}
+```
+
+Each person then copies `team/<key>/agents.yaml` and `team/<key>/team-roster.yaml` into their SlackAgentTeam folder, merges `env.example` into `.env`, and creates their two Slack Apps (`<key>_dev`, `<key>_rev`). Slack ids exist only after the apps are installed:
+
+```bash
+python team_init.py ids team.yaml --person <key> --write   # reads them via auth.test with that person's bot tokens
+python team_init.py build team.yaml                          # regenerate; share the new team-roster.yaml
+```
+
+The generated config uses per-thread worktrees, a shared project for the channel, owner-mode control auth, and cards that send each developer's reviews to the same person's reviewer (a human can name another person's reviewer). `team.yaml`, `team-roster.yaml` and `team/` are gitignored: they hold the team's Slack ids and local paths. No token is written to any generated file.
+
+### Manual layout
 
 Use the decentralized Slack-bus layout in [`roster.yaml`](roster.yaml),
 [`agents.alice.yaml`](agents.alice.yaml), and

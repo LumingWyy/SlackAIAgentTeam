@@ -19,6 +19,10 @@ multi_app.pid
 # this machine's agents (workspaces, repos); agents.example.yaml is the template
 agents.yaml
 agents.yaml.bak
+# team_init.py input and output: the team's Slack ids and local paths
+team.yaml
+team-roster.yaml
+/team/
 state.db*
 .slack-files/
 PLAN.md

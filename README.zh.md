@@ -19,6 +19,8 @@
 | `agent_guard.py`, `agent_guard_bin/` | agent PATH 上的 `gh` / `git` 守卫：agent 只开 PR，合并由人来做 |
 | `agents.yaml` | 本机的 agent 定义（`card` / persona、所有者、节点、项目、workspace、仓库）。与 `.env` 一样只在本地、已 gitignore；首次启动时由 `agents.example.yaml` 自动生成 |
 | `agents.example.yaml` | `agents.yaml` 的模板（受版本管理，不含个人 workspace 和仓库） |
+| `team_init.py` / `team.example.yaml` | 用一个文件生成多人团队的 roster 和每人的配置 |
+| `templates/repo-AGENTS.md` | 目标仓库 `AGENTS.md`（详细 agent 规则）的起点模板 |
 | `agents.distributed.example.yaml` | 两人 × 每人两个本地 agent 的分布式示例 |
 | `slack-app-manifest-agent.yaml` | 每个 agent 一份的 Slack App manifest 模板 |
 | `.env.example` | 环境变量模板（多 agent token） |
@@ -400,6 +402,8 @@ DM 中人类可无 `@` 对话（peer 不会在 DM 中交接）。
 
 启动时 agent 会读取频道 **topic** 与 **purpose**（5 分钟缓存），作为运维规则放在 prompt 顶部。请把规则写在频道 topic/描述里。
 
+Slack 里两者各限 250 字，所以只放 Slack 上的约定；详细规则写进目标仓库的 `AGENTS.md`（codex 直接读；再放一个内容为 `@AGENTS.md` 的 `CLAUDE.md`，Claude 也会读）。[`channel-rules-template.md`](channel-rules-template.md) 里有 topic、说明和置顶消息的模板；`AGENTS.md` 可以从 [`templates/repo-AGENTS.md`](templates/repo-AGENTS.md) 开始改。
+
 ## 协作摩擦控制
 
 | 控制 | 行为 |
@@ -431,6 +435,26 @@ DM 中人类可无 `@` 对话（peer 不会在 DM 中交接）。
 7. **远端 agent 被识别为 unknown bot**——每台主机都必须配置其 `slack_user_id` 与 `slack_bot_id`。
 
 ## 多机部署
+
+### 用一个文件生成整队配置（`team_init.py`）
+
+每人在自己机器上跑一个 developer 和一个 reviewer 时，只需描述一次团队，其余全部生成：
+
+```bash
+cp team.example.yaml team.yaml        # 成员、Slack 用户 ID、机器名、仓库、频道
+python team_init.py build team.yaml   # -> team/team-roster.yaml、team/<key>/{agents.yaml,env.example}
+```
+
+之后每人把 `team/<key>/agents.yaml` 和 `team/<key>/team-roster.yaml` 复制到自己的 SlackAgentTeam 目录，把 `env.example` 合并进 `.env`，并创建自己的两个 Slack App（`<key>_dev`、`<key>_rev`）。Slack ID 要等 App 安装后才有：
+
+```bash
+python team_init.py ids team.yaml --person <key> --write   # 用本人的 bot token 调 auth.test 读出 ID
+python team_init.py build team.yaml                          # 重新生成，把新的 team-roster.yaml 发给大家
+```
+
+生成的配置默认：每个线程独立 worktree、频道绑定为一个共享项目、owner 模式的控制认证，card 写明 developer 默认交给同一个人的 reviewer（人可以点名别人的 reviewer）。`team.yaml`、`team-roster.yaml` 和 `team/` 已 gitignore（含团队的 Slack ID 与本机路径），生成的文件里不会写入任何 token。
+
+### 手动配置
 
 采用 [`roster.yaml`](roster.yaml)、[`agents.alice.yaml`](agents.alice.yaml)
 与 [`agents.bob.yaml`](agents.bob.yaml) 的“Slack 协调、本地执行”方式。

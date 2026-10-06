@@ -19,6 +19,8 @@
 | `agent_guard.py`, `agent_guard_bin/` | agent の PATH 上の `gh` / `git` ガード：agent は PR を作り、マージは人間 |
 | `agents.yaml` | このマシンの agent 定義（`card` / persona、所有者、node、project、workspace、リポジトリ）。`.env` と同じくローカル専用で gitignore 済み。初回起動時に `agents.example.yaml` から自動生成 |
 | `agents.example.yaml` | `agents.yaml` のテンプレート（バージョン管理対象。個人の workspace やリポジトリは含まない） |
+| `team_init.py` / `team.example.yaml` | 1 ファイルから複数人チームの roster と各自の設定を生成 |
+| `templates/repo-AGENTS.md` | 対象リポジトリの `AGENTS.md`（詳しい agent ルール）の出発点 |
 | `agents.distributed.example.yaml` | 2 人 × 各 2 ローカル agent の分散構成例 |
 | `slack-app-manifest-agent.yaml` | agent ごとの Slack App 用 manifest テンプレート |
 | `.env.example` | 環境変数サンプル（マルチ token） |
@@ -352,6 +354,8 @@ DM では人間は `@` なしで会話可能（peer の DM 引き継ぎはしな
 
 起動時にチャンネルの topic / purpose を読み（5 分キャッシュ）、運用ルールとして prompt 先頭に注入。
 
+Slack ではどちらも 250 文字までなので、Slack 上の約束事だけを書き、詳しいルールは対象リポジトリの `AGENTS.md` に置きます（codex はそのまま読み、`@AGENTS.md` だけを書いた `CLAUDE.md` を置けば Claude も読みます）。topic・説明・ピン留めのテンプレートは [`channel-rules-template.md`](channel-rules-template.md)、`AGENTS.md` の出発点は [`templates/repo-AGENTS.md`](templates/repo-AGENTS.md)。
+
 ## 協調の摩擦対策
 
 1 メッセージ 1 依頼、既出情報の繰り返し禁止、相槌のみ禁止、ターン予算（既定 12）、`dx` による交通整理。
@@ -371,6 +375,26 @@ DM では人間は `@` なしで会話可能（peer の DM 引き継ぎはしな
 7. remote agent が unknown bot になる → 各機に `slack_user_id` / `slack_bot_id` を配布
 
 ## 多機デプロイ
+
+### 1 ファイルでチーム構成を生成（`team_init.py`）
+
+各自が自分のマシンで developer と reviewer を 1 体ずつ動かすチームなら、チームを一度書けば残りは生成できます:
+
+```bash
+cp team.example.yaml team.yaml        # メンバー、Slack ユーザー ID、マシン名、repo、チャンネル
+python team_init.py build team.yaml   # -> team/team-roster.yaml、team/<key>/{agents.yaml,env.example}
+```
+
+各自は `team/<key>/agents.yaml` と `team/<key>/team-roster.yaml` を自分の SlackAgentTeam フォルダにコピーし、`env.example` を `.env` にマージして、自分の Slack App 2 つ（`<key>_dev`、`<key>_rev`）を作成します。Slack の ID は App のインストール後に決まります:
+
+```bash
+python team_init.py ids team.yaml --person <key> --write   # 本人の bot token で auth.test を呼んで ID を取得
+python team_init.py build team.yaml                          # 再生成し、新しい team-roster.yaml を共有
+```
+
+生成される設定は、スレッドごとの worktree、チャンネルを 1 つの共有プロジェクトに紐付け、owner モードのコントロール認証、developer のレビューを既定で同じ人の reviewer に回す card（人が他の人の reviewer を指名可）です。`team.yaml`・`team-roster.yaml`・`team/` は gitignore 済み（チームの Slack ID とローカルパスを含むため）。生成ファイルに token は書き込みません。
+
+### 手動構成
 
 [`roster.yaml`](roster.yaml)、[`agents.alice.yaml`](agents.alice.yaml)、
 [`agents.bob.yaml`](agents.bob.yaml) の「Slack で調整・各機で実行」構成を
