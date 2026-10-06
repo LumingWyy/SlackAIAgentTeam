@@ -346,6 +346,15 @@ def env_example(team: dict[str, Any], person: dict[str, Any]) -> str:
     for agent in hosted(team, person):
         bot, app = default_slack_token_env_names(agent["name"])
         lines += [f"# {agent['name']}", f"{bot}=", f"{app}="]
+    openai_agents = [a["name"] for a in hosted(team, person) if a["runtime"] == "openai"]
+    if openai_agents:
+        # Generated agents use the default openai_api_key_env and no base URL,
+        # so multi_app requires this key for them.
+        lines += [
+            "",
+            f"# OpenAI API key for {', '.join(openai_agents)} (runtime: openai)",
+            "OPENAI_API_KEY=",
+        ]
     lines += [
         "",
         "# Console / admin API bearer: 32+ random printable characters, e.g.",
@@ -432,6 +441,11 @@ def read_ids(
         result = call(token, "auth.test")
         if not result.get("ok"):
             raise TeamError(f"{name}: Slack auth.test failed: {result.get('error')}")
+        if not result.get("user_id") or not result.get("bot_id"):
+            # A user token passes auth.test too, but has no bot_id.
+            raise TeamError(
+                f"{bot_env} does not hold a bot token (xoxb-…): auth.test returned no bot_id"
+            )
         found[name] = {
             "slack_user_id": str(result.get("user_id") or ""),
             "slack_bot_id": str(result.get("bot_id") or ""),

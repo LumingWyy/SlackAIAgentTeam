@@ -272,3 +272,24 @@ def test_developer_card_says_to_claim_before_working(tmp_path):
     roster = team_init.build_roster(team)
     card = next(a["card"] for a in roster["agents"] if a["name"] == "alice_dev")
     assert "claiming each with the claim tool first" in card
+
+
+def test_env_example_lists_the_openai_key_for_openai_roles(tmp_path):
+    team = _team(tmp_path)
+    alice = team["people"][0]
+    assert "OPENAI_API_KEY=" not in team_init.env_example(team, alice)
+    alice["runtime"] = {"rev": "openai"}
+    text = team_init.env_example(team, alice)
+    assert "OPENAI_API_KEY=\n" in text and "alice_rev" in text
+
+
+def test_ids_refuses_a_user_token_in_the_bot_variable(tmp_path):
+    team = _team(tmp_path, with_ids=False)
+    env = {f"ALICE_{r}_SLACK_BOT_TOKEN": "xoxp-user" for r in ("DEV", "REV", "QA")}
+    env["PM_SLACK_BOT_TOKEN"] = "xoxb-pm"
+
+    def user_token_auth(token, method):
+        return {"ok": True, "user_id": "U0HUMAN1"}  # no bot_id: a user token
+
+    with pytest.raises(TeamError, match="does not hold a bot token"):
+        team_init.read_ids(team, "alice", env, call=user_token_auth)

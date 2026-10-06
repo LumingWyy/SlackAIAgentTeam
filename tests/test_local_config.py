@@ -126,3 +126,48 @@ def test_template_qa_checks_the_pr_commit_and_writes_back():
     assert "gh pr comment" in qa and "QA: PASS" in qa and "QA: FAIL" in qa
     assert "Never merge" in qa
     assert "hand the PR to the QA agent" in personas["reviewer"]
+
+
+def test_concurrent_first_starts_never_see_a_partial_agents_yaml(tmp_path, monkeypatch):
+    """multi_app and the console may both create it at once on the first run."""
+    import os
+
+    import local_config
+
+    example = tmp_path / "agents.example.yaml"
+    example.write_text("agents: []\n" * 500, encoding="utf-8")
+    target = tmp_path / "agents.yaml"
+    seen = []
+    real_link = os.link
+
+    def racing_link(src, dst):
+        # Just before publishing, the target does not exist yet: nobody can
+        # have opened a partial file, because nothing is at the path.
+        seen.append(target.exists())
+        real_link(src, dst)
+
+    monkeypatch.setattr(local_config.os, "link", racing_link)
+    assert ensure_agents_config(target, example=example) is True
+    assert seen == [False]
+    assert target.read_text(encoding="utf-8") == example.read_text(encoding="utf-8")
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".agents.yaml.")] == []
+    # The second starter loses the race cleanly and leaves the file alone.
+    assert ensure_agents_config(target, example=example) is False
+    assert target.read_text(encoding="utf-8") == example.read_text(encoding="utf-8")
+
+
+def test_a_failed_copy_leaves_no_empty_agents_yaml(tmp_path, monkeypatch):
+    import local_config
+
+    example = tmp_path / "agents.example.yaml"
+    example.write_text("agents: []\n", encoding="utf-8")
+    target = tmp_path / "agents.yaml"
+
+    def broken_copy(_src, _dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(local_config.shutil, "copyfileobj", broken_copy)
+    with pytest.raises(OSError):
+        ensure_agents_config(target, example=example)
+    assert not target.exists()  # the next start retries instead of loading an empty file
+    assert list(tmp_path.iterdir()) == [example]

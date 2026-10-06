@@ -1458,30 +1458,30 @@ class StateStore:
 
     def set_agent_paused(
         self, agent: str, paused: bool, *, now: float | None = None
-    ) -> None:
+    ) -> bool:
+        """Whether the change was written (False when the DB is off or failed)."""
         if paused:
-            self._exec(
+            return self._exec(
                 "INSERT OR REPLACE INTO agent_pause (agent, paused_at) "
                 "VALUES (?, ?)",
                 (agent, time.time() if now is None else now),
-            )
-        else:
-            self._exec("DELETE FROM agent_pause WHERE agent = ?", (agent,))
+            ) >= 0
+        return self._exec("DELETE FROM agent_pause WHERE agent = ?", (agent,)) >= 0
 
     def mark_thread_stopped(
         self, agent: str, thread_key: str, *, now: float | None = None
-    ) -> None:
-        self._exec(
+    ) -> bool:
+        return self._exec(
             "INSERT OR REPLACE INTO stopped_threads (agent, thread_key, stopped_at) "
             "VALUES (?, ?, ?)",
             (agent, thread_key, time.time() if now is None else now),
-        )
+        ) >= 0
 
-    def clear_thread_stopped(self, agent: str, thread_key: str) -> None:
-        self._exec(
+    def clear_thread_stopped(self, agent: str, thread_key: str) -> bool:
+        return self._exec(
             "DELETE FROM stopped_threads WHERE agent = ? AND thread_key = ?",
             (agent, thread_key),
-        )
+        ) >= 0
 
     def stopped_threads(self, agent: str) -> set[str]:
         if self._conn is None:

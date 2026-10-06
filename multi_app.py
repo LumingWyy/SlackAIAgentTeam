@@ -7780,17 +7780,31 @@ class SlackAgent:
             {"reply_language": self.cfg.reply_language}
         )
 
-    def set_paused(self, paused: bool) -> None:
+    def set_paused(self, paused: bool) -> bool:
+        """Apply now; return whether it was also saved for the next start.
+
+        A failed write (say, a full disk) still stops or resumes the agent in
+        this process, but after a restart it would come back in its old state,
+        so the caller is told.
+        """
         self.paused = paused
         if not paused:
             self._paused_notified.clear()
-        if self._store is not None:
-            self._store.set_agent_paused(self.name, paused)
+        persisted = self._store is not None and self._store.set_agent_paused(
+            self.name, paused
+        )
+        if self._store is not None and not persisted:
+            logger.warning(
+                "agent %s %s state could not be saved; a restart would undo it",
+                self.name,
+                "stopped" if paused else "resumed",
+            )
         logger.info(
             "agent %s %s by the operator",
             self.name,
             "stopped" if paused else "resumed",
         )
+        return persisted
 
     async def stop(self) -> dict[str, int]:
         """Operator stop: refuse new work, then cancel what is running.
@@ -7799,7 +7813,7 @@ class SlackAgent:
         than started. Interrupted threads are told why; a patrol round hands
         its issue back. Stays stopped, across restarts, until ``resume``.
         """
-        self.set_paused(True)
+        persisted = self.set_paused(True)
         running = [task for task in self._tasks if not task.done()]
         triggers = [self._task_triggers.get(task) for task in running]
         patrol = self._patrol_round
@@ -7843,10 +7857,11 @@ class SlackAgent:
         return {
             "cancelled": len(running),
             "patrol_cancelled": int(len(cancelled) > len(running)),
+            "persisted": persisted,
         }
 
-    def resume(self) -> None:
-        self.set_paused(False)
+    def resume(self) -> bool:
+        return self.set_paused(False)
 
     def begin_shutdown(self) -> None:
         """Take no new work: the process is stopping."""
@@ -7859,15 +7874,29 @@ class SlackAgent:
 
     def _mark_thread_stopped(self, thread_key: str) -> None:
         self._stopped_threads.add(thread_key)
-        if self._store is not None:
-            self._store.mark_thread_stopped(self.name, thread_key)
+        if self._store is not None and not self._store.mark_thread_stopped(
+            self.name, thread_key
+        ):
+            logger.warning(
+                "agent %s could not save the stop note for %s; "
+                "a restart would drop it",
+                self.name,
+                thread_key,
+            )
 
     def _clear_thread_stopped(self, thread_key: str) -> None:
         if thread_key not in self._stopped_threads:
             return
         self._stopped_threads.discard(thread_key)
-        if self._store is not None:
-            self._store.clear_thread_stopped(self.name, thread_key)
+        if self._store is not None and not self._store.clear_thread_stopped(
+            self.name, thread_key
+        ):
+            logger.warning(
+                "agent %s could not clear the saved stop note for %s; "
+                "a restart would bring it back",
+                self.name,
+                thread_key,
+            )
 
     def _keep_stopped_session(
         self, thread_key: str, gen: tuple[int, int], session_id: str
@@ -9356,8 +9385,10 @@ def build_admin_app(
 
     async def h_resume(request: aio_web.Request) -> aio_web.Response:
         agent = request_agent(request)
-        agent.resume()
-        return aio_web.json_response({"ok": True, "stopped": False})
+        persisted = agent.resume()
+        return aio_web.json_response(
+            {"ok": True, "stopped": False, "persisted": persisted}
+        )
 
     async def h_set_reply_language(request: aio_web.Request) -> aio_web.Response:
         agent = request_agent(request)

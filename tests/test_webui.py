@@ -223,7 +223,8 @@ def test_monitor_card_can_stop_and_resume_an_agent():
     assert "if(a.kind==='stop')return t('stop.confirm'" in script  # inline confirm first
     assert "else if(a.kind==='stop')await stopAgent(a.agent);" in script
     assert "'/stop'" in script and "'/resume'" in script
-    for key in ("btn.stop", "btn.resume", "st.paused", "stop.confirm", "toast.stop", "toast.resume"):
+    assert script.count("r.persisted===false") == 4  # stop and resume both warn when not saved
+    for key in ("btn.stop", "btn.resume", "st.paused", "stop.confirm", "toast.stop", "toast.resume", "toast.notsaved"):
         assert script.count(f"'{key}':") == 3, key
 
 
@@ -1695,6 +1696,56 @@ agents:
     }
 
 
+def test_machine_level_endpoints_need_control_of_the_whole_node(tmp_path, monkeypatch):
+    """With two local owners, neither alone may browse the disk or use the node's gh."""
+    target = tmp_path / "agents.yaml"
+    env_file = tmp_path / ".env"
+    tokens = {"U01ALICE": "alice-" + "a" * 40, "U02BOB": "bob-" + "b" * 40, "U01ADMIN": "admin-" + "z" * 40}
+    target.write_text(
+        "access:\n  admins: [U01ADMIN]\nagents:\n"
+        "  - name: alice\n    owner: U01ALICE\n    persona: a\n"
+        "  - name: bob\n    owner: U02BOB\n    persona: b\n",
+        encoding="utf-8",
+    )
+    env_file.write_text(
+        "".join(f"SLACK_AGENT_CONTROL_TOKEN_{user}={token}\n" for user, token in tokens.items()),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(webui, "AGENTS_YAML", target)
+    monkeypatch.setattr(webui, "ENV_FILE", env_file)
+
+    async def fake_gh_status():
+        return {"installed": True, "logged_in": True, "login": "someone"}
+
+    monkeypatch.setattr(webui, "_gh_status", fake_gh_status)
+    requests = (
+        ("get", "/api/fs/dirs?path=~"),
+        ("post", "/api/fs/pick-dir"),
+        ("get", "/api/github/status"),
+        ("get", "/api/github/repos"),
+        ("post", "/api/github/repos"),
+    )
+
+    async def scenario():
+        from aiohttp.test_utils import TestClient, TestServer
+
+        statuses = {}
+        async with TestClient(TestServer(webui.make_app())) as client:
+            for who in ("U01ALICE", "U01ADMIN"):
+                for method, path in requests:
+                    response = await getattr(client, method)(
+                        path, headers={"Authorization": f"Bearer {tokens[who]}"}, json={}
+                    )
+                    statuses[(who, path, method)] = response.status
+        return statuses
+
+    statuses = asyncio.run(scenario())
+    for method, path in requests:
+        assert statuses[("U01ALICE", path, method)] == 403, path
+    assert statuses[("U01ADMIN", "/api/github/status", "get")] == 200
+    assert statuses[("U01ADMIN", "/api/fs/dirs?path=~", "get")] != 403
+
+
 def test_webui_resolves_local_owner_from_separate_roster(
     tmp_path, monkeypatch
 ):
@@ -2380,3 +2431,31 @@ def test_repo_field_offers_picker_and_create():
     for key in ("ws.search", "ws.inherit", "ws.private", "ws.norepos", "ws.ghfail",
                 "ws.create", "ws.createq", "ws.createbtn", "ws.created", "ws.loading"):
         assert script.count(f"'{key}':") >= 3, key
+
+
+def test_concurrent_cache_misses_share_one_gh_fetch(monkeypatch):
+    """Two pages (or auto refresh + refresh now) missing together run gh once."""
+    monkeypatch.setattr(webui, "read_yaml", lambda: {"agents": [{"name": "a", "github_repo": "acme/live"}]})
+    monkeypatch.setattr(webui, "read_env_file", lambda: {})
+    monkeypatch.setattr(webui.shutil, "which", lambda _name: "/bin/gh")
+    webui._issues_cache.clear()
+    calls = []
+
+    async def slow_issues(repo):
+        calls.append(repo)
+        await asyncio.sleep(0.05)
+        return [{"number": 1, "title": "t", "url": ""}], ""
+
+    monkeypatch.setattr(webui, "_gh_issues", slow_issues)
+
+    async def scenario():
+        first, second = await asyncio.gather(
+            webui.h_issues(_IssuesRequest()),
+            webui.h_issues(_IssuesRequest({"refresh": "1"})),
+        )
+        return json.loads(first.text), json.loads(second.text)
+
+    first, second = asyncio.run(scenario())
+    assert calls == ["acme/live"]
+    assert first["issues"] == second["issues"] and first["issues"][0]["repo"] == "acme/live"
+    assert webui._issues_inflight == {}  # nothing left behind

@@ -735,7 +735,8 @@ def test_stop_cancels_running_work_and_tells_each_thread(tmp_path, monkeypatch):
         return result, events
 
     result, _events = asyncio.run(scenario())
-    assert result == {"cancelled": 2, "patrol_cancelled": 0}
+    # no state.db in this test: the stop holds until a restart, and says so
+    assert result == {"cancelled": 2, "patrol_cancelled": 0, "persisted": False}
     assert agent.paused is True
     assert rec.posts == []  # nothing half-finished was posted
     assert len(notices) == 1 and notices[0]["thread_ts"] == "100.0"
@@ -1218,4 +1219,26 @@ def test_shut_down_takes_no_new_work_and_reaps_turns_before_closing_slack(
         "dev", team_id="T_TEST", max_age_seconds=3600, limit=10
     )
     assert [row["trigger_ts"] for row in rows] == ["200.0"]
+    agent._store.close()
+
+
+def test_a_stop_that_cannot_be_saved_says_so(tmp_path, monkeypatch, caplog):
+    """A full disk must not let a stop look durable: a restart would undo it."""
+    from state_store import StateStore
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    agent._store = StateStore(str(tmp_path / "state.db"))
+    assert agent.set_paused(True) is True  # healthy store
+    monkeypatch.setattr(agent._store, "_exec", lambda *_a, **_k: -1)  # writes now fail
+    with caplog.at_level("WARNING", logger="multi_app"):
+        result = asyncio.run(agent.stop())
+        resumed = agent.resume()
+        agent._mark_thread_stopped("C1:100.0")
+        agent._clear_thread_stopped("C1:100.0")
+    assert result["persisted"] is False and resumed is False
+    assert agent.paused is False  # still applied in this process
+    assert "stopped state could not be saved" in caplog.text
+    assert "resumed state could not be saved" in caplog.text
+    assert "could not save the stop note" in caplog.text
+    assert "could not clear the saved stop note" in caplog.text
     agent._store.close()
