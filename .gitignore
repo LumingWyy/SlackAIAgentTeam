@@ -26,3 +26,6 @@ team-roster.yaml
 state.db*
 .slack-files/
 PLAN.md
+# extra root CAs for the image (see certs/README.md); never committed
+certs/*.crt
+certs/*.pem

@@ -273,6 +273,8 @@ CLAUDE_WORKSPACE=/path/to/project
 
 ### Docker（推奨）
 
+TLS を検査するネットワーク（Cloudflare Zero Trust / Gateway、社内プロキシ）では、ビルドも agent も "self-signed certificate in certificate chain" で失敗します。先に [`certs/README.md`](certs/README.md) のとおり、そのネットワークのルート CA を `certs/` に置いてください。
+
 ```bash
 cp .env.alice.example .env.alice   # Alice の機械では Alice の値だけ
 NODE=alice make up                 # Alice node だけを起動

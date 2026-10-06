@@ -307,6 +307,8 @@ CLAUDE_WORKSPACE=/path/to/project
 
 ### Docker（推荐）
 
+如果网络会检查 TLS（Cloudflare Zero Trust / Gateway、公司代理），构建和 agent 运行都会报 "self-signed certificate in certificate chain"：请先按 [`certs/README.md`](certs/README.md) 把该网络的根证书放进 `certs/`。
+
 ```bash
 cp .env.alice.example .env.alice   # 只在 Alice 的机器填写 Alice 的值
 NODE=alice make up                 # 只启动 Alice 节点

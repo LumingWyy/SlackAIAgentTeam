@@ -320,6 +320,8 @@ Override env names in `agents.yaml` with `bot_token_env` / `app_token_env`.
 
 ### Docker (recommended)
 
+Behind a network that inspects TLS (Cloudflare Zero Trust / Gateway, a corporate proxy), the build and the agents fail with "self-signed certificate in certificate chain": put that network's root CA in `certs/` first, as [`certs/README.md`](certs/README.md) shows.
+
 ```bash
 cp .env.alice.example .env.alice   # Alice's machine only; fill Alice values
 NODE=alice make up                 # builds and starts only Alice's node
