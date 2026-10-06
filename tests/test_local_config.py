@@ -1,5 +1,6 @@
 """agents.yaml is local; the tracked agents.example.yaml seeds it."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -52,8 +53,12 @@ def test_tracked_template_loads_and_carries_no_personal_repo(
     assert gcfg.github_repo is None
 
 
-_IN_REPO = (ROOT / "Dockerfile").exists() and (ROOT / ".gitignore").exists()
-_repo_only = pytest.mark.skipif(not _IN_REPO, reason="repository files are not in the image")
+# Skip only inside the image (it sets SLACK_AGENT_IMAGE); in a checkout a
+# missing Dockerfile or .gitignore must fail these tests, not skip them.
+_repo_only = pytest.mark.skipif(
+    os.environ.get("SLACK_AGENT_IMAGE") == "1",
+    reason="repository files are not in the image",
+)
 
 
 @_repo_only

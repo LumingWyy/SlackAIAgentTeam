@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -11,9 +12,10 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 
 # These check repository files (compose, Dockerfile, READMEs, env examples),
-# which the runtime image does not ship; `make test-docker` skips them.
+# which the runtime image does not ship. Skip only inside the image (it sets
+# SLACK_AGENT_IMAGE): in a checkout a missing file must fail, not skip.
 pytestmark = pytest.mark.skipif(
-    not (ROOT / "docker-compose.yml").exists(),
+    os.environ.get("SLACK_AGENT_IMAGE") == "1",
     reason="repository files are not in the image",
 )
 
@@ -100,3 +102,13 @@ def test_all_readmes_document_thread_worktree_safety_and_lifecycle():
         assert "git worktree" in text
         assert "unpushed" in text
         assert "branch" in text
+
+
+def test_only_public_ca_certificates_reach_the_image():
+    """certs/ may hold a network's root CA; nothing else there enters the build."""
+    ignore = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    assert "certs/*" in ignore and "!certs/*.crt" in ignore
+    assert ignore.index("certs/*") < ignore.index("!certs/*.crt")
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY certs/ /usr/local/share/ca-certificates/extra/" in dockerfile
+    assert "SLACK_AGENT_IMAGE=1" in dockerfile  # what the repo-file tests key their skip on

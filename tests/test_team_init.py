@@ -1,5 +1,6 @@
 """team_init.py builds a multi-person team's configs that multi_app accepts."""
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -205,7 +206,7 @@ def test_ids_write_stores_them_in_team_yaml(tmp_path, monkeypatch, capsys):
 
 
 @pytest.mark.skipif(
-    not (team_init.BASE_DIR / ".gitignore").exists(),
+    os.environ.get("SLACK_AGENT_IMAGE") == "1",  # in a checkout a missing file fails
     reason="repository files are not in the image",
 )
 def test_generated_files_are_gitignored():

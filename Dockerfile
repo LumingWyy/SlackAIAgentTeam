@@ -3,7 +3,8 @@ FROM python:3.13-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    SLACK_AGENT_IMAGE=1
 
 # Networks that inspect TLS (e.g. Cloudflare Zero Trust / Gateway) re-sign HTTPS
 # with their own root CA. Put that CA as PEM in certs/<name>.crt (gitignored,

@@ -7,7 +7,8 @@ NodeSource or npm, and at run time Claude, Slack and GitHub calls fail.
 
 Put that network's root CA here as a PEM file named `<anything>.crt`. The image
 adds it to the system trust store, which apt, curl, pip, Python and Node use.
-The `.crt` / `.pem` files are gitignored.
+Only `*.crt` files reach the Docker build (`.dockerignore`), and they are
+gitignored. Put public CA certificates here only, never a private key.
 
 On macOS, export a CA that the system already trusts, e.g. Cloudflare Gateway:
 
