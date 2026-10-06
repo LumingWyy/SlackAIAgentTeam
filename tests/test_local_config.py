@@ -92,13 +92,23 @@ def test_channel_template_fits_slack_limits_once_filled():
 
     text = (ROOT / "channel-rules-template.md").read_text(encoding="utf-8")
     topic, description = re.findall(r"```\n(.*?)\n```", text, re.S)[:2]
-    project = "x" * 30
     repo = "some-organisation/some-long-repository-name"
-    assert len(topic.replace("{{PROJECT}}", project)) <= 250
+    assert len(topic.replace("{{OWNER/REPO}}", repo)) <= 250
     assert len(description.replace("{{OWNER/REPO}}", repo)) <= 250
+    assert "QA" in topic and "QA" in description  # developer -> reviewer -> QA -> human
 
 
 def test_repo_agents_template_tells_how_claude_reads_it():
     text = (ROOT / "templates" / "repo-AGENTS.md").read_text(encoding="utf-8")
     assert "CLAUDE.md" in text and "`@AGENTS.md`" in text
     assert "--assignee @me" in text
+
+
+def test_template_qa_checks_the_pr_commit_and_writes_back():
+    raw = yaml.safe_load(AGENTS_EXAMPLE.read_text(encoding="utf-8"))
+    personas = {a["name"]: a["persona"] for a in raw["agents"]}
+    qa = personas["qa"]
+    assert "headRefOid" in qa and "git archive" in qa  # the PR's exact commit, clean copy
+    assert "gh pr comment" in qa and "QA: PASS" in qa and "QA: FAIL" in qa
+    assert "Never merge" in qa
+    assert "hand the PR to the QA agent" in personas["reviewer"]

@@ -6,7 +6,8 @@ apply, and add CLAUDE.md containing the single line `@AGENTS.md` so Claude
 reads the same file (Codex reads AGENTS.md directly). Changes take effect for
 an agent once they are on the branch its worktrees start from. -->
 
-Rules for the developer and reviewer agents working on this repository from Slack.
+Rules for the developer, reviewer and QA agents working on this repository from Slack.
+Flow: developer opens the PR -> reviewer reviews it -> on PASS the PR owner's QA checks behaviour -> a human merges.
 The channel topic and description are a short summary; this file is the source of truth.
 
 ## Context
@@ -17,7 +18,7 @@ The channel topic and description are a short summary; this file is the source o
 ## Scope
 
 - Implement only issues assigned to you (`gh issue list --assignee @me`). Do not change code for someone else's issue.
-- Review is the exception: review any PR you are asked to review, whoever owns it.
+- Review and QA are the exception: check any PR you are asked to, whoever owns it.
 - One Slack thread is one issue. Do not extend the work past that issue's done criteria; suggest follow-ups in the thread instead.
 - {{decisions the team has not made yet, e.g. "Do not add libraries that issues #2-#11 have not chosen yet; ask a human."}}
 
@@ -35,6 +36,14 @@ The channel topic and description are a short summary; this file is the source o
 - Focus on: {{what matters most here, e.g. compatibility, error handling, tests, done criteria}}.
 - Write findings on the PR (inline, one thread per finding) with `Verdict: PASS` or `Verdict: CHANGES REQUESTED`; post only the verdict and the PR link in Slack.
 - Do not fix the code yourself; send changes back to the PR's developer, whoever owns it.
+- On PASS hand the PR to the QA agent of the PR's owner.
+
+## QA
+
+- Check behaviour on the PR's exact head commit, in a clean copy (`git archive <sha>`), never by switching your branch.
+- Check each done criterion of the issue, plus: {{how to exercise this project, e.g. start the server and call the endpoints}}.
+- Post `QA: PASS` or `QA: FAIL` on the PR with the sha, commands and key output; post the verdict and PR link in Slack.
+- On FAIL send concrete repro steps to the PR's developer; on PASS ask a human to merge. Never merge.
 
 ## Stop and ask a human
 

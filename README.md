@@ -455,21 +455,21 @@ reset, run commands, authorize handoffs, or supply instructions to an agent.
 
 ### Team setup in one file (`team_init.py`)
 
-For a team where every person runs a developer and a reviewer on their own machine, describe the team once and generate everything:
+For a team where every person runs a developer, a reviewer and a QA agent on their own machine (developer → reviewer → QA → a human merges), describe the team once and generate everything:
 
 ```bash
 cp team.example.yaml team.yaml        # people, Slack user ids, machines, repo, channel
 python team_init.py build team.yaml   # -> team/team-roster.yaml, team/<key>/{agents.yaml,env.example}
 ```
 
-Each person then copies `team/<key>/agents.yaml` and `team/<key>/team-roster.yaml` into their SlackAgentTeam folder, merges `env.example` into `.env`, and creates their two Slack Apps (`<key>_dev`, `<key>_rev`). Slack ids exist only after the apps are installed:
+Each person then copies `team/<key>/agents.yaml` and `team/<key>/team-roster.yaml` into their SlackAgentTeam folder, merges `env.example` into `.env`, and creates their three Slack Apps (`<key>_dev`, `<key>_rev`, `<key>_qa`). Slack ids exist only after the apps are installed:
 
 ```bash
 python team_init.py ids team.yaml --person <key> --write   # reads them via auth.test with that person's bot tokens
 python team_init.py build team.yaml                          # regenerate; share the new team-roster.yaml
 ```
 
-The generated config uses per-thread worktrees, a shared project for the channel, owner-mode control auth, and cards that send each developer's reviews to the same person's reviewer (a human can name another person's reviewer). `team.yaml`, `team-roster.yaml` and `team/` are gitignored: they hold the team's Slack ids and local paths. No token is written to any generated file.
+The generated config uses per-thread worktrees, a shared project for the channel, owner-mode control auth, and cards that route the work: a developer asks the same person's reviewer (a human can name another), a reviewer hands a passing PR to the QA of the PR's owner, and QA checks the PR's exact commit and asks a human to merge. `team.yaml`, `team-roster.yaml` and `team/` are gitignored: they hold the team's Slack ids and local paths. No token is written to any generated file.
 
 ### Manual layout
 

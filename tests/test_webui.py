@@ -300,7 +300,7 @@ def test_channel_rules_fill_the_repo_the_agents_actually_use(monkeypatch):
     stale_default = {"github": {"repo": "acme/stale"}}
     one = rules({**stale_default, "agents": [
         {"name": "a", "github_repo": "acme/live"}, {"name": "b", "github_repo": "acme/live"}]})
-    assert one["repo"] == "acme/live" and "repo: acme/live" in one["template"]
+    assert one["repo"] == "acme/live" and "acme/live の開発チャンネル" in one["template"]
     two = rules({**stale_default, "agents": [
         {"name": "a", "github_repo": "acme/live"}, {"name": "b", "github_repo": "acme/other"}]})
     assert two["repo"] == "" and "{{OWNER/REPO}}" in two["template"]

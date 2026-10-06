@@ -378,21 +378,21 @@ Slack ではどちらも 250 文字までなので、Slack 上の約束事だけ
 
 ### 1 ファイルでチーム構成を生成（`team_init.py`）
 
-各自が自分のマシンで developer と reviewer を 1 体ずつ動かすチームなら、チームを一度書けば残りは生成できます:
+各自が自分のマシンで developer・reviewer・QA を 1 体ずつ動かすチーム（developer → reviewer → QA → 人間がマージ）なら、チームを一度書けば残りは生成できます:
 
 ```bash
 cp team.example.yaml team.yaml        # メンバー、Slack ユーザー ID、マシン名、repo、チャンネル
 python team_init.py build team.yaml   # -> team/team-roster.yaml、team/<key>/{agents.yaml,env.example}
 ```
 
-各自は `team/<key>/agents.yaml` と `team/<key>/team-roster.yaml` を自分の SlackAgentTeam フォルダにコピーし、`env.example` を `.env` にマージして、自分の Slack App 2 つ（`<key>_dev`、`<key>_rev`）を作成します。Slack の ID は App のインストール後に決まります:
+各自は `team/<key>/agents.yaml` と `team/<key>/team-roster.yaml` を自分の SlackAgentTeam フォルダにコピーし、`env.example` を `.env` にマージして、自分の Slack App 3 つ（`<key>_dev`、`<key>_rev`、`<key>_qa`）を作成します。Slack の ID は App のインストール後に決まります:
 
 ```bash
 python team_init.py ids team.yaml --person <key> --write   # 本人の bot token で auth.test を呼んで ID を取得
 python team_init.py build team.yaml                          # 再生成し、新しい team-roster.yaml を共有
 ```
 
-生成される設定は、スレッドごとの worktree、チャンネルを 1 つの共有プロジェクトに紐付け、owner モードのコントロール認証、developer のレビューを既定で同じ人の reviewer に回す card（人が他の人の reviewer を指名可）です。`team.yaml`・`team-roster.yaml`・`team/` は gitignore 済み（チームの Slack ID とローカルパスを含むため）。生成ファイルに token は書き込みません。
+生成される設定は、スレッドごとの worktree、チャンネルを 1 つの共有プロジェクトに紐付け、owner モードのコントロール認証、引き継ぎ経路を書いた card（developer は既定で同じ人の reviewer へ、人が他の人を指名可。reviewer は PASS なら PR の owner の QA へ。QA は PR の commit で確認して人間にマージを依頼）です。`team.yaml`・`team-roster.yaml`・`team/` は gitignore 済み（チームの Slack ID とローカルパスを含むため）。生成ファイルに token は書き込みません。
 
 ### 手動構成
 

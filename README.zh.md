@@ -438,21 +438,21 @@ Slack 里两者各限 250 字，所以只放 Slack 上的约定；详细规则�
 
 ### 用一个文件生成整队配置（`team_init.py`）
 
-每人在自己机器上跑一个 developer 和一个 reviewer 时，只需描述一次团队，其余全部生成：
+每人在自己机器上跑一个 developer、一个 reviewer 和一个 QA（developer → reviewer → QA → 人合并）时，只需描述一次团队，其余全部生成：
 
 ```bash
 cp team.example.yaml team.yaml        # 成员、Slack 用户 ID、机器名、仓库、频道
 python team_init.py build team.yaml   # -> team/team-roster.yaml、team/<key>/{agents.yaml,env.example}
 ```
 
-之后每人把 `team/<key>/agents.yaml` 和 `team/<key>/team-roster.yaml` 复制到自己的 SlackAgentTeam 目录，把 `env.example` 合并进 `.env`，并创建自己的两个 Slack App（`<key>_dev`、`<key>_rev`）。Slack ID 要等 App 安装后才有：
+之后每人把 `team/<key>/agents.yaml` 和 `team/<key>/team-roster.yaml` 复制到自己的 SlackAgentTeam 目录，把 `env.example` 合并进 `.env`，并创建自己的三个 Slack App（`<key>_dev`、`<key>_rev`、`<key>_qa`）。Slack ID 要等 App 安装后才有：
 
 ```bash
 python team_init.py ids team.yaml --person <key> --write   # 用本人的 bot token 调 auth.test 读出 ID
 python team_init.py build team.yaml                          # 重新生成，把新的 team-roster.yaml 发给大家
 ```
 
-生成的配置默认：每个线程独立 worktree、频道绑定为一个共享项目、owner 模式的控制认证，card 写明 developer 默认交给同一个人的 reviewer（人可以点名别人的 reviewer）。`team.yaml`、`team-roster.yaml` 和 `team/` 已 gitignore（含团队的 Slack ID 与本机路径），生成的文件里不会写入任何 token。
+生成的配置默认：每个线程独立 worktree、频道绑定为一个共享项目、owner 模式的控制认证，card 写明交接路线：developer 默认交给同一个人的 reviewer（人可以点名别人的），reviewer 通过后交给 PR 所属者的 QA，QA 在 PR 的确切 commit 上验证后请人合并。`team.yaml`、`team-roster.yaml` 和 `team/` 已 gitignore（含团队的 Slack ID 与本机路径），生成的文件里不会写入任何 token。
 
 ### 手动配置
 

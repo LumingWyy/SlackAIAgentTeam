@@ -4,7 +4,8 @@
     python team_init.py ids team.yaml --person NAME [--env .env] [--write]
 
 team.yaml (see team.example.yaml) lists the people; every person runs a
-developer and a reviewer. ``build`` writes the shared ``team-roster.yaml`` and,
+developer, a reviewer and a QA agent (developer -> reviewer -> QA -> a human
+merges). ``build`` writes the shared ``team-roster.yaml`` and,
 per person, an ``agents.yaml`` and an ``env.example`` naming the variables to
 fill. Slack user / bot ids exist only after each Slack App is installed:
 ``ids`` reads them with that person's bot tokens (auth.test) and prints them,
@@ -37,6 +38,7 @@ ROSTER_FILE = "team-roster.yaml"
 ROLES: dict[str, tuple[str, str, str]] = {
     "dev": ("dev", "dev", "claude"),
     "rev": ("rev", "reviewer", "claude"),
+    "qa": ("qa", "qa", "claude"),
 }
 _KEY_RE = re.compile(r"[a-z][a-z0-9]{0,11}")  # leaves room for "_dev" in 16 chars
 _CHANNEL_RE = re.compile(r"[CG][A-Z0-9]{6,}")
@@ -121,16 +123,23 @@ def missing_ids(team: dict[str, Any]) -> list[str]:
 
 
 def _card(person: dict[str, Any], role: str) -> str:
+    """Who each agent is and who it hands to: the team list routes by these."""
     label = _person_label(person)
     if role == "dev":
         return (
             f"{label}'s developer. Implements issues assigned to {label}; asks "
             f"{agent_name(person['key'], 'rev')} for review unless a human names "
-            "another reviewer."
+            "another reviewer; fixes what review or QA sends back."
+        )
+    if role == "rev":
+        return (
+            f"{label}'s reviewer. Reviews any PR it is asked to and writes the "
+            "findings on the PR; on PASS hands the PR to the QA of the PR's owner."
         )
     return (
-        f"{label}'s reviewer. Reviews any PR it is asked to, writes the findings "
-        "on the PR, and posts the verdict in Slack."
+        f"{label}'s QA. Checks {label}'s PRs after review passes, on the PR's exact "
+        "commit; posts QA: PASS/FAIL with evidence on the PR and in Slack; on PASS "
+        "asks a human to merge."
     )
 
 
@@ -213,7 +222,7 @@ def build_person_config(
         "roster": ROSTER_FILE,
         "node": {"id": str(person["node_id"]), "max_concurrency": 2, "max_queue": 10},
         "security": {"control_auth": "required"},
-        "budget": {"max_agent_rounds": int(team.get("max_agent_rounds") or 8)},
+        "budget": {"max_agent_rounds": int(team.get("max_agent_rounds") or 10)},
         "github": {"repo": canonical_github_repo(str(team["repo"]))},
         # Each Slack thread gets its own git worktree, so the developer and the
         # reviewer on this machine never edit the same checkout.
