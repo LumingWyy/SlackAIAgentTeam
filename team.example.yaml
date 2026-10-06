@@ -11,6 +11,14 @@ max_agent_rounds: 10               # agent-to-agent handoffs per thread before a
 daily_total_tokens: 250000         # optional: per-person daily AI token budget
 # admins: [U0AAAAAAA]              # optional: who may manage every agent (default: everyone below)
 
+# Roles the whole team shares: one agent each, running on one person's machine.
+# pm turns vague requests into assigned issues; dx keeps threads from looping.
+team_agents:
+  - role: pm
+    host: alice                    # runs on Alice's machine, on her quota
+  - role: dx
+    host: bob
+
 people:
   - key: alice                     # 1-12 lowercase letters/digits; agents become alice_dev / _rev / _qa
     name: Alice                    # optional display name used in the agents' cards

@@ -5,7 +5,8 @@
 
 team.yaml (see team.example.yaml) lists the people; every person runs a
 developer, a reviewer and a QA agent (developer -> reviewer -> QA -> a human
-merges). ``build`` writes the shared ``team-roster.yaml`` and,
+merges). ``team_agents`` adds roles the whole team shares, such as one pm and
+one dx, each running on one person's machine. ``build`` writes the shared ``team-roster.yaml`` and,
 per person, an ``agents.yaml`` and an ``env.example`` naming the variables to
 fill. Slack user / bot ids exist only after each Slack App is installed:
 ``ids`` reads them with that person's bot tokens (auth.test) and prints them,
@@ -39,6 +40,13 @@ ROLES: dict[str, tuple[str, str, str]] = {
     "dev": ("dev", "dev", "claude"),
     "rev": ("rev", "reviewer", "claude"),
     "qa": ("qa", "qa", "claude"),
+}
+# Roles the whole team shares (one agent each, on one person's machine):
+# role -> (persona taken from agents.example.yaml, runtime). The agent is
+# named after the role.
+TEAM_ROLES: dict[str, tuple[str, str]] = {
+    "pm": ("pm", "claude"),
+    "dx": ("dx", "claude"),
 }
 _KEY_RE = re.compile(r"[a-z][a-z0-9]{0,11}")  # leaves room for "_dev" in 16 chars
 _CHANNEL_RE = re.compile(r"[CG][A-Z0-9]{6,}")
@@ -105,20 +113,67 @@ def validate_team(team: dict[str, Any]) -> None:
         nodes.add(node)
         if not str(person.get("workspace") or "").strip():
             raise TeamError(f"{key}: workspace (their local clone of the repo) is required")
+    shared = team.get("team_agents") or []
+    if not isinstance(shared, list):
+        raise TeamError("team_agents must be a list")
+    roles: set[str] = set()
+    for entry in shared:
+        role = str((entry or {}).get("role") or "")
+        if role not in TEAM_ROLES:
+            raise TeamError(
+                f"team_agents role {role!r}: one of {', '.join(TEAM_ROLES)}"
+            )
+        if role in roles:
+            raise TeamError(f"team_agents has {role} twice; the team shares one")
+        roles.add(role)
+        if str(entry.get("host") or "") not in keys:
+            raise TeamError(f"team_agents {role}: host must be one of the people's keys")
 
 
-def _ids(person: dict[str, Any], role: str) -> tuple[str, str]:
-    entry = ((person.get("ids") or {}).get(role)) or {}
+def team_agents(team: dict[str, Any]) -> list[dict[str, Any]]:
+    return [dict(entry) for entry in team.get("team_agents") or []]
+
+
+def hosted(team: dict[str, Any], person: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every agent that runs on this person's machine, in a stable order."""
+    agents = [
+        {
+            "name": agent_name(person["key"], role),
+            "persona": persona,
+            "runtime": str((person.get("runtime") or {}).get(role) or runtime),
+            "ids": (person.get("ids") or {}).get(role) or {},
+            "card": _card(person, role),
+        }
+        for role, (_suffix, persona, runtime) in ROLES.items()
+    ]
+    for entry in team_agents(team):
+        if entry["host"] != person["key"]:
+            continue
+        persona, runtime = TEAM_ROLES[entry["role"]]
+        agents.append(
+            {
+                "name": entry["role"],
+                "persona": persona,
+                "runtime": str(entry.get("runtime") or runtime),
+                "ids": entry.get("ids") or {},
+                "card": _TEAM_CARDS[entry["role"]],
+            }
+        )
+    return agents
+
+
+def _ids(agent: dict[str, Any]) -> tuple[str, str]:
+    entry = agent.get("ids") or {}
     return str(entry.get("slack_user_id") or ""), str(entry.get("slack_bot_id") or "")
 
 
 def missing_ids(team: dict[str, Any]) -> list[str]:
     """Agent names whose Slack user / bot ids are not filled in yet."""
     return [
-        agent_name(person["key"], role)
+        agent["name"]
         for person in team["people"]
-        for role in ROLES
-        if not all(_ids(person, role))
+        for agent in hosted(team, person)
+        if not all(_ids(agent))
     ]
 
 
@@ -143,11 +198,25 @@ def _card(person: dict[str, Any], role: str) -> str:
     )
 
 
+_TEAM_CARDS = {
+    "pm": (
+        "Team PM. Turns a vague request into issues with done criteria and one "
+        "assignee each, then hands each issue to its assignee's developer; writes "
+        "no code; signs off product questions after QA passes."
+    ),
+    "dx": (
+        "Team DX. Watches threads for loops, duplicate delegation and stuck agents; "
+        "narrows each to one next step and uses !status / !reset; writes no code "
+        "and stays silent unless called."
+    ),
+}
+
+
 def build_roster(team: dict[str, Any]) -> dict[str, Any]:
     people = team["people"]
     members = [str(person["slack_user_id"]) for person in people]
     admins = [str(item) for item in (team.get("admins") or members)]
-    names = [agent_name(person["key"], role) for person in people for role in ROLES]
+    names = [agent["name"] for person in people for agent in hosted(team, person)]
     roster: dict[str, Any] = {
         "version": 1,
         "access": {"admins": admins},
@@ -172,16 +241,16 @@ def build_roster(team: dict[str, Any]) -> dict[str, Any]:
             "reservation_tokens": {member: reservation for member in members},
         }
     for person in people:
-        for role in ROLES:
-            user_id, bot_id = _ids(person, role)
+        for agent in hosted(team, person):
+            user_id, bot_id = _ids(agent)
             roster["agents"].append(
                 {
-                    "name": agent_name(person["key"], role),
+                    "name": agent["name"],
                     "slack_user_id": user_id,
                     "slack_bot_id": bot_id,
                     "owner": str(person["slack_user_id"]),
                     "node_id": str(person["node_id"]),
-                    "card": _card(person, role),
+                    "card": agent["card"],
                 }
             )
     return roster
@@ -209,15 +278,14 @@ def build_person_config(
     }
     if person.get("reply_language"):
         defaults["reply_language"] = str(person["reply_language"])
-    agents = []
-    for role, (_suffix, persona_key, runtime) in ROLES.items():
-        agents.append(
-            {
-                "name": agent_name(person["key"], role),
-                "runtime": str((person.get("runtime") or {}).get(role) or runtime),
-                "persona": personas.get(persona_key, ""),
-            }
-        )
+    agents = [
+        {
+            "name": agent["name"],
+            "runtime": agent["runtime"],
+            "persona": personas.get(agent["persona"], ""),
+        }
+        for agent in hosted(team, person)
+    ]
     return {
         "roster": ROSTER_FILE,
         "node": {"id": str(person["node_id"]), "max_concurrency": 2, "max_queue": 10},
@@ -236,16 +304,15 @@ def build_person_config(
     }
 
 
-def env_example(person: dict[str, Any]) -> str:
+def env_example(team: dict[str, Any], person: dict[str, Any]) -> str:
     lines = [
         f"# {_person_label(person)}: merge into SlackAgentTeam/.env on your machine.",
         "# Never commit or share the filled-in values.",
         "",
     ]
-    for role in ROLES:
-        name = agent_name(person["key"], role)
-        bot, app = default_slack_token_env_names(name)
-        lines += [f"# {name}", f"{bot}=", f"{app}="]
+    for agent in hosted(team, person):
+        bot, app = default_slack_token_env_names(agent["name"])
+        lines += [f"# {agent['name']}", f"{bot}=", f"{app}="]
     lines += [
         "",
         "# Console / admin API bearer: 32+ random printable characters, e.g.",
@@ -275,7 +342,7 @@ def build(team: dict[str, Any], out: Path) -> list[Path]:
         files = {
             "agents.yaml": _dump(build_person_config(team, person, personas)),
             ROSTER_FILE: roster_text,
-            "env.example": env_example(person),
+            "env.example": env_example(team, person),
         }
         for name, text in files.items():
             path = folder / name
@@ -316,14 +383,15 @@ def read_ids(
     env: dict[str, str],
     call: SlackCall | None = None,
 ) -> dict[str, dict[str, str]]:
-    """``{role: {slack_user_id, slack_bot_id}}`` for one person's bots."""
+    """``{agent name: {slack_user_id, slack_bot_id}}`` for every bot on this
+    person's machine (their own and any team agent they host)."""
     call = call or (lambda token, method: _slack_auth_test(token, method))
     person = next((p for p in team["people"] if p["key"] == key), None)
     if person is None:
         raise TeamError(f"no person with key {key}")
     found: dict[str, dict[str, str]] = {}
-    for role in ROLES:
-        name = agent_name(key, role)
+    for agent in hosted(team, person):
+        name = agent["name"]
         bot_env, _app_env = default_slack_token_env_names(name)
         token = env.get(bot_env) or os.environ.get(bot_env) or ""
         if not token:
@@ -331,11 +399,23 @@ def read_ids(
         result = call(token, "auth.test")
         if not result.get("ok"):
             raise TeamError(f"{name}: Slack auth.test failed: {result.get('error')}")
-        found[role] = {
+        found[name] = {
             "slack_user_id": str(result.get("user_id") or ""),
             "slack_bot_id": str(result.get("bot_id") or ""),
         }
     return found
+
+
+def store_ids(team: dict[str, Any], key: str, found: dict[str, dict[str, str]]) -> None:
+    """Put ids read by ``read_ids`` where team.yaml keeps them."""
+    person = next(p for p in team["people"] if p["key"] == key)
+    for role in ROLES:
+        name = agent_name(key, role)
+        if name in found:
+            person.setdefault("ids", {})[role] = found[name]
+    for entry in team.get("team_agents") or []:
+        if entry.get("host") == key and entry.get("role") in found:
+            entry["ids"] = found[entry["role"]]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -366,8 +446,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         ids = read_ids(team, args.person, _read_env(Path(args.env)))
         if args.write:
-            person = next(p for p in team["people"] if p["key"] == args.person)
-            person["ids"] = ids
+            store_ids(team, args.person, ids)
             Path(args.team).write_text(_dump(team), encoding="utf-8")
             print(f"stored ids for {args.person} in {args.team} (comments are not kept)")
         print(_dump({"ids": ids}), end="")

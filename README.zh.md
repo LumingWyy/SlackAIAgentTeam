@@ -452,7 +452,7 @@ python team_init.py ids team.yaml --person <key> --write   # 用本人的 bot to
 python team_init.py build team.yaml                          # 重新生成，把新的 team-roster.yaml 发给大家
 ```
 
-生成的配置默认：每个线程独立 worktree、频道绑定为一个共享项目、owner 模式的控制认证，card 写明交接路线：developer 默认交给同一个人的 reviewer（人可以点名别人的），reviewer 通过后交给 PR 所属者的 QA，QA 在 PR 的确切 commit 上验证后请人合并。`team.yaml`、`team-roster.yaml` 和 `team/` 已 gitignore（含团队的 Slack ID 与本机路径），生成的文件里不会写入任何 token。
+全队共用的角色写在 `team_agents` 下（一个 `pm` 把模糊需求拆成有负责人的 issue，一个 `dx` 防止线程打转），各自跑在 `host` 指定的那个人的机器上。生成的配置默认：每个线程独立 worktree、频道绑定为一个共享项目、owner 模式的控制认证，card 写明交接路线：developer 默认交给同一个人的 reviewer（人可以点名别人的），reviewer 通过后交给 PR 所属者的 QA，QA 在 PR 的确切 commit 上验证后请人合并。`team.yaml`、`team-roster.yaml` 和 `team/` 已 gitignore（含团队的 Slack ID 与本机路径），生成的文件里不会写入任何 token。
 
 ### 手动配置
 

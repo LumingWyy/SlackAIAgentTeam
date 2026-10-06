@@ -469,7 +469,7 @@ python team_init.py ids team.yaml --person <key> --write   # reads them via auth
 python team_init.py build team.yaml                          # regenerate; share the new team-roster.yaml
 ```
 
-The generated config uses per-thread worktrees, a shared project for the channel, owner-mode control auth, and cards that route the work: a developer asks the same person's reviewer (a human can name another), a reviewer hands a passing PR to the QA of the PR's owner, and QA checks the PR's exact commit and asks a human to merge. `team.yaml`, `team-roster.yaml` and `team/` are gitignored: they hold the team's Slack ids and local paths. No token is written to any generated file.
+Roles the whole team shares go under `team_agents` (one `pm` that turns vague requests into assigned issues, one `dx` that keeps threads from looping), each on the machine of the person named as `host`. The generated config uses per-thread worktrees, a shared project for the channel, owner-mode control auth, and cards that route the work: a developer asks the same person's reviewer (a human can name another), a reviewer hands a passing PR to the QA of the PR's owner, and QA checks the PR's exact commit and asks a human to merge. `team.yaml`, `team-roster.yaml` and `team/` are gitignored: they hold the team's Slack ids and local paths. No token is written to any generated file.
 
 ### Manual layout
 

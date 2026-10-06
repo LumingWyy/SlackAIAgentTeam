@@ -392,7 +392,7 @@ python team_init.py ids team.yaml --person <key> --write   # 本人の bot token
 python team_init.py build team.yaml                          # 再生成し、新しい team-roster.yaml を共有
 ```
 
-生成される設定は、スレッドごとの worktree、チャンネルを 1 つの共有プロジェクトに紐付け、owner モードのコントロール認証、引き継ぎ経路を書いた card（developer は既定で同じ人の reviewer へ、人が他の人を指名可。reviewer は PASS なら PR の owner の QA へ。QA は PR の commit で確認して人間にマージを依頼）です。`team.yaml`・`team-roster.yaml`・`team/` は gitignore 済み（チームの Slack ID とローカルパスを含むため）。生成ファイルに token は書き込みません。
+チーム共通の役割は `team_agents` に書きます（曖昧な依頼を担当者付きの issue に分ける `pm`、スレッドの堂々巡りを止める `dx` を 1 体ずつ）。それぞれ `host` に指定した人のマシンで動きます。生成される設定は、スレッドごとの worktree、チャンネルを 1 つの共有プロジェクトに紐付け、owner モードのコントロール認証、引き継ぎ経路を書いた card（developer は既定で同じ人の reviewer へ、人が他の人を指名可。reviewer は PASS なら PR の owner の QA へ。QA は PR の commit で確認して人間にマージを依頼）です。`team.yaml`・`team-roster.yaml`・`team/` は gitignore 済み（チームの Slack ID とローカルパスを含むため）。生成ファイルに token は書き込みません。
 
 ### 手動構成
 

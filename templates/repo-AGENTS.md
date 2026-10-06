@@ -45,6 +45,11 @@ The channel topic and description are a short summary; this file is the source o
 - Post `QA: PASS` or `QA: FAIL` on the PR with the sha, commands and key output; post the verdict and PR link in Slack.
 - On FAIL send concrete repro steps to the PR's developer; on PASS ask a human to merge. Never merge.
 
+## Team agents (if the team has them)
+
+- pm: turns a vague request into issues, each with done criteria and one assignee, and hands each issue to that person's developer. Writes no code. Product questions after QA passes go to pm, then a human.
+- dx: called when a thread loops, two agents work on the same thing, or an agent is stuck. Narrows the thread to one next step. Writes no code.
+
 ## Stop and ask a human
 
 - The issue does not say what is wanted.
