@@ -3954,8 +3954,6 @@ class SlackAgent:
     async def _on_message(
         self, body: dict, event: dict, client: Any, say: Any
     ) -> None:
-        if self._shutting_down:
-            return  # the process is stopping; Slack redelivers to the next run
         # 0. Opportunistically reclaim idle thread memory (self-throttled, at most once per SWEEP_INTERVAL)
         self._sweep_thread_state()
 
@@ -4267,6 +4265,18 @@ class SlackAgent:
                 "agent %s rejected activation: execution planning failed: %s",
                 self.name,
                 exc,
+            )
+            return
+
+        # 8b. The process is stopping. The event is already acknowledged, so
+        # Slack will not redeliver it: note it as cut off, and the next start
+        # tells the thread to send it again.
+        if self._shutting_down:
+            if quota_reservation is not None:
+                self.quota_tracker.release(quota_reservation)
+            self._ledger_record(event, execution_plan)
+            logger.info(
+                "agent %s shutting down: trigger noted for the next start", self.name
             )
             return
 
@@ -10079,12 +10089,19 @@ async def shut_down(
         agent.begin_shutdown()
     for task in background:
         task.cancel()
-    await cancel_running_turns(agents)
+    await cancel_running_turns(agents, also=background)
     await close_slack_connections(handlers, agents)
 
 
-async def cancel_running_turns(agents: list[Any], *, timeout: float = 5.0) -> None:
-    """Cancel every running activation and patrol round, and wait for them."""
+async def cancel_running_turns(
+    agents: list[Any],
+    *,
+    also: list[asyncio.Future] | None = None,
+    timeout: float = 5.0,
+) -> None:
+    """Cancel every running activation and patrol round and wait (bounded)
+    for them, together with the already-cancelled ``also`` tasks, so all of
+    them have unwound before Slack connections close."""
     running = [
         task
         for agent in agents
@@ -10093,8 +10110,9 @@ async def cancel_running_turns(agents: list[Any], *, timeout: float = 5.0) -> No
     ]
     for task in running:
         task.cancel()
-    if running:
-        await asyncio.wait(running, timeout=timeout)
+    pending = running + [task for task in also or [] if not task.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=timeout)
 
 
 async def close_slack_connections(handlers: list[Any], agents: list[Any]) -> None:

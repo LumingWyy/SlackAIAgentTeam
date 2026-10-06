@@ -1173,9 +1173,13 @@ def test_shutdown_cancels_running_turns_before_closing_slack():
 def test_shut_down_takes_no_new_work_and_reaps_turns_before_closing_slack(
     tmp_path, monkeypatch
 ):
+    """Ordered stop: loops and turns unwind first; a late trigger is noted, not run."""
     import multi_app
+    from state_store import StateStore
 
     agent = _build_agent(tmp_path, monkeypatch)
+    agent._store = StateStore(str(tmp_path / "state.db"))
+    _wire(agent, ["unused"])
     order = []
 
     async def scenario():
@@ -1199,12 +1203,19 @@ def test_shut_down_takes_no_new_work_and_reaps_turns_before_closing_slack(
 
         async def close_client():
             # A Slack event still arriving while connections close starts nothing.
+            before = {t for t in agent._tasks if not t.done()}
             await agent._on_message({"event_id": "late"}, _event(ts="200.0"), object(), _say)
-            order.append(f"slack closed, {len(agent._tasks)} turn(s) left")
+            started = {t for t in agent._tasks if not t.done()} - before
+            order.append(f"slack closed, {len(started)} new turn(s)")
 
         agent.close_client = close_client
         await multi_app.shut_down([loop_task], [], [agent])
 
     asyncio.run(scenario())
-    assert order == ["loop cancelled", "turn reaped", "slack closed, 1 turn(s) left"]
-    assert all(task.done() for task in agent._tasks)  # the one reaped turn, nothing new
+    assert order == ["loop cancelled", "turn reaped", "slack closed, 0 new turn(s)"]
+    # The late trigger is in the ledger, so the next start tells the thread to resend it.
+    rows = agent._store.take_interrupted_activations(
+        "dev", team_id="T_TEST", max_age_seconds=3600, limit=10
+    )
+    assert [row["trigger_ts"] for row in rows] == ["200.0"]
+    agent._store.close()
