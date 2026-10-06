@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 from local_config import AGENTS_EXAMPLE, ensure_agents_config
@@ -51,6 +52,11 @@ def test_tracked_template_loads_and_carries_no_personal_repo(
     assert gcfg.github_repo is None
 
 
+_IN_REPO = (ROOT / "Dockerfile").exists() and (ROOT / ".gitignore").exists()
+_repo_only = pytest.mark.skipif(not _IN_REPO, reason="repository files are not in the image")
+
+
+@_repo_only
 def test_image_ships_the_template_not_a_local_agents_yaml():
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     copied = " ".join(
@@ -70,6 +76,7 @@ def test_template_reviewer_writes_its_review_onto_the_pr():
     assert "Verdict: PASS" in persona and "Verdict: CHANGES REQUESTED" in persona
 
 
+@_repo_only
 def test_every_generated_agents_yaml_is_gitignored():
     """AGENTS_CONFIG may point anywhere; a root-only pattern would miss it."""
     lines = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()

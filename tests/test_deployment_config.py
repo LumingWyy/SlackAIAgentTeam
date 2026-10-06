@@ -4,10 +4,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# These check repository files (compose, Dockerfile, READMEs, env examples),
+# which the runtime image does not ship; `make test-docker` skips them.
+pytestmark = pytest.mark.skipif(
+    not (ROOT / "docker-compose.yml").exists(),
+    reason="repository files are not in the image",
+)
 
 
 def _mounts(service: dict) -> set[str]:

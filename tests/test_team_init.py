@@ -204,6 +204,10 @@ def test_ids_write_stores_them_in_team_yaml(tmp_path, monkeypatch, capsys):
     assert "xoxb-" not in team_path.read_text(encoding="utf-8")
 
 
+@pytest.mark.skipif(
+    not (team_init.BASE_DIR / ".gitignore").exists(),
+    reason="repository files are not in the image",
+)
 def test_generated_files_are_gitignored():
     lines = (team_init.BASE_DIR / ".gitignore").read_text(encoding="utf-8").splitlines()
     for pattern in ("team.yaml", "team-roster.yaml", "/team/"):
