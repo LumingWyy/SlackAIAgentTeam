@@ -8,11 +8,24 @@ __pycache__/
 nohup.out
 .idea/
 .jbeval/
-.claude/
+# local Claude Code state stays private; only shared project skills are tracked
+.claude/*
+!.claude/skills/
+.claude/skills/*
+!.claude/skills/slack-app-setup/
 .DS_Store
 multi_app.pid
 .env.bak
+# this machine's agents (workspaces, repos); agents.example.yaml is the template
+agents.yaml
 agents.yaml.bak
+# team_init.py input and output: the team's Slack ids and local paths
+team.yaml
+team-roster.yaml
+/team/
 state.db*
 .slack-files/
 PLAN.md
+# extra root CAs for the image (see certs/README.md); never committed
+certs/*.crt
+certs/*.pem

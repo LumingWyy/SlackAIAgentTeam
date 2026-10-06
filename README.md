@@ -17,11 +17,15 @@ Multiple agents run Socket Mode in one Python process. In channels, an agent spe
 | `state_store.py` | SQLite thread-state persistence (sessions / summaries survive restarts) |
 | `issue_claim.py` | Host-side GitHub issue claim tool (v2 lease: `claim` / `renew` / `release` / `verify`) |
 | `agent_guard.py`, `agent_guard_bin/` | `gh` / `git` guard on the agent PATH: agents open PRs, humans merge |
-| `agents.yaml` | Agent definitions (`card` / persona, ownership, node, projects) |
+| `agents.yaml` | This machine's agent definitions (`card` / persona, ownership, node, projects, workspaces, repos). Local and gitignored like `.env`; created from `agents.example.yaml` on first run |
+| `agents.example.yaml` | Tracked template for `agents.yaml` (no personal workspaces or repos) |
+| `team_init.py` / `team.example.yaml` | Generate a multi-person team's roster and per-person configs from one file |
+| `templates/repo-AGENTS.md` | Starting point for the target repository's `AGENTS.md` (detailed agent rules) |
 | `agents.distributed.example.yaml` | Two humans × two local agents distributed example |
 | `slack-app-manifest-agent.yaml` | Slack App manifest template (one App per agent) |
 | `.env.example` | Env var template (multi-agent tokens) |
-| `webui.py` | Local console (agent CRUD, Slack App wizard, live monitor, hot-swap) |
+| `webui.py` | Local console (agent CRUD, local workspace, Slack App wizard, live monitor, hot-swap) |
+| `.claude/skills/slack-app-setup/` | Claude Code skill: an agent drives the browser through Slack App setup; the human only confirms |
 
 ## Agent roles
 
@@ -194,40 +198,46 @@ Four tabs:
 **Guide** (the first-visit start page)
 
 - Five ordered stages: assign roles → create Slack Apps → connect private local accounts → write role prompts → run the first task/handoff
+- Slack Apps: the guide links straight to api.slack.com/apps, and each agent's setup wizard has a **Create in Slack from this manifest** link that opens Slack's create-from-manifest flow already filled in. Or run `/slack-app-setup` in Claude Code (`.claude/skills/slack-app-setup`): with Claude in Chrome connected, an agent drives the browser through create → install → App-Level Token → invite → restart, asks before every step with an effect, and never touches token values — you paste `xoxb-` / `xapp-` into the console yourself
 - Browser-local progress checklist; no setup state is sent to the server
 - Copy-ready Slack channel rules, human task kickoff, structured `HANDOFF`, and dev/reviewer/planner persona templates
 - Agent responsibility matrix makes local-tool and OpenAI no-tool boundaries explicit
-- Protected tabs ask for the control Bearer only when opened; the static guide itself needs no credentials
+- Adding an agent to Slack: step 02 walks a newly created agent in from start to finish (New agent → create and install its Slack App → App-Level Token → paste tokens → restart multi_app → `/invite @name` in the project channel → @mention test), with fixes for when it does not show up or answer
+- A control-token bar appears at the top only after the server answers 401; a single node without control auth never asks, and the static guide needs no credentials
 
 **Monitor** (data from running `multi_app` admin API)
 
 - **Tracked issues**: open GitHub issues across the agents' effective repositories (number / title / status labels / assignee); 30s cache; needs local `gh` login
 - Top status: online / offline, agent count, busy threads, sessions, connections
 - Per-agent “node”: status rail, runtime·model, sessions / patrol, recent threads (busy / tokens / remaining budget / idle)
-- **Hot-swap model** (with confirm): applies to the running process next turn, no restart
-- **Hot-swap runtime** (with confirm): claude / codex / openai; drops incompatible sessions
+- **Hot-swap model**: confirm in the card; applies to the running process next turn, no restart
+- **Hot-swap runtime**: claude / codex / openai; drops incompatible sessions
 - **Reply language** dropdown (中文 / 日本語 / English): next turn
 - **Reasoning effort** by runtime (openai: none…max; claude: low…max; codex: minimal…xhigh); empty = engine default
 - **Session restart**: clear all sessions for that agent (summaries kept for handoff)
+- Runtime switches, session restarts and worktree removal open an in-place confirm bar in the card (✓ to confirm, ✕ or Escape to back out) instead of a browser dialog; the bar survives the auto-refresh
 - Model lists from real engine config (`~/.claude/settings.json`, Anthropic API if keyed, `~/.codex/config.toml`)
 - **UI language** 中 / 日 / EN (browser-local; independent of agent `reply_language`)
-- Auto-refresh every 5s (pauses during pending confirm dialogs)
+- Auto-refresh every 5s (paused while a model switch awaits confirmation); figures roll only when a value changes, so refreshes do not flicker
 
 **Config** (writes `agents.yaml` / `.env`; saves hot-reload the running `multi_app` — adding/removing agents still needs a restart)
 
 - Agent list, token status (bot / app), runtime, role summary
-- **Setup wizard**: generate per-agent manifest → copy → create on api.slack.com → paste tokens → verify (`auth.test` + `apps.connections.open`) → write `.env`
+- **Setup wizard**: generate per-agent manifest → **Create in Slack from this manifest** (opens Slack's create page already filled in; copying the manifest by hand still works) → paste tokens → verify (`auth.test` + `apps.connections.open`) → write `.env`
+- **Local workspace**: each agent card edits `workspace` and `github_repo`. **Check** confirms the directory exists, whether it is a git repo, its branch and origin, and warns when origin differs from the repo (GitHub collaboration would be disabled), with one click to adopt origin's repo; saving hot-reloads, and an empty `github_repo` inherits the default. Type the directory, click **Choose…** for the machine's own folder dialog (macOS, or a Linux desktop with zenity / kdialog), or **Browse** to walk folders in the page (home directory only, git repos marked). The GitHub repo field has **Choose…** too: pick from the repos the local gh account can see (switch owner or org, search); when the check finds the repo missing, **Create on GitHub** makes it (private, after a confirm). The check first makes sure gh is installed and signed in on this machine: missing gh links to the installer, a signed-out gh points to the Auth tab, and neither is misreported as an unreachable repo
 - **Edit persona** / **Add agent**
 
 **Auth** verifies the Claude, Codex, and GitHub login in the environment that
 actually runs the agent (Docker when available, otherwise the host). Each owner
 connects only their own accounts.
 
-Webui binds **127.0.0.1 only** (Host header check against DNS rebinding). Live data comes from admin API (`ADMIN_BASE`, default `http://127.0.0.1:8766`). Owner/distributed configurations require an environment-only Bearer named `SLACK_AGENT_CONTROL_TOKEN_<SLACK_USER_ID>` (32+ unique random printable characters). The browser keeps it in `sessionStorage` and sends `Authorization: Bearer ...`; identity headers are ignored. Owners see/change only their agents, top-level admins can manage all agents, and global reload is admin-only. `/healthz` remains public; sensitive reads and every write require authentication. Saves create `.bak` backups (gitignored); YAML comments in `agents.yaml` are lost on save.
+**Look and feel** follows [rare-ui](https://github.com/swamimalode07/rare-ui): light / dark / system themes, a selected tab that lifts out of the bar, odometer counters, a task-list strike when a step is ticked, copy buttons that spring into a check. Everything is disabled under "reduce motion".
+
+Webui binds **127.0.0.1 only** (Host header check against DNS rebinding). Live data comes from admin API (`ADMIN_BASE`, default `http://127.0.0.1:8766`). Owner/distributed configurations require an environment-only Bearer named `SLACK_AGENT_CONTROL_TOKEN_<SLACK_USER_ID>` (32+ unique random printable characters). The browser keeps it in `sessionStorage` and sends `Authorization: Bearer ...` (asked in place only after a 401; a rejected token is dropped at once); identity headers are ignored. Owners see/change only their agents, top-level admins can manage all agents, and global reload is admin-only. `/healthz` remains public; sensitive reads and every write require authentication. Saves create `.bak` backups (gitignored); YAML comments in `agents.yaml` are lost on save.
 
 ## Slack App setup (manual)
 
-(Skip if using the Web UI wizard.) Each agent needs its **own Slack App**.
+(Skip if you use the wizard's **Create in Slack from this manifest** link, or run `/slack-app-setup` in Claude Code.) Each agent needs its **own Slack App**.
 
 1. [https://api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From a manifest**
 2. Paste `slack-app-manifest-agent.yaml`; change three fields per App:
@@ -295,6 +305,13 @@ ALLOWED_SLACK_USERS=U01ABCDEF
 
 # Optional Claude workspace when agents.yaml omits workspace
 CLAUDE_WORKSPACE=/path/to/project
+
+# Optional runtime tuning (defaults and details in .env.example)
+# FRESHNESS_RECHECK=1                  # recheck a draft against mid-turn messages
+# PROVIDER_COOLDOWN_BASE_SECONDS=60    # rate-limit cooldown, shared per provider account
+# PROVIDER_PACER_BASE_SECONDS=0.5      # node-wide spacing of turn starts; 0 disables
+# SOCKET_GAP_REVALIDATE_SECONDS=120    # socket gap after which transcripts revalidate
+# AGENT_PROTECTED_BRANCHES=main,master # branches agents may not push to directly
 ```
 
 Override env names in `agents.yaml` with `bot_token_env` / `app_token_env`.
@@ -302,6 +319,8 @@ Override env names in `agents.yaml` with `bot_token_env` / `app_token_env`.
 ## Start
 
 ### Docker (recommended)
+
+Behind a network that inspects TLS (Cloudflare Zero Trust / Gateway, a corporate proxy), the build and the agents fail with "self-signed certificate in certificate chain": put that network's root CA in `certs/` first, as [`certs/README.md`](certs/README.md) shows.
 
 ```bash
 cp .env.alice.example .env.alice   # Alice's machine only; fill Alice values
@@ -332,6 +351,7 @@ Compose notes:
 make run     # = .venv/bin/python multi_app.py
 make test
 make webui
+make stop    # stops both, whether started in the foreground or in the background
 ```
 
 Startup logs print the roster (name / user_id / workspace). Optional agents without tokens log a skip warning.
@@ -400,6 +420,18 @@ Example: `!status <@U_DEV>`. Mainly for humans and `dx`.
 
 On activation, agents load channel **topic** and **purpose** (5 min cache) as channel ops rules at the top of the prompt. Put rules in the channel topic/description.
 
+Slack caps each at 250 characters, so keep only the Slack conventions there and put the detailed rules in the target repository's `AGENTS.md` (Codex reads it; a `CLAUDE.md` containing `@AGENTS.md` makes Claude read it too). [`channel-rules-template.md`](channel-rules-template.md) has a topic, a description and a pinned-message template; [`templates/repo-AGENTS.md`](templates/repo-AGENTS.md) is the starting point for `AGENTS.md`.
+
+## Attachments and HTML reports
+
+Each Slack turn gets a private outbox directory in `SLACK_AGENT_OUTBOX` (under `SLACK_AGENT_OUTBOX_ROOT`, default `~/.slack-agent-team/outbox`). Files the agent saves there are uploaded to the thread with its reply, then the directory is deleted. Only regular files are sent, at most 5 per turn and 10 MB each, of the types html, png, jpg, gif, svg, pdf, md, txt, csv, json; anything else is listed back as not attached. The Slack app needs `files:write` (in the manifest).
+
+For reports that need diagrams or tables (comparisons, design explanations, reviews or QA results with several findings), agents can use the [answer-me-with-html](https://github.com/QingYunA/answer-me-with-html) skill, which renders a one-page HTML from a short Markdown draft:
+
+1. On every machine that runs agents, install it (third-party code: read it first; it runs a bundled Node 20+ CLI): `npx skills add QingYunA/answer-me-with-html -g -y -a claude-code` (add `-a codex` for Codex agents).
+2. Enable it per agent with `skills: [answer-me-with-html]` (or under `defaults`; `skills:` in `team.yaml` does this for a whole team). Claude agents then load only the skills listed there.
+3. The agent renders with `--no-open -o "$SLACK_AGENT_OUTBOX/<name>.html"`, writes a 2–3 line conclusion in Slack, and the page arrives as an attachment. It does not make pages for ordinary replies.
+
 ## Collaboration friction controls
 
 | Control | Behavior |
@@ -433,6 +465,26 @@ reset, run commands, authorize handoffs, or supply instructions to an agent.
 7. **Remote agent classified as unknown bot** — every host needs that logical entry's `slack_user_id` and `slack_bot_id`.
 
 ## Multi-host deploy
+
+### Team setup in one file (`team_init.py`)
+
+For a team where every person runs a developer, a reviewer and a QA agent on their own machine (developer → reviewer → QA → a human merges), describe the team once and generate everything:
+
+```bash
+cp team.example.yaml team.yaml        # people, Slack user ids, machines, repo, channel
+python team_init.py build team.yaml   # -> team/team-roster.yaml, team/<key>/{agents.yaml,env.example}
+```
+
+Each person then copies `team/<key>/agents.yaml` and `team/<key>/team-roster.yaml` into their SlackAgentTeam folder, merges `env.example` into `.env`, and creates their three Slack Apps (`<key>_dev`, `<key>_rev`, `<key>_qa`), plus one app for each team agent they host (`pm`, `dx`; see `team_agents` below). Slack ids exist only after the apps are installed:
+
+```bash
+python team_init.py ids team.yaml --person <key> --write   # reads them via auth.test with that person's bot tokens
+python team_init.py build team.yaml                          # regenerate; share the new team-roster.yaml
+```
+
+Roles the whole team shares go under `team_agents` (one `pm` that turns vague requests into assigned issues, one `dx` that keeps threads from looping), each on the machine of the person named as `host`. The generated config uses per-thread worktrees, a shared project for the channel, owner-mode control auth, and cards that route the work: a developer asks the same person's reviewer (a human can name another), a reviewer hands a passing PR to the QA of the PR's owner, and QA checks the PR's exact commit and asks a human to merge. `team.yaml`, `team-roster.yaml` and `team/` are gitignored: they hold the team's Slack ids and local paths. No token is written to any generated file.
+
+### Manual layout
 
 Use the decentralized Slack-bus layout in [`roster.yaml`](roster.yaml),
 [`agents.alice.yaml`](agents.alice.yaml), and
@@ -657,14 +709,14 @@ Git discipline (in system prompt):
 
 Expected path:
 
-1. **dev** atomically claims issue with its issue-specific Git-ref lease, then records the matching agent/node/timestamp marker
+1. **dev** claims with `issue_claim.py claim` (atomic Git-ref lease plus the matching agent/node/timestamp marker; the issue moves to `status:in-progress`)
 2. **dev** reads the issue with `gh issue view`; in `thread_worktree` it works
    on the already-managed branch without checkout
-3. **dev** fix → commit/push → `gh pr create`
+3. **dev** fix → commit/push → `issue_claim.py open-pr` (the PR gets `Closes #N` and the Slack thread link, the issue moves to `status:in-review`, the claim is released)
 4. **dev** posts PR URL and `@reviewer`
 5. **reviewer** uses `gh pr view` / `gh pr diff` (and the shared thread
    worktree when local) without switching the managed branch
-6. **reviewer** LGTM → merge + `gh issue close`
+6. **reviewer** LGTM → asks a human to merge (agents cannot merge); merging closes the issue through `Closes #N`
 
 ### Patrol
 
@@ -688,6 +740,7 @@ agents:
   - name: dev
     github_repo: OWNER/DEV-REPO # per-agent override
     patrol_interval: 300       # seconds; 0 = off
+    patrol_labels: [role:dev]  # only claim issues that also carry these labels
 
   - name: reviewer
     github_repo: ""             # explicit GitHub disable

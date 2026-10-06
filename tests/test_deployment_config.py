@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
+import pytest
 import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# These check repository files (compose, Dockerfile, READMEs, env examples),
+# which the runtime image does not ship. Skip only inside the image (it sets
+# SLACK_AGENT_IMAGE): in a checkout a missing file must fail, not skip.
+pytestmark = pytest.mark.skipif(
+    os.environ.get("SLACK_AGENT_IMAGE") == "1",
+    reason="repository files are not in the image",
+)
 
 
 def _mounts(service: dict) -> set[str]:
@@ -92,3 +102,54 @@ def test_all_readmes_document_thread_worktree_safety_and_lifecycle():
         assert "git worktree" in text
         assert "unpushed" in text
         assert "branch" in text
+
+
+def test_only_public_ca_certificates_reach_the_image():
+    """certs/ may hold a network's root CA; nothing else there enters the build."""
+    ignore = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    assert "certs/*" in ignore and "!certs/*.crt" in ignore
+    assert ignore.index("certs/*") < ignore.index("!certs/*.crt")
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY certs/ /usr/local/share/ca-certificates/extra/" in dockerfile
+    assert "SLACK_AGENT_IMAGE=1" in dockerfile  # what the repo-file tests key their skip on
+
+
+def test_make_stop_stops_only_this_checkouts_processes(tmp_path):
+    """Another clone's multi_app (here: a fake one elsewhere) must keep running."""
+    import shutil
+    import subprocess
+    import sys
+    import time
+
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    assert "@sh scripts/stop-local.sh run" in makefile
+    assert "@sh scripts/stop-local.sh webui" in makefile
+    assert "pkill" not in makefile
+
+    checkout, other = tmp_path / "checkout", tmp_path / "other-clone"
+    (checkout / "scripts").mkdir(parents=True)
+    other.mkdir()
+    shutil.copy(ROOT / "scripts" / "stop-local.sh", checkout / "scripts" / "stop-local.sh")
+    for folder in (checkout, other):
+        (folder / "multi_app.py").write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+    mine = subprocess.Popen([sys.executable, "multi_app.py"], cwd=checkout)
+    theirs = subprocess.Popen([sys.executable, "multi_app.py"], cwd=other)
+    try:
+        time.sleep(0.5)
+        out = subprocess.run(
+            ["sh", str(checkout / "scripts" / "stop-local.sh"), "run"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+        assert "stopped multi_app" in out
+        assert mine.wait(timeout=10) is not None
+        assert theirs.poll() is None  # the other clone's process is untouched
+        again = subprocess.run(
+            ["sh", str(checkout / "scripts" / "stop-local.sh"), "run"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+        assert "multi_app was not running" in again
+    finally:
+        for proc in (mine, theirs):
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()

@@ -698,3 +698,547 @@ def test_batched_turn_clears_ledger_rows_of_absorbed_triggers(
     # Only the holder's own row remains until its task callback clears it.
     assert [row["trigger_ts"] for row in rows] == ["101.0"]
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# Operator stop (console)
+# ---------------------------------------------------------------------------
+
+def test_stop_cancels_running_work_and_tells_each_thread(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    started = asyncio.Event()
+
+    async def endless():
+        started.set()
+        await asyncio.sleep(3600)
+
+    rec = _wire(agent, [endless])
+
+    async def fake_run_turn(prompt, thread_key, gen, **kwargs):
+        rec.turns.append(prompt)
+        await endless()
+
+    agent._run_turn = fake_run_turn
+    notices = []
+
+    async def say(**kwargs):
+        notices.append(kwargs)
+
+    async def scenario():
+        events = [_event(ts="101.0"), _event(ts="102.0")]  # one thread, two triggers
+        for event in events:
+            task = asyncio.create_task(agent._activate_inner(event, object(), say))
+            agent._tasks.add(task)
+            agent._task_triggers[task] = (event, object(), say)
+        await started.wait()
+        result = await agent.stop()
+        return result, events
+
+    result, _events = asyncio.run(scenario())
+    # no state.db in this test: the stop holds until a restart, and says so
+    assert result == {"cancelled": 2, "patrol_cancelled": 0, "persisted": False}
+    assert agent.paused is True
+    assert rec.posts == []  # nothing half-finished was posted
+    assert len(notices) == 1 and notices[0]["thread_ts"] == "100.0"
+    assert "中断" in notices[0]["text"]
+    assert {"add": "black_square_for_stop", "remove": None} in rec.reactions
+    assert {"add": None, "remove": "hourglass_flowing_sand"} in rec.reactions
+    assert not any(r["add"] == "x" for r in rec.reactions)  # stopped, not failed
+
+
+def test_stop_survives_a_restart_until_resumed(tmp_path, monkeypatch):
+    from multi_app import Roster, SlackAgent, load_agents_config
+    from multi_core import TurnBudget
+    from state_store import StateStore
+
+    yaml_path = tmp_path / "agents.yaml"
+    yaml_path.write_text("agents:\n  - name: dev\n    persona: x\n", encoding="utf-8")
+    monkeypatch.setenv("DEV_SLACK_BOT_TOKEN", "xoxb-dev")
+    monkeypatch.setenv("DEV_SLACK_APP_TOKEN", "xapp-dev")
+    configs, _ = load_agents_config(str(yaml_path))
+
+    def boot(store):
+        return SlackAgent(
+            configs[0], budget=TurnBudget(8), roster=Roster(),
+            allowed_humans=set(), store=store,
+        )
+
+    store = StateStore(str(tmp_path / "state.db"))
+    boot(store).set_paused(True)
+    store.close()
+    store = StateStore(str(tmp_path / "state.db"))
+    agent = boot(store)
+    assert agent.paused is True
+    agent.resume()
+    store.close()
+    store = StateStore(str(tmp_path / "state.db"))
+    assert boot(store).paused is False
+    store.close()
+
+
+def test_stopped_patrol_round_hands_the_issue_back(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    calls, posts = [], []
+
+    async def claim_tool(action, *, repo, issue, config, stale_only=False):
+        calls.append((action, issue))
+        return {"status": "released"}
+
+    async def fake_post(_channel, _thread_ts, text):
+        posts.append(text)
+
+    agent._run_claim_tool = claim_tool
+    agent._post_result = fake_post
+    agent.paused = True
+    asyncio.run(agent._release_stopped_claim("acme/widgets", 7, agent.cfg, "C-PATROL"))
+    assert calls == [("release", 7)]
+    assert "#7" in posts[0] and "todo" in posts[0]
+
+
+def _stream_then_hang(monkeypatch, session_id, started):
+    import multi_app
+    from claude_agent_sdk import SystemMessage
+
+    async def fake_query(*, prompt, options):
+        yield SystemMessage(subtype="init", data={"session_id": session_id})
+        started.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(multi_app, "query", fake_query)
+
+
+@pytest.mark.parametrize("operator_stop", [True, False])
+def test_interrupted_first_turn_keeps_its_session_only_on_operator_stop(
+    tmp_path, monkeypatch, operator_stop
+):
+    """A stop keeps the new session for the next turn; other cancels do not."""
+    agent = _build_agent(tmp_path, monkeypatch)
+    started = asyncio.Event()
+    _stream_then_hang(monkeypatch, "sess-first", started)
+    thread_key = "C1:100.0"
+
+    async def scenario():
+        turn = asyncio.create_task(
+            agent._run_claude("p", thread_key, agent._turn_generation(thread_key))
+        )
+        await started.wait()
+        if operator_stop:
+            agent.set_paused(True)
+            agent._operator_cancelled.add(turn)
+        turn.cancel()
+        await asyncio.gather(turn, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert agent.sessions.get(thread_key) == ("sess-first" if operator_stop else None)
+
+
+def test_turn_after_a_stop_is_told_not_to_pick_the_work_back_up(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    started = asyncio.Event()
+    replies = iter(["hang", "fail", "ok", "ok"])
+
+    rec = _wire(agent, ["unused"])
+
+    async def fake_run_turn(prompt, thread_key, gen, **kwargs):
+        rec.turns.append(prompt)
+        reply = next(replies)
+        if reply == "hang":
+            started.set()
+            await asyncio.sleep(3600)
+        if reply == "fail":
+            raise RuntimeError("provider blew up")
+        return "done"
+
+    agent._run_turn = fake_run_turn
+
+    async def scenario():
+        event = _event(ts="101.0")
+        task = asyncio.create_task(agent._activate_inner(event, object(), _say))
+        agent._tasks.add(task)
+        agent._task_triggers[task] = (event, object(), _say)
+        await started.wait()
+        await agent.stop()
+        agent.resume()
+        for ts in ("103.0", "105.0", "107.0"):
+            await agent._activate_inner(_event(ts=ts), object(), _say)
+
+    asyncio.run(scenario())
+    note = "操作者が途中で停止しました"
+    assert note not in rec.turns[0]
+    assert note in rec.turns[1]  # the first turn after the stop (it fails)
+    assert note in rec.turns[2]  # so the retry still carries it
+    assert note not in rec.turns[3]  # cleared once a turn succeeded
+
+
+# ---------------------------------------------------------------------------
+# Slack identity (what Slack shows for the bot)
+# ---------------------------------------------------------------------------
+
+def test_slack_identity_reads_the_shown_name_not_the_app_name():
+    from multi_core import slack_identity
+
+    user = {"name": "ai_agent_luming", "profile": {"real_name": "dev", "display_name": ""}}
+    bot = {"name": "Agent (developer)", "app_id": "A0BJRUTHFV5"}
+    assert slack_identity(user, bot) == {
+        "display_name": "dev",
+        "username": "ai_agent_luming",
+        "app_name": "Agent (developer)",
+        "app_id": "A0BJRUTHFV5",
+        "app_home_url": "https://api.slack.com/apps/A0BJRUTHFV5/app-home",
+    }
+    renamed = {"name": "x", "profile": {"real_name": "dev", "display_name": "developer"}}
+    assert slack_identity(renamed, bot)["display_name"] == "developer"
+    odd = slack_identity(user, {"app_id": "javascript:alert(1)"})
+    assert odd["app_id"] == "" and odd["app_home_url"] == ""
+
+
+def test_sync_rereads_the_bot_profile_from_slack(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    names = iter(["dev", "developer"])
+
+    class Client:
+        async def users_info(self, user):
+            assert user == SELF_USER
+            return {"user": {"name": "dev", "profile": {"real_name": next(names)}}}
+
+        async def bots_info(self, bot):
+            assert bot == SELF_BOT
+            return {"bot": {"name": "Agent (dev)", "app_id": "A0TESTAPP1"}}
+
+    class App:
+        client = Client()
+
+    agent.app = App()
+    assert asyncio.run(agent.refresh_slack_identity())["display_name"] == "dev"
+    assert asyncio.run(agent.refresh_slack_identity())["display_name"] == "developer"
+    assert agent.status_snapshot()["slack"]["display_name"] == "developer"
+
+
+def test_status_reports_stopped_apart_from_cooldown_paused_admissions(
+    tmp_path, monkeypatch
+):
+    """The limiter's "paused" (cooldown waits) must not mask or fake a stop."""
+    agent = _build_agent(tmp_path, monkeypatch)
+    snapshot = agent.status_snapshot()
+    assert snapshot["stopped"] is False and "paused" in snapshot
+    agent.set_paused(True)
+    snapshot = agent.status_snapshot()
+    assert snapshot["stopped"] is True
+    assert snapshot["paused"] == 0  # still the limiter's count
+
+
+def test_resume_before_a_cancelled_task_unwinds_still_counts_as_a_stop(
+    tmp_path, monkeypatch
+):
+    """Cleanup asks whether its own task was stopped, not the live flag."""
+    agent = _build_agent(tmp_path, monkeypatch)
+    seen = []
+    started = asyncio.Event()
+
+    async def work():
+        try:
+            started.set()
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.05)  # Resume lands while this unwinds
+            seen.append(agent._stopped_by_operator())
+            raise
+
+    async def scenario():
+        task = asyncio.create_task(work())
+        agent._tasks.add(task)
+        await started.wait()
+        stopping = asyncio.create_task(agent.stop())
+        await asyncio.sleep(0)
+        agent.resume()
+        await stopping
+
+    asyncio.run(scenario())
+    assert seen == [True]
+    assert agent.paused is False
+
+
+def test_stop_replies_within_its_bound_when_work_is_slow_to_unwind(
+    tmp_path, monkeypatch
+):
+    import time as _time
+
+    import multi_app
+
+    monkeypatch.setattr(multi_app, "STOP_WAIT_SECONDS", 0.05)
+    agent = _build_agent(tmp_path, monkeypatch)
+    started = asyncio.Event()
+
+    async def stubborn():
+        try:
+            started.set()
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            await asyncio.sleep(1.0)
+            raise
+
+    async def scenario():
+        task = asyncio.create_task(stubborn())
+        agent._tasks.add(task)
+        await started.wait()
+        begin = _time.monotonic()
+        result = await agent.stop()
+        elapsed = _time.monotonic() - begin
+        await asyncio.gather(task, return_exceptions=True)
+        return result, elapsed
+
+    result, elapsed = asyncio.run(scenario())
+    assert result["cancelled"] == 1
+    assert elapsed < 0.8
+
+
+def test_stop_note_survives_a_restart(tmp_path, monkeypatch):
+    from multi_app import Roster, SlackAgent, load_agents_config
+    from multi_core import TurnBudget
+    from state_store import StateStore
+
+    yaml_path = tmp_path / "agents.yaml"
+    yaml_path.write_text("agents:\n  - name: dev\n    persona: x\n", encoding="utf-8")
+    monkeypatch.setenv("DEV_SLACK_BOT_TOKEN", "xoxb-dev")
+    monkeypatch.setenv("DEV_SLACK_APP_TOKEN", "xapp-dev")
+    configs, _ = load_agents_config(str(yaml_path))
+
+    def boot(store):
+        return SlackAgent(
+            configs[0], budget=TurnBudget(8), roster=Roster(),
+            allowed_humans=set(), store=store,
+        )
+
+    store = StateStore(str(tmp_path / "state.db"))
+    boot(store)._mark_thread_stopped("C1:100.0")
+    store.close()
+    store = StateStore(str(tmp_path / "state.db"))
+    agent = boot(store)
+    assert "C1:100.0" in agent._stopped_threads
+    agent._clear_thread_stopped("C1:100.0")
+    store.close()
+    store = StateStore(str(tmp_path / "state.db"))
+    assert boot(store)._stopped_threads == set()
+    store.close()
+
+
+def test_stop_note_stays_when_the_reply_could_not_be_posted(tmp_path, monkeypatch):
+    agent = _build_agent(tmp_path, monkeypatch)
+    rec = _wire(agent, ["done"])
+    agent._mark_thread_stopped("C1:100.0")
+    attempts = []
+
+    async def flaky_post(_channel, _thread_ts, result):
+        attempts.append(result)
+        if len(attempts) == 1:
+            raise RuntimeError("slack is down")
+        rec.posts.append(result)
+
+    agent._post_result = flaky_post
+    _activate(agent, _event(ts="101.0"))  # the failed post is logged, not raised
+    assert "C1:100.0" in agent._stopped_threads  # nothing reached the thread
+    _activate(agent, _event(ts="103.0"))
+    assert "C1:100.0" not in agent._stopped_threads
+    assert "操作者が途中で停止しました" in rec.turns[1]
+
+
+def test_slack_name_is_reread_periodically(tmp_path, monkeypatch):
+    import multi_app
+
+    monkeypatch.setattr(multi_app, "SLACK_IDENTITY_REFRESH_SECONDS", 0.01)
+    agent = _build_agent(tmp_path, monkeypatch)
+    calls = []
+
+    async def refresh():
+        calls.append(1)
+        if len(calls) == 2:
+            raise RuntimeError("slack hiccup")  # a failure never ends the loop
+        return {}
+
+    agent.refresh_slack_identity = refresh
+
+    async def scenario():
+        loop = asyncio.create_task(agent.slack_identity_loop())
+        while len(calls) < 3:
+            await asyncio.sleep(0.01)
+        loop.cancel()
+        await asyncio.gather(loop, return_exceptions=True)
+
+    asyncio.run(scenario())
+    assert len(calls) >= 3
+
+
+def test_sigterm_cancels_the_main_task_instead_of_killing_the_process():
+    """make stop sends SIGTERM; running turns must unwind and reap their children."""
+    import signal
+
+    import multi_app
+
+    registered = {}
+
+    class Loop:
+        def add_signal_handler(self, sig, callback):
+            registered[sig] = callback
+
+    async def scenario():
+        main = asyncio.create_task(asyncio.sleep(3600))
+        multi_app.install_shutdown_signals(Loop(), main)
+        registered[signal.SIGTERM]()  # what the loop calls on SIGTERM
+        try:
+            await main
+        except asyncio.CancelledError:
+            return "cancelled"
+        return "kept running"
+
+    assert asyncio.run(scenario()) == "cancelled"
+
+
+def test_shutdown_signals_tolerate_loops_without_signal_support():
+    import multi_app
+
+    class Loop:
+        def add_signal_handler(self, sig, callback):
+            raise NotImplementedError
+
+    async def scenario():
+        task = asyncio.create_task(asyncio.sleep(0))
+        multi_app.install_shutdown_signals(Loop(), task)  # must not raise
+        await task
+
+    asyncio.run(scenario())
+
+
+def test_shutdown_closes_every_connection_even_if_one_fails():
+    import multi_app
+
+    closed = []
+
+    class Handler:
+        def __init__(self, name, fail=False):
+            self.name, self.fail = name, fail
+
+        async def close_async(self):
+            closed.append(self.name)
+            if self.fail:
+                raise RuntimeError("socket already gone")
+
+    class Agent:
+        def __init__(self, name):
+            self.name = name
+
+        async def close_client(self):
+            closed.append(self.name)
+
+    asyncio.run(
+        multi_app.close_slack_connections(
+            [Handler("socket-a", fail=True), Handler("socket-b")],
+            [Agent("dev"), Agent("reviewer")],
+        )
+    )
+    assert closed == ["socket-a", "socket-b", "dev", "reviewer"]
+
+
+def test_shutdown_cancels_running_turns_before_closing_slack():
+    """A turn's children are reaped before shutdown spends time on Slack."""
+    import multi_app
+
+    order = []
+
+    async def scenario():
+        async def turn():
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                order.append("turn reaped its children")
+                raise
+
+        class Agent:
+            name = "dev"
+
+            def __init__(self):
+                self._tasks = {asyncio.create_task(turn())}
+                self._patrol_round = None
+
+            async def close_client(self):
+                order.append("slack closed")
+
+        agent = Agent()
+        await asyncio.sleep(0)
+        await multi_app.cancel_running_turns([agent])
+        await multi_app.close_slack_connections([], [agent])
+
+    asyncio.run(scenario())
+    assert order == ["turn reaped its children", "slack closed"]
+
+
+def test_shut_down_takes_no_new_work_and_reaps_turns_before_closing_slack(
+    tmp_path, monkeypatch
+):
+    """Ordered stop: loops and turns unwind first; a late trigger is noted, not run."""
+    import multi_app
+    from state_store import StateStore
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    agent._store = StateStore(str(tmp_path / "state.db"))
+    _wire(agent, ["unused"])
+    order = []
+
+    async def scenario():
+        async def turn():
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                order.append("turn reaped")
+                raise
+
+        async def background_loop():
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                order.append("loop cancelled")
+                raise
+
+        agent._tasks.add(asyncio.create_task(turn()))
+        loop_task = asyncio.ensure_future(background_loop())
+        await asyncio.sleep(0)
+
+        async def close_client():
+            # A Slack event still arriving while connections close starts nothing.
+            before = {t for t in agent._tasks if not t.done()}
+            await agent._on_message({"event_id": "late"}, _event(ts="200.0"), object(), _say)
+            started = {t for t in agent._tasks if not t.done()} - before
+            order.append(f"slack closed, {len(started)} new turn(s)")
+
+        agent.close_client = close_client
+        await multi_app.shut_down([loop_task], [], [agent])
+
+    asyncio.run(scenario())
+    assert order == ["loop cancelled", "turn reaped", "slack closed, 0 new turn(s)"]
+    # The late trigger is in the ledger, so the next start tells the thread to resend it.
+    rows = agent._store.take_interrupted_activations(
+        "dev", team_id="T_TEST", max_age_seconds=3600, limit=10
+    )
+    assert [row["trigger_ts"] for row in rows] == ["200.0"]
+    agent._store.close()
+
+
+def test_a_stop_that_cannot_be_saved_says_so(tmp_path, monkeypatch, caplog):
+    """A full disk must not let a stop look durable: a restart would undo it."""
+    from state_store import StateStore
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    agent._store = StateStore(str(tmp_path / "state.db"))
+    assert agent.set_paused(True) is True  # healthy store
+    monkeypatch.setattr(agent._store, "_exec", lambda *_a, **_k: -1)  # writes now fail
+    with caplog.at_level("WARNING", logger="multi_app"):
+        result = asyncio.run(agent.stop())
+        resumed = agent.resume()
+        agent._mark_thread_stopped("C1:100.0")
+        agent._clear_thread_stopped("C1:100.0")
+    assert result["persisted"] is False and resumed is False
+    assert agent.paused is False  # still applied in this process
+    assert "stopped state could not be saved" in caplog.text
+    assert "resumed state could not be saved" in caplog.text
+    assert "could not save the stop note" in caplog.text
+    assert "could not clear the saved stop note" in caplog.text
+    agent._store.close()

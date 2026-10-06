@@ -14,3 +14,6 @@ __pycache__/
 *.pid
 .DS_Store
 REVIEW-*.md
+# only public CA certificates (*.crt) reach the image; never keys or bundles
+certs/*
+!certs/*.crt

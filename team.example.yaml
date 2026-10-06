@@ -1,0 +1,38 @@
+# One credential-free description of the whole team. Copy to team.yaml (gitignored),
+# fill it in, then:  python team_init.py build team.yaml
+# Every person runs three agents on their own machine: <key>_dev, <key>_rev and <key>_qa
+# (developer -> reviewer -> QA -> a human merges).
+
+project: product-x                 # lowercase id for the Slack project
+repo: acme/product-x               # OWNER/REPO the team works on
+channel: C0123456789               # the shared Slack channel's id (channel details > About)
+base_ref: main                     # branch each Slack thread's worktree starts from
+max_agent_rounds: 10               # agent-to-agent handoffs per thread before a human must step in
+daily_total_tokens: 250000         # optional: per-person daily AI token budget
+# skills: [answer-me-with-html]    # optional: Claude skills the agents may use; every person installs
+#                                  # them on their machine (README: HTML reports in Slack)
+# admins: [U0AAAAAAA]              # optional: who may manage every agent (default: everyone below)
+
+# Roles the whole team shares: one agent each, running on one person's machine.
+# pm turns vague requests into assigned issues; dx keeps threads from looping.
+team_agents:
+  - role: pm
+    host: alice                    # runs on Alice's machine, on her quota; Alice creates its Slack App too
+  - role: dx
+    host: bob
+
+people:
+  - key: alice                     # 1-12 lowercase letters/digits; agents become alice_dev / _rev / _qa
+    name: Alice                    # optional display name used in the agents' cards
+    slack_user_id: U0AAAAAAA       # Alice's own Slack user id (profile > ⋮ > Copy member ID)
+    node_id: alice-mac             # a name for Alice's machine, unique in the team
+    workspace: ~/workspace/product-x   # Alice's local clone of the repo
+    reply_language: English        # optional
+    # ids: filled in by `python team_init.py ids team.yaml --person alice --write`
+    #   once Alice's three Slack Apps are installed and their tokens are in her .env
+
+  - key: bob
+    name: Bob
+    slack_user_id: U0BBBBBBB
+    node_id: bob-laptop
+    workspace: ~/src/product-x

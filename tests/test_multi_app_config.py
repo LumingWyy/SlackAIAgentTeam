@@ -1603,6 +1603,53 @@ def test_remote_roster_bot_mention_activates_local_agent(
     assert activated == ["1.0"]
 
 
+def test_stopped_agent_refuses_new_work_until_resumed(tmp_path, monkeypatch):
+    """A stopped agent answers a mention with one notice per thread, runs nothing."""
+    import asyncio
+
+    agent = _collaboration_agent(tmp_path, monkeypatch)
+    activated, replies, reactions = [], [], []
+
+    async def fake_activate(event, _client, _say):
+        activated.append(event["ts"])
+
+    async def say(**kwargs):
+        replies.append(kwargs["text"])
+
+    async def record_reaction(_client, _channel, ts, add=None, remove=None):
+        reactions.append((ts, add))
+
+    agent._activate = fake_activate
+    agent._set_reaction = record_reaction
+
+    def mention(ts):
+        return {
+            "channel": "C1",
+            "ts": ts,
+            "thread_ts": "1.0",
+            "text": "please review <@ULOCAL>",
+            "bot_id": "BREMOTE",
+            "subtype": "bot_message",
+        }
+
+    class Client:
+        async def conversations_replies(self, **_kwargs):
+            return {"messages": [mention(ts) for ts in ("1.0", "1.1", "1.2")]}
+
+    async def scenario():
+        agent.set_paused(True)
+        for ts in ("1.0", "1.1"):
+            await agent._on_message({"event_id": f"Ev-{ts}"}, mention(ts), Client(), say)
+        agent.resume()
+        await agent._on_message({"event_id": "Ev-1.2"}, mention("1.2"), Client(), say)
+        await asyncio.gather(*agent._tasks)
+
+    asyncio.run(scenario())
+    assert activated == ["1.2"]
+    assert reactions == [("1.0", "double_vertical_bar"), ("1.1", "double_vertical_bar")]
+    assert len(replies) == 1 and "停止中" in replies[0]
+
+
 def test_human_budget_reset_requires_eligible_mention_but_dm_resets(
     tmp_path, monkeypatch
 ):
@@ -8717,6 +8764,26 @@ def test_restart_sessions_survives_inflight_turn(tmp_path, monkeypatch):
     assert cleared == 1
     assert "C:1" not in agent.sessions
     assert agent.thread_stats.get("C:1") is None
+
+
+def test_first_sweep_runs_right_after_boot(tmp_path, monkeypatch):
+    """monotonic() starts at boot; a young clock must not skip the first sweep."""
+    import multi_app
+
+    agent, _gcfg, _p = _make_agent(
+        tmp_path,
+        monkeypatch,
+        """
+        agents:
+          - name: a
+            persona: x
+            workspace: /ws/a
+        """,
+    )
+    monkeypatch.setattr(multi_app.time, "monotonic", lambda: 1.0)
+    agent._thread_touched["C1:1.0"] = 1.0 - multi_app.THREAD_STATE_TTL_SECONDS * 2
+    agent._sweep_thread_state()
+    assert "C1:1.0" not in agent._thread_touched
 
 
 def test_sweep_forgets_thread_generation(tmp_path, monkeypatch):

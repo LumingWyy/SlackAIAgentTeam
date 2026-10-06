@@ -27,6 +27,7 @@ import os
 import pty
 import re
 import shutil
+import sys
 import tempfile
 from contextvars import ContextVar
 from pathlib import Path
@@ -40,9 +41,11 @@ from control_auth import (
     ControlPrincipal,
     require_slack_human_id,
 )
+from local_config import ensure_agents_config
 from multi_core import (
     canonical_github_repo,
     default_slack_token_env_names,
+    github_repo_from_remote,
 )
 
 logger = logging.getLogger("webui")
@@ -163,13 +166,20 @@ def _entry_owner(
     return owner
 
 
+def _env_node_id() -> str:
+    """AGENT_NODE_ID as multi_app sees it: the process env wins over .env."""
+    return str(
+        os.environ.get("AGENT_NODE_ID")
+        or read_env_file().get("AGENT_NODE_ID")
+        or ""
+    )
+
+
 def _local_entries(raw: dict[str, Any]) -> list[dict[str, Any]]:
     node_cfg = raw.get("node") or {}
     if not isinstance(node_cfg, dict):
         raise RuntimeError("node must be a mapping")
-    node_id = str(
-        node_cfg.get("id") or os.environ.get("AGENT_NODE_ID") or ""
-    ).strip()
+    node_id = str(node_cfg.get("id") or _env_node_id()).strip()
     separate_roster = _roster_path(raw) is not None
     result: list[dict[str, Any]] = []
     for entry in raw.get("agents") or []:
@@ -233,8 +243,7 @@ def _build_webui_authenticator(
     node_cfg = raw.get("node") or {}
     node_id = str(
         (node_cfg.get("id") if isinstance(node_cfg, dict) else "")
-        or os.environ.get("AGENT_NODE_ID")
-        or ""
+        or _env_node_id()
     ).strip()
     local_entries = _local_entries(raw)
     distributed = bool(node_id) or len(local_entries) != len(all_entries)
@@ -512,6 +521,7 @@ async def h_state(request: web.Request) -> web.Response:
                 "persona": entry.get("persona") or "",
                 "card": entry.get("card") or "",
                 "workspace": entry.get("workspace") or "",
+                "github_repo_explicit": str(entry.get("github_repo") or ""),
                 "github_repo": (
                     entry.get("github_repo")
                     if "github_repo" in entry
@@ -554,9 +564,12 @@ async def h_manifest(request: web.Request) -> web.Response:
             persona = (entry.get("persona") or "").strip().splitlines()
             persona = persona[0] if persona else ""
             break
-    return web.Response(
-        text=build_manifest(name, persona), content_type="text/plain"
-    )
+    manifest = build_manifest(name, persona)
+    if request.query.get("format") == "json":
+        # For Slack's prefilled create link:
+        # https://api.slack.com/apps?new_app=1&manifest_json=<url-encoded>
+        return web.json_response({"manifest": yaml.safe_load(manifest)})
+    return web.Response(text=manifest, content_type="text/plain")
 
 
 async def h_validate(request: web.Request) -> web.Response:
@@ -677,6 +690,334 @@ async def h_update_persona(request: web.Request) -> web.Response:
                 entry.pop("card", None)
         write_yaml(raw)
     return web.json_response({"ok": True, "reload": await _admin_reload()})
+
+
+async def _inspect_workspace(path: str) -> dict[str, Any]:
+    """Git facts about a local directory: is it a repo, its branch and origin."""
+    rc, out, _err = await _run(
+        ["git", "-C", path, "rev-parse", "--is-inside-work-tree"], timeout=10
+    )
+    if rc != 0 or out.strip() != "true":
+        return {"git": False, "branch": "", "origin_repo": ""}
+    # symbolic-ref also names the unborn branch of a repo with no commits yet
+    rc, out, _err = await _run(
+        ["git", "-C", path, "symbolic-ref", "--quiet", "--short", "HEAD"], timeout=10
+    )
+    branch = out.strip() if rc == 0 else ""
+    rc, out, _err = await _run(
+        ["git", "-C", path, "remote", "get-url", "origin"], timeout=10
+    )
+    origin = out.strip() if rc == 0 else ""
+    return {
+        "git": True,
+        "branch": branch,
+        "origin_repo": (github_repo_from_remote(origin) or "") if origin else "",
+    }
+
+
+# Folder picking for the workspace editor. A browser cannot hand back an
+# absolute directory path, so the local console either shows the OS folder
+# dialog itself or lists directories for an in-page browser.
+_PICK_LOCK = asyncio.Lock()
+_DIR_LIST_LIMIT = 300
+_MAC_PICK_SCRIPT = (
+    "on run argv",
+    "tell application (path to frontmost application as text)",
+    "activate",
+    "set picked to choose folder with prompt (item 2 of argv) "
+    "default location (POSIX file (item 1 of argv))",
+    "end tell",
+    "return POSIX path of picked",
+    "end run",
+)
+
+
+def _home_dir() -> str:
+    return os.path.realpath(os.path.expanduser("~"))
+
+
+def _display_path(path: str) -> str:
+    """``~/…`` for paths under the home directory, as agents.yaml writes them."""
+    home = _home_dir()
+    if path == home:
+        return "~"
+    if path.startswith(home + os.sep):
+        return "~" + path[len(home):]
+    return path
+
+
+def _start_dir(raw: str) -> str:
+    """An existing directory to open a picker at (falls back to home)."""
+    candidate = os.path.realpath(os.path.expanduser(str(raw or "").strip() or "~"))
+    while candidate and not os.path.isdir(candidate):
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            break
+        candidate = parent
+    return candidate if os.path.isdir(candidate) else _home_dir()
+
+
+def _folder_dialog_argv(start: str, prompt: str) -> list[str] | None:
+    """Command that shows the OS folder dialog, or None when there is none."""
+    if sys.platform == "darwin" and shutil.which("osascript"):
+        argv = ["osascript"]
+        for line in _MAC_PICK_SCRIPT:
+            argv += ["-e", line]
+        return argv + [start, prompt]
+    if sys.platform.startswith("linux") and os.environ.get("DISPLAY"):
+        if shutil.which("zenity"):
+            return ["zenity", "--file-selection", "--directory",
+                    f"--title={prompt}", f"--filename={start}/"]
+        if shutil.which("kdialog"):
+            return ["kdialog", "--getexistingdirectory", start, "--title", prompt]
+    return None
+
+
+async def h_pick_dir(request: web.Request) -> web.Response:
+    """Show the OS folder dialog on this machine and return the chosen path."""
+    body = await request.json() if request.can_read_body else {}
+    start = _start_dir(str((body or {}).get("start") or ""))
+    argv = _folder_dialog_argv(start, "Choose the agent workspace")
+    if argv is None:
+        return web.json_response({"ok": False, "error": "unavailable"})
+    if _PICK_LOCK.locked():
+        return web.json_response({"ok": False, "error": "busy"})
+    async with _PICK_LOCK:
+        rc, out, _err = await _run(argv, timeout=300)
+    path = out.strip().rstrip(os.sep) or ""
+    if rc != 0 or not path:
+        # cancel (osascript -128 / zenity 1) or timeout
+        return web.json_response({"ok": False, "error": "cancelled"})
+    path = os.path.realpath(path)
+    return web.json_response({"ok": True, "path": _display_path(path)})
+
+
+async def h_list_dirs(request: web.Request) -> web.Response:
+    """Subdirectories of one directory under home, for the in-page browser.
+
+    Names only, never file contents; hidden directories are skipped and
+    anything outside the home directory is refused.
+    """
+    home = _home_dir()
+    path = os.path.realpath(os.path.expanduser(request.query.get("path") or "~"))
+    if path != home and not path.startswith(home + os.sep):
+        return web.json_response({"ok": False, "error": "outside home directory"})
+    if not os.path.isdir(path):
+        return web.json_response({"ok": False, "error": "directory does not exist"})
+    dirs: list[dict[str, Any]] = []
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.name.startswith(".") or not entry.is_dir(follow_symlinks=False):
+                    continue
+                dirs.append(
+                    {
+                        "name": entry.name,
+                        "path": _display_path(entry.path),
+                        "git": os.path.exists(os.path.join(entry.path, ".git")),
+                    }
+                )
+    except OSError:
+        return web.json_response({"ok": False, "error": "directory is not readable"})
+    dirs.sort(key=lambda item: item["name"].lower())
+    parent = os.path.dirname(path)
+    return web.json_response(
+        {
+            "ok": True,
+            "path": _display_path(path),
+            "parent": _display_path(parent) if path != home else "",
+            "git": os.path.exists(os.path.join(path, ".git")),
+            "dirs": dirs[:_DIR_LIST_LIMIT],
+            "truncated": len(dirs) > _DIR_LIST_LIMIT,
+            "picker": _folder_dialog_argv(path, "") is not None,
+        }
+    )
+
+
+_REPO_LIST_LIMIT = 200
+
+
+async def _gh_status() -> dict[str, Any]:
+    """Whether this machine has gh and which account it is signed in as."""
+    rc, out, err = await _run(["gh", "api", "user", "--jq", ".login"], timeout=15)
+    if rc == -1 and err.endswith("not found"):
+        return {"installed": False, "logged_in": False, "login": ""}
+    login = out.strip() if rc == 0 else ""
+    return {"installed": True, "logged_in": bool(login), "login": login}
+
+
+async def h_github_status(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True, **await _gh_status()})
+
+
+def _gh_error(err: str, rc: int) -> str:
+    if rc == -1:
+        return "gh is not installed or timed out"
+    line = (err or "").strip().splitlines()
+    return (line[-1] if line else "gh failed")[:200]
+
+
+async def h_github_repos(request: web.Request) -> web.Response:
+    """Repositories the local gh account can see, for the repo picker.
+
+    ``owner`` picks a user/org (default: the signed-in user); the response
+    also lists the owners to switch between.
+    """
+    gh = await _gh_status()
+    if not gh["logged_in"]:
+        return web.json_response({"ok": False, "gh": gh,
+            "error": "gh is not installed" if not gh["installed"] else "gh is not signed in"})
+    login = gh["login"]
+    rc, out, _err = await _run(
+        ["gh", "api", "user/orgs", "--jq", ".[].login"], timeout=15
+    )
+    owners = [login] + (
+        [line.strip() for line in out.splitlines() if line.strip()] if rc == 0 else []
+    )
+    owner = str(request.query.get("owner") or login).strip()
+    if owner not in owners:
+        return web.json_response({"ok": False, "error": "unknown owner", "owners": owners})
+    rc, out, err = await _run(
+        [
+            "gh", "repo", "list", owner,
+            "--limit", str(_REPO_LIST_LIMIT),
+            "--json", "nameWithOwner,description,isPrivate,isArchived,updatedAt",
+        ],
+        timeout=30,
+    )
+    if rc != 0:
+        return web.json_response(
+            {"ok": False, "error": _gh_error(err, rc), "owners": owners, "owner": owner}
+        )
+    try:
+        items = json.loads(out or "[]")
+    except ValueError:
+        return web.json_response({"ok": False, "error": "gh returned malformed JSON"})
+    repos = [
+        {
+            "name": str(item.get("nameWithOwner") or ""),
+            "description": str(item.get("description") or "")[:200],
+            "private": bool(item.get("isPrivate")),
+            "archived": bool(item.get("isArchived")),
+            "updated": str(item.get("updatedAt") or ""),
+        }
+        for item in items
+        if isinstance(item, dict) and item.get("nameWithOwner")
+    ]
+    repos.sort(key=lambda repo: repo["updated"], reverse=True)
+    return web.json_response(
+        {"ok": True, "owner": owner, "owners": owners, "repos": repos}
+    )
+
+
+async def h_github_create_repo(request: web.Request) -> web.Response:
+    """Create one GitHub repository (private unless asked) with the local gh."""
+    body = await request.json()
+    try:
+        repo = canonical_github_repo(str(body.get("repo") or "").strip())
+    except ValueError:
+        return web.json_response({"ok": False, "error": "repo must be OWNER/REPO"})
+    visibility = "--public" if body.get("public") else "--private"
+    rc, out, err = await _run(["gh", "repo", "create", repo, visibility], timeout=60)
+    if rc != 0:
+        return web.json_response({"ok": False, "error": _gh_error(err, rc)})
+    url = next(
+        (line.strip() for line in out.splitlines() if line.strip().startswith("https://")),
+        f"https://github.com/{repo}",
+    )
+    return web.json_response({"ok": True, "repo": repo, "url": url})
+
+
+async def _repo_reachable(repo: str) -> bool | None:
+    """Whether the local gh account can see ``repo``; None when unknown."""
+    if not repo:
+        return None
+    rc, _out, _err = await _run(
+        ["gh", "repo", "view", repo, "--json", "nameWithOwner"], timeout=15
+    )
+    if rc == -1:  # gh missing or timed out
+        return None
+    return rc == 0
+
+
+async def h_update_workspace(request: web.Request) -> web.Response:
+    """Check (``dry_run``) or save one agent's local workspace and GitHub repo.
+
+    ``github_repo`` omitted leaves the setting alone; an empty string clears
+    the agent's own value so it inherits defaults / github.repo again. The
+    response reports what the directory's git origin points at, and whether
+    it disagrees with the effective repo (preflight would disable GitHub).
+    """
+    name = request.match_info["name"]
+    if not NAME_RE.match(name):
+        raise web.HTTPBadRequest(text="invalid name")
+    raw = read_yaml()
+    if _require_agent_access(request, name, raw) is None:
+        return web.json_response({"ok": False, "error": "unknown agent"})
+    body = await request.json()
+    workspace = str(body.get("workspace") or "").strip()
+    if not workspace:
+        return web.json_response({"ok": False, "error": "workspace is required"})
+    expanded = os.path.expanduser(workspace)
+    if not os.path.isabs(expanded):
+        return web.json_response(
+            {"ok": False, "error": "use an absolute path or ~/…"}
+        )
+    path = os.path.realpath(expanded)
+    if not os.path.isdir(path):
+        return web.json_response(
+            {"ok": False, "error": "directory does not exist", "path": path}
+        )
+    repo_given = "github_repo" in body
+    repo = str(body.get("github_repo") or "").strip()
+    if repo:
+        try:
+            repo = canonical_github_repo(repo)
+        except ValueError:
+            return web.json_response(
+                {"ok": False, "error": "github_repo must be OWNER/REPO"}
+            )
+    entry = _require_agent_access(request, name, raw) or {}
+    defaults = raw.get("defaults") or {}
+    inherited = str(
+        defaults.get("github_repo", (raw.get("github") or {}).get("repo")) or ""
+    )
+    if repo_given:
+        effective = repo or inherited
+    else:
+        effective = str(entry.get("github_repo") or inherited)
+    facts, gh = await asyncio.gather(_inspect_workspace(path), _gh_status())
+    # an unsigned gh cannot see any repo: report that, not "repo unreachable"
+    reachable = await _repo_reachable(effective) if gh["logged_in"] else None
+    result: dict[str, Any] = {
+        "ok": True,
+        "path": path,
+        **facts,
+        "gh": gh,
+        "github_repo": effective,
+        "repo_reachable": reachable,
+        "mismatch": bool(
+            facts["origin_repo"]
+            and effective
+            and facts["origin_repo"].lower() != effective.lower()
+        ),
+    }
+    if body.get("dry_run"):
+        return web.json_response(result)
+    async with _CONFIG_LOCK:
+        raw = read_yaml()
+        entry = _require_agent_access(request, name, raw)
+        if entry is None:
+            return web.json_response({"ok": False, "error": "unknown agent"})
+        entry["workspace"] = workspace
+        if repo_given:
+            if repo:
+                entry["github_repo"] = repo
+            else:
+                entry.pop("github_repo", None)
+        write_yaml(raw)
+    result["reload"] = await _admin_reload()
+    return web.json_response(result)
 
 
 def _anthropic_key() -> str:
@@ -997,8 +1338,12 @@ async def h_live_state(request: web.Request) -> web.Response:
 
 
 ISSUES_CACHE_TTL_SECONDS = 30.0
+# "Refresh now" skips the cache, but never re-runs gh more often than this.
+ISSUES_MIN_REFRESH_SECONDS = 5.0
 ISSUES_CACHE_MAX = 64
 _issues_cache: dict[str, Any] = {}
+# cache key -> the gh fetch already running for it (singleflight)
+_issues_inflight: dict[str, asyncio.Future] = {}
 
 
 def _configured_github_repos(
@@ -1105,16 +1450,82 @@ async def _gh_issues(repo: str) -> tuple[list[dict], str]:
     return issues, ""
 
 
+def _starts_on_this_node(
+    entry: dict[str, Any],
+    defaults: dict[str, Any],
+    env: dict[str, str],
+    local_names: set[str],
+) -> bool:
+    """Whether multi_app on this node would start ``entry`` (mirrors startup).
+
+    Remote entries never run here; an optional entry is skipped when a Slack
+    token, or an OpenAI runtime's key / base URL, is missing.
+    """
+    if entry.get("name") not in local_names:
+        return False
+    if not entry.get("optional"):
+        return True
+
+    def present(name: str) -> bool:
+        return bool(env.get(name) or os.environ.get(name))
+
+    if not all(present(name) for name in token_env_names(entry, defaults)):
+        return False
+    runtime = str(
+        entry.get("runtime") or defaults.get("runtime") or "claude"
+    ).strip().lower()
+    if runtime != "openai":
+        return True
+    key_env = (
+        entry.get("openai_api_key_env")
+        or defaults.get("openai_api_key_env")
+        or "OPENAI_API_KEY"
+    )
+    return present(key_env) or bool(
+        _resolve_openai_base_url(entry, defaults, env)
+    )
+
+
+async def _fetch_issues_payload(repos: list[str]) -> dict[str, Any]:
+    import time as _t
+
+    results = await asyncio.gather(*(_gh_issues(repo) for repo in repos))
+    issues: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for repo, (repo_issues, error) in zip(repos, results):
+        issues.extend({**issue, "repo": repo} for issue in repo_issues)
+        if error:
+            errors.append({"repo": repo, "error": error})
+    return {
+        "repo": ", ".join(repos),
+        "repos": repos,
+        "issues": issues,
+        "error": "; ".join(f"{e['repo']}: {e['error']}" for e in errors),
+        "errors": errors,
+        "fetched_at": int(_t.time()),
+    }
+
+
 async def h_issues(request: web.Request) -> web.Response:
-    """Monitor open issues across every effective per-agent repo (30s cache)."""
+    """Monitor open issues across the repos of agents this node runs (30s cache).
+
+    ``?refresh=1`` bypasses the cache (at most every 5s). One repo failing
+    never hides the others: ``errors`` lists each failure next to the issues.
+    """
     import time as _t
 
     try:
         raw = read_yaml()
-        repos = _configured_github_repos(
-            raw, _visible_entries(request, raw)
-        )
-    except ValueError as exc:
+        defaults = raw.get("defaults") or {}
+        env = read_env_file()
+        local_names = {entry.get("name") for entry in _local_entries(raw)}
+        entries = [
+            entry
+            for entry in _visible_entries(request, raw)
+            if _starts_on_this_node(entry, defaults, env, local_names)
+        ]
+        repos = _configured_github_repos(raw, entries)
+    except (ValueError, RuntimeError) as exc:
         return web.json_response(
             {"repo": "", "repos": [], "issues": [], "error": str(exc)}
         )
@@ -1137,7 +1548,9 @@ async def h_issues(request: web.Request) -> web.Response:
         _issues_cache.pop(key, None)
     cache_key = "\0".join(repos)
     c = _issues_cache.get(cache_key)
-    if c and now - c["t"] < ISSUES_CACHE_TTL_SECONDS:
+    refresh = request is not None and request.query.get("refresh") == "1"
+    max_age = ISSUES_MIN_REFRESH_SECONDS if refresh else ISSUES_CACHE_TTL_SECONDS
+    if c and now - c["t"] < max_age:
         return web.json_response(c["payload"])
     if not shutil.which("gh"):
         return web.json_response(
@@ -1148,19 +1561,20 @@ async def h_issues(request: web.Request) -> web.Response:
                 "error": "gh not installed",
             }
         )
-    results = await asyncio.gather(*(_gh_issues(repo) for repo in repos))
-    issues: list[dict[str, Any]] = []
-    errors: list[str] = []
-    for repo, (repo_issues, error) in zip(repos, results):
-        issues.extend({**issue, "repo": repo} for issue in repo_issues)
-        if error:
-            errors.append(f"{repo}: {error}")
-    payload = {
-        "repo": ", ".join(repos),
-        "repos": repos,
-        "issues": issues,
-        "error": "; ".join(errors),
-    }
+    # Requests that miss the cache together (several pages, auto refresh and
+    # "refresh now") share one fetch instead of each running gh per repo.
+    inflight = _issues_inflight.get(cache_key)
+    if inflight is None:
+        inflight = asyncio.ensure_future(_fetch_issues_payload(repos))
+        _issues_inflight[cache_key] = inflight
+
+        def _done(future: asyncio.Future, key: str = cache_key) -> None:
+            if _issues_inflight.get(key) is future:
+                _issues_inflight.pop(key, None)
+
+        inflight.add_done_callback(_done)
+    # shield: one client going away must not cancel the fetch the others await
+    payload = await asyncio.shield(inflight)
     _issues_cache[cache_key] = {"t": now, "payload": payload}
     while len(_issues_cache) > ISSUES_CACHE_MAX:
         oldest = min(
@@ -1175,18 +1589,29 @@ CHANNEL_RULES_TEMPLATE = BASE_DIR / "channel-rules-template.md"
 
 
 async def h_channel_rules(request: web.Request) -> web.Response:
-    """Shared channel-rules template (for Slack topic/purpose); fill {{repo}} from config."""
+    """Shared channel-rules template (Slack topic/purpose); fills in the repo.
+
+    The repo is the one the agents actually use (per-agent github_repo, else
+    the shared default), filled in only when that is a single repo.
+    """
     try:
         text = CHANNEL_RULES_TEMPLATE.read_text(encoding="utf-8")
     except OSError:
         return web.json_response({"template": "", "error": "template not found"})
-    repo = (read_yaml().get("github") or {}).get("repo") or ""
+    raw = read_yaml()
+    try:
+        repos = _configured_github_repos(raw, _visible_entries(request, raw))
+    except ValueError:
+        repos = []
+    repo = repos[0] if len(repos) == 1 else ""
     if repo:
         text = text.replace("{{OWNER/REPO}}", repo)
     return web.json_response({"template": text, "repo": repo, "error": ""})
 
 
-async def _admin_post(path: str, body: dict) -> tuple[dict, int]:
+async def _admin_post(
+    path: str, body: dict, *, timeout: float = 5
+) -> tuple[dict, int]:
     """POST to the running multi_app admin API; returns (json, status).
 
     Connection failure → ({ok: False, error}, 502) so callers can degrade gracefully.
@@ -1203,7 +1628,7 @@ async def _admin_post(path: str, body: dict) -> tuple[dict, int]:
                 f"{ADMIN_BASE}{path}",
                 json=body,
                 headers=headers,
-                timeout=5,
+                timeout=timeout,
             ) as resp:
                 return await resp.json(), resp.status
     except Exception as exc:
@@ -1317,6 +1742,34 @@ async def h_live_restart(request: web.Request) -> web.Response:
     _require_agent_access(request, name, read_yaml())
     data, status = await _admin_post(f"/agents/{name}/restart", {})
     return web.json_response(data, status=status)
+
+
+async def _live_agent_action(
+    request: web.Request, action: str, *, timeout: float = 5
+) -> web.Response:
+    name = request.match_info["name"]
+    if not NAME_RE.match(name):
+        raise web.HTTPBadRequest(text="invalid name")
+    _require_agent_access(request, name, read_yaml())
+    data, status = await _admin_post(
+        f"/agents/{name}/{action}", {}, timeout=timeout
+    )
+    return web.json_response(data, status=status)
+
+
+async def h_live_stop(request: web.Request) -> web.Response:
+    """Stop an agent: running work is cancelled, new work refused until resumed."""
+    # multi_app waits up to STOP_WAIT_SECONDS (20s) for cancelled work.
+    return await _live_agent_action(request, "stop", timeout=30)
+
+
+async def h_live_resume(request: web.Request) -> web.Response:
+    return await _live_agent_action(request, "resume")
+
+
+async def h_live_slack_identity(request: web.Request) -> web.Response:
+    """Re-read what Slack shows for the agent's bot (display name, username, app)."""
+    return await _live_agent_action(request, "slack-identity")
 
 
 async def h_live_remove_worktree(request: web.Request) -> web.Response:
@@ -2386,7 +2839,12 @@ a:hover{text-decoration-color:var(--accent)}
 /* tracked issues */
 .irow{display:grid;grid-template-columns:auto 1fr auto auto;gap:14px;align-items:center;padding:9px 2px;
   border-top:1px solid var(--line);font-size:.88rem}
-.irow:first-child{border-top:0}
+.irow:first-child,.ierr+.irow{border-top:0}
+.ierr{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;padding:8px 10px;margin:2px 0 8px;font-size:.8rem;
+  color:var(--ink-2);border-radius:var(--r-sm);background:color-mix(in oklch,var(--warn) 9%,transparent);
+  border:1px solid color-mix(in oklch,var(--warn) 32%,var(--line))}
+.ierr-repo{font-family:var(--mono);font-size:.72rem;color:var(--ink)}
+#issues-refresh:disabled{cursor:progress;color:var(--faint)}
 .inum{font-family:var(--mono);font-size:.74rem;color:var(--accent-ink);padding:2px 7px;border-radius:var(--pill);
   background:var(--accent-wash);text-decoration:none}
 .ititle{color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -2410,6 +2868,12 @@ a:hover{text-decoration-color:var(--accent)}
 @keyframes rail{from{background-position:100% 0}to{background-position:-100% 0}}
 .state.idle{color:var(--good);background:oklch(0.6 0.13 152 / 0.12)}.state.idle::before{background:var(--good)}
 .state.off{color:var(--crit);background:oklch(0.59 0.2 27 / 0.12)}.state.off::before{background:var(--crit)}
+.state.paused{color:var(--ink-2);background:var(--tile)}.state.paused::before{border-radius:1.5px;background:var(--ink-2)}
+.btn.line.stop{color:var(--crit)}
+.slackid{align-items:baseline;flex-wrap:wrap}.slackname{font-weight:600;color:var(--ink)}
+.nm-id{font-family:var(--mono);font-size:.72rem;color:var(--faint);padding:1px 6px;border:1px solid var(--line);
+  border-radius:var(--pill);white-space:nowrap}
+.btn.line.stop:hover{border-color:color-mix(in oklch,var(--crit) 45%,var(--line-2))}
 .rtline{font-family:var(--mono);font-size:.76rem;color:var(--ink-2)}
 .node .aux{margin-left:auto;font-family:var(--mono);font-size:.72rem;color:var(--faint)}
 
@@ -2516,6 +2980,54 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
 .grid2 .lbl{display:block;margin-bottom:6px}
 .foot{padding:44px 0 24px;color:var(--faint);font-family:var(--mono);font-size:.7rem;letter-spacing:.06em;text-align:center;
   text-transform:uppercase}
+/* local workspace row on each agent card */
+.wsrow{display:flex;align-items:center;gap:8px 12px;flex-wrap:wrap;margin-top:14px;padding:12px 14px;border-radius:var(--r-lg);
+  background:var(--bg);border:1px solid var(--line)}
+.wsrow .btn{margin-left:auto}
+.state.warn{color:var(--warn);background:oklch(0.7 0.14 72 / 0.12)}.state.warn::before{background:var(--warn)}
+.wspath{font-family:var(--mono);font-size:.8rem;color:var(--ink);overflow-wrap:anywhere}
+.wspath .faint{color:var(--faint)}
+.wsedit{margin-top:12px;padding:16px;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--bg)}
+.wsedit[hidden]{display:none}
+.ctl .wsedit{grid-column:1/-1;margin-top:0}
+.wspick{display:flex;gap:6px;align-items:center}
+.wspick input{flex:1;min-width:0}
+.wspick .btn{padding:8px 11px}
+.dirbrowser{margin-top:10px;border:1px solid var(--line);border-radius:var(--r-lg);background:var(--surface);overflow:hidden}
+.dirbrowser[hidden]{display:none}
+.dirbrowser .dirbar{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid var(--line)}
+.dirbrowser .dirpath{flex:1;min-width:0;font-family:var(--mono);font-size:.76rem;color:var(--ink);overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.dirbrowser .dirlist{max-height:240px;overflow:auto;padding:4px}
+.dirbrowser .dir{appearance:none;display:flex;align-items:center;gap:8px;width:100%;border:0;background:transparent;
+  padding:7px 10px;border-radius:var(--r);font-family:var(--mono);font-size:.78rem;color:var(--ink-2);cursor:pointer;text-align:left}
+.dirbrowser .dir:hover,.dirbrowser .dir:focus-visible{background:var(--tile);color:var(--ink)}
+.dirbrowser .dir[hidden]{display:none}
+.dirbrowser .dir::before{content:"";width:12px;height:9px;flex:none;border:1.5px solid var(--faint);border-radius:2px}
+.dirbrowser .dir.git::before{border-color:var(--accent);background:var(--accent-wash)}
+.dirbrowser .dir .chip{margin-left:auto}
+.dirbrowser .empty{padding:10px 12px}
+.dirbrowser .dirbar select,.dirbrowser .dirbar input{width:auto;padding:5px 9px;font-size:.8rem}
+.dirbrowser .dirbar select{padding-right:28px}
+.dirbrowser .dirbar input{flex:1;min-width:120px}
+.dirbrowser .repo{flex-wrap:wrap;row-gap:2px}
+.dirbrowser .repo::before{display:none}
+.dirbrowser .repo .desc{flex-basis:100%;font-family:var(--sans);font-size:.72rem;color:var(--faint);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.dirbrowser .repo.archived{opacity:.6}
+.repoask{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap;font-family:var(--sans);color:var(--ink)}
+.wsedit.open{animation:rise .35s var(--out) both}
+.wsinfo{display:flex;align-items:center;gap:6px 10px;flex-wrap:wrap;font-family:var(--mono);font-size:.74rem;color:var(--muted);margin-top:12px}
+.wsinfo:empty{display:none}
+.wsinfo .warn{color:var(--warn)}.wsinfo .ng{color:var(--crit)}.wsinfo .ok{color:var(--good)}
+/* control token: asked in place, only after the server said it needs one */
+.unlock{display:none;margin-top:18px;padding:16px 18px;border-radius:var(--r-lg);background:var(--accent-wash);
+  border:1px solid color-mix(in oklch,var(--accent) 30%,var(--line))}
+.unlock.on{display:block;animation:armIn .5s var(--spring) both}
+.unlock .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+.unlock .row input{flex:1;min-width:220px;max-width:420px}
+.unlock b{font-family:var(--display);font-weight:600;font-size:1rem}
+.unlock .msg{margin-top:8px}
 #cx-code,#gh-code{font-family:var(--mono)!important;font-size:1.4rem!important;letter-spacing:.18em!important;
   color:var(--ink)!important;font-weight:600!important;display:inline-block;padding:8px 14px;border-radius:var(--r);
   background:var(--tile);box-shadow:var(--apple)}
@@ -2606,6 +3118,15 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
 @keyframes nudge{0%{transform:none}35%{transform:translateX(3px)}100%{transform:none}}
 .guide-evidence li+li{margin-top:5px}
 .guide-actions{display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.guide-join{margin-top:18px;padding:16px 18px;border-radius:var(--r-lg);border:1px dashed var(--line-2)}
+.guide-join h3{font-size:.95rem;font-weight:600;color:var(--ink)}
+.guide-join>p{color:var(--ink-2);font-size:.86rem;margin-top:4px;max-width:66ch}
+.guide-join ol{list-style:none;padding:0;margin-top:12px;counter-reset:join;display:grid;gap:7px;
+  font-size:.88rem;color:var(--ink-2);max-width:72ch}
+.guide-join li{counter-increment:join;display:grid;grid-template-columns:1.9em minmax(0,1fr);gap:6px}
+.guide-join li::before{content:counter(join,decimal-leading-zero);font-family:var(--mono);font-size:.7rem;
+  color:var(--accent-ink);padding-top:.25em}
+.guide-join>p.tip{margin-top:12px;font-size:.82rem;color:var(--muted)}
 .prompt-stack{margin-top:18px;display:grid;gap:8px}
 .prompt-row{border:1px solid var(--line);border-radius:var(--r-lg);background:var(--surface);overflow:hidden}
 .prompt-row summary{display:flex;align-items:center;gap:10px;cursor:pointer;padding:9px 10px 9px 14px;color:var(--ink);
@@ -2696,6 +3217,16 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
 </div></header>
 
 <main class="wrap">
+  <div class="unlock" id="unlock" role="region" aria-labelledby="unlock-title">
+    <b id="unlock-title" data-i18n="unlock.title">需要控制令牌</b>
+    <div class="sub" data-i18n="unlock.hint">这个节点启用了控制认证。</div>
+    <div class="row">
+      <input id="unlock-token" type="password" autocomplete="off" spellcheck="false" placeholder="Bearer token"
+        onkeydown="if(event.key==='Enter')unlockControl()">
+      <button class="btn solid" onclick="unlockControl()" data-i18n="unlock.save">解锁</button>
+    </div>
+    <div class="msg ng" id="unlock-msg"></div>
+  </div>
   <section id="panel-guide" class="panel on">
     <div class="guide-hero">
       <div class="guide-kicker" data-i18n="guide.kicker">START HERE · OWNER RUNBOOK</div>
@@ -2738,12 +3269,12 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
             <label class="guide-done"><input type="checkbox" data-guide-check="roles">
               <span data-i18n="guide.done">标记完成</span></label>
           </div>
-          <p class="body" data-i18n="guide.roles.body">每人保留 2–3 个 agent。dev 写代码，reviewer 独立审查，planner/pm 只拆任务；OpenAI agent 默认没有本地文件工具。</p>
+          <p class="body" data-i18n="guide.roles.body">每人保留 2–3 个 agent。developer 写代码，reviewer 独立审查，planner/pm 只拆任务；OpenAI agent 默认没有本地文件工具。</p>
           <table class="agent-guide">
             <thead><tr><th data-i18n="guide.agent.role">角色</th><th>runtime</th>
               <th data-i18n="guide.agent.must">必须做到</th><th data-i18n="guide.agent.never">不要做</th></tr></thead>
             <tbody>
-              <tr><td>dev</td><td class="runtime" data-guide-label-key="lbl.runtime">Claude / Codex</td>
+              <tr><td>developer</td><td class="runtime" data-guide-label-key="lbl.runtime">Claude / Codex</td>
                 <td data-guide-label-key="guide.agent.must" data-i18n="guide.dev.must">确认完成标准；实现并测试；commit、push、贴 PR；只交给一个 reviewer。</td>
                 <td class="never" data-guide-label-key="guide.agent.never" data-i18n="guide.dev.never">不要在别人的节点登录；不要把未 push 的本地路径当成交付物。</td></tr>
               <tr><td>reviewer</td><td class="runtime" data-guide-label-key="lbl.runtime">不同模型优先</td>
@@ -2781,9 +3312,25 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
               <ul><li><span data-i18n="guide.slack.do1">在「团队构成」为本机每个 agent 复制 manifest</span></li>
                 <li><span data-i18n="guide.slack.do2">Install to Workspace，粘贴并验证 Bot/App Token</span></li>
                 <li><span data-i18n="guide.slack.do3">邀请全部本地与远端 bot 进入共享项目频道</span></li>
+                <li><span data-i18n="guide.slack.do5">也可以在 Claude Code 里运行 /slack-app-setup，由 agent 操作浏览器完成，只在关键步骤请你确认</span></li>
                 <li><span data-i18n="guide.slack.do4">把频道规则贴到 topic/说明：一任务一线程、一次只叫一个 agent</span></li></ul></div>
-            <div class="guide-actions"><button class="btn line" onclick="showTab('cfg')" data-i18n="guide.goto.slack">去设置 Slack App</button></div>
+            <div class="guide-actions"><a class="btn line" href="https://api.slack.com/apps" target="_blank" rel="noopener noreferrer"><span data-i18n="guide.open.slack">打开 api.slack.com/apps</span> ↗</a>
+              <button class="btn line" onclick="showTab('cfg')" data-i18n="guide.goto.slack">去设置 Slack App</button></div>
           </div>
+          <section class="guide-join" aria-labelledby="guide-join-title">
+            <h3 id="guide-join-title" data-i18n="guide.join.title">把你新建的 agent 加进 Slack</h3>
+            <p data-i18n="guide.join.sub">在「构成」新增的 agent，要有自己的 Slack App、重启上线并被邀请进频道，才能在 Slack 里被 @。每个新 agent 做一遍：</p>
+            <ol>
+              <li data-i18n="guide.join.s1">「构成」→「新增 agent」：填名字（如 qa）和 workspace，保存</li>
+              <li data-i18n="guide.join.s2">在它的卡片点「设置」→「用此 manifest 在 Slack 创建」→ 选择 workspace → Create → Install to Workspace → 允许</li>
+              <li data-i18n="guide.join.s3">在该 App 的 Basic Information → App-Level Tokens → Generate Token and Scopes，添加 connections:write，生成后复制 xapp-…</li>
+              <li data-i18n="guide.join.s4">在 OAuth &amp; Permissions 复制 Bot User OAuth Token（xoxb-…）；两个 token 粘贴回卡片，点「验证并写入 .env」</li>
+              <li data-i18n="guide.join.s5">重启 multi_app（新增 agent 必须重启才会上线）；「监视」里它显示已连接</li>
+              <li data-i18n="guide.join.s6">在 Slack 打开项目频道，发送 /invite @agent名（例如 /invite @qa）；或点频道名 → 集成 → 添加应用</li>
+              <li data-i18n="guide.join.s7">在频道里 @它 发一句测试：消息挂上 ⏳ 表示在处理，✅ 表示完成，回复在该消息的线程里</li>
+            </ol>
+            <p class="tip" data-i18n="guide.join.tip">@ 时找不到它：App 还没安装到这个 workspace。@ 了没反应：确认它在频道成员里、multi_app 已重启、「监视」里显示已连接。也可以在 Slack 左侧「应用」里找到它直接私信，私信不用 @。</p>
+          </section>
           <div class="prompt-stack">
             <details class="prompt-row"><summary><span data-i18n="guide.prompt.channel">Slack 频道规则模板</span>
               <button class="btn text copy-btn" onclick="event.preventDefault();copyGuidePrompt('channel')"><span class="ic-wrap" aria-hidden="true"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><span data-i18n="guide.copy">复制</span></button></summary>
@@ -2802,13 +3349,15 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
               <span data-i18n="guide.done">标记完成</span></label>
           </div>
           <p class="body" data-i18n="guide.local.body">登录本人 Claude/Codex/GitHub，OpenAI Key 只放本机 env；创建独立 workspace、state 和 worktree volume。绝不挂载另一位 owner 的认证目录。</p>
+          <p class="body" data-i18n="guide.local.ws">workspace 是 agent 读写代码的本机目录，必须是目标 GitHub 仓库的 clone（origin 指向 agent 的 OWNER/REPO）。</p>
           <div class="guide-evidence">
             <div><h3 data-i18n="guide.evidence">完成证据</h3>
               <ul><li><span data-i18n="guide.local.ev1">「认证」显示所选 runtime 与 GitHub 已验证</span></li>
                 <li><span data-i18n="guide.local.ev2">本机 env 只含本人 Slack Token、控制 Bearer 和 AI Key</span></li>
-                <li><span data-i18n="guide.local.ev3">仓库 origin 与 agent 的 canonical OWNER/REPO 一致</span></li></ul></div>
-            <div class="guide-actions"><button class="btn solid" onclick="showTab('auth')" data-i18n="guide.goto.auth">去认证</button>
-              <button class="btn line" onclick="showTab('cfg')" data-i18n="guide.goto.cfg">去团队构成</button></div>
+                <li><span data-i18n="guide.local.ev3">仓库 origin 与 agent 的 canonical OWNER/REPO 一致</span></li>
+                <li><span data-i18n="guide.local.ev4">每张 agent 卡片的 workspace 显示「就绪」</span></li></ul></div>
+            <div class="guide-actions"><button class="btn solid" onclick="openWorkspaceSettings()" data-i18n="guide.goto.ws">去设置 workspace</button>
+              <button class="btn line" onclick="showTab('auth')" data-i18n="guide.goto.auth">去认证</button></div>
           </div>
         </div>
       </li>
@@ -2824,7 +3373,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
           </div>
           <p class="body" data-i18n="guide.prompts.body">card 让队友知道何时找它、交什么、拿回什么；persona 约束它如何工作。推荐模板可复制后按项目改写。</p>
           <div class="prompt-stack">
-            <details class="prompt-row"><summary><span data-i18n="guide.prompt.dev">dev persona 推荐</span>
+            <details class="prompt-row"><summary><span data-i18n="guide.prompt.dev">developer persona 推荐</span>
               <button class="btn text copy-btn" onclick="event.preventDefault();copyGuidePrompt('dev')"><span class="ic-wrap" aria-hidden="true"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><span data-i18n="guide.copy">复制</span></button></summary>
               <pre data-guide-prompt="dev"></pre></details>
             <details class="prompt-row"><summary><span data-i18n="guide.prompt.reviewer">reviewer persona 推荐</span>
@@ -2837,7 +3386,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
           <div class="guide-evidence">
             <div><h3 data-i18n="guide.evidence">完成证据</h3>
               <ul><li><span data-i18n="guide.prompts.ev1">每个 card 能在 6 行内说清输入、输出和禁区</span></li>
-                <li><span data-i18n="guide.prompts.ev2">reviewer 与 dev 使用独立验证标准，OpenAI persona 明示无本地工具</span></li></ul></div>
+                <li><span data-i18n="guide.prompts.ev2">reviewer 与 developer 使用独立验证标准，OpenAI persona 明示无本地工具</span></li></ul></div>
             <div class="guide-actions"><button class="btn line" onclick="showTab('cfg')" data-i18n="guide.goto.prompt">去编辑 Prompt</button></div>
           </div>
         </div>
@@ -2852,7 +3401,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
             <label class="guide-done"><input type="checkbox" data-guide-check="first-task">
               <span data-i18n="guide.done">标记完成</span></label>
           </div>
-          <p class="body" data-i18n="guide.task.body">人类给一个明确任务；dev 在本地 worktree 实现并产出 PR；reviewer 独立验证。跨机器只传 Slack 上下文和 durable artifact。</p>
+          <p class="body" data-i18n="guide.task.body">人类给一个明确任务；developer 在本地 worktree 实现并产出 PR；reviewer 独立验证。跨机器只传 Slack 上下文和 durable artifact。</p>
           <div class="prompt-stack">
             <details class="prompt-row" open><summary><span data-i18n="guide.prompt.task">人类启动任务模板</span>
               <button class="btn text copy-btn" onclick="event.preventDefault();copyGuidePrompt('task')"><span class="ic-wrap" aria-hidden="true"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><span data-i18n="guide.copy">复制</span></button></summary>
@@ -2903,7 +3452,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
       <div class="seccap"><span data-i18n="tasks.title">注目タスク</span>
         <span class="src" id="tasks-repo"></span>
         <span style="flex:1"></span>
-        <button class="linkbtn" onclick="loadIssues()" data-i18n="sw.now">今すぐ更新</button></div>
+        <button class="linkbtn" id="issues-refresh" onclick="loadIssues(true)" data-i18n="sw.now">今すぐ更新</button></div>
       <div id="issues"></div>
     </div>
     <div class="seccap" style="margin-top:26px"><span data-i18n="agents.title">エージェント</span></div>
@@ -2913,13 +3462,6 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
   <section id="panel-cfg" class="panel">
     <div class="lede"><h1 data-i18n="cfg.title">チーム構成</h1>
       <div class="sub" data-i18n="cfg.sub">agents.yaml と .env の編集。保存すると稼働中の multi_app に自動反映されます（agent の追加/削除は再起動が必要）。</div></div>
-    <div class="card">
-      <div class="head"><span class="nm" data-i18n="rules.title">共通チャンネルのルール（テンプレート）</span>
-        <span style="flex:1"></span>
-        <button class="btn text copy-btn" id="rules-copy" onclick="copyRules()"><span class="ic-wrap" aria-hidden="true"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><span data-i18n="rules.copy">コピー</span></button></div>
-      <div class="sub" data-i18n="rules.sub" style="margin:6px 0 10px">Slack 共通チャンネルの topic/説明に貼ると、各 agent がこのルールに従います。</div>
-      <pre id="rules-pre" style="max-height:320px">…</pre>
-    </div>
     <div id="agents"></div>
     <div class="card">
       <div class="head"><span class="nm" data-i18n="cfg.newagent">新しい agent</span></div>
@@ -2941,6 +3483,13 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:var(--r-lg);
       <textarea id="new-persona" rows="3" placeholder="…"></textarea>
       <div style="margin-top:16px"><button class="btn solid" onclick="addAgent()" data-i18n="cfg.save">保存</button>
       <span class="msg" id="new-msg"></span></div>
+    </div>
+    <div class="card">
+      <div class="head"><span class="nm" data-i18n="rules.title">共通チャンネルのルール（テンプレート）</span>
+        <span style="flex:1"></span>
+        <button class="btn text copy-btn" id="rules-copy" onclick="copyRules()"><span class="ic-wrap" aria-hidden="true"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg></span><span data-i18n="rules.copy">コピー</span></button></div>
+      <div class="sub" data-i18n="rules.sub" style="margin:6px 0 10px">Slack 共通チャンネルの topic/説明に貼ると、各 agent がこのルールに従います。</div>
+      <pre id="rules-pre" style="max-height:320px">…</pre>
     </div>
   </section>
 
@@ -3056,30 +3605,56 @@ function withControlAuth(options){
   const token=controlToken();if(token)headers.set('Authorization','Bearer '+token);
   next.headers=headers;return next;
 }
-const apiFetch=(u,o)=>fetch(u,withControlAuth(o));
+// a token is asked for only after the server answers 401: nodes without
+// control auth (local legacy mode) never show the prompt at all
+let CONTROL_REQUIRED=false;
+const apiFetch=async(u,o)=>{
+  const r=await fetch(u,withControlAuth(o));
+  if(r.status===401){CONTROL_REQUIRED=true;showUnlock(!!controlToken());}
+  return r;
+};
 const j=async(u,o)=>(await apiFetch(u,o)).json();
+function showUnlock(rejected){
+  if(rejected)saveControlToken('');
+  const bar=$('#unlock');if(!bar)return;
+  $('#unlock-msg').textContent=rejected?t('unlock.bad'):'';
+  if(!bar.classList.contains('on')){bar.classList.add('on');const input=$('#unlock-token');if(input)input.focus();}
+}
+function unlockControl(){
+  const input=$('#unlock-token'), value=(input.value||'').trim();
+  if(!value)return;
+  saveControlToken(value);input.value='';$('#unlock').classList.remove('on');
+  showTab(TABS.find(k=>$('#panel-'+k).classList.contains('on'))||'mon');
+}
 function ensureControlToken(){
-  if(controlToken())return;
-  const supplied=window.prompt('Control bearer token');
-  if(supplied)saveControlToken(supplied.trim());
+  if(!CONTROL_REQUIRED||controlToken())return;
+  showUnlock(false);
 }
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 function safeHttpUrl(value){
   try{const u=new URL(String(value||''),location.origin);
     return (u.protocol==='http:'||u.protocol==='https:')?u.href:'';}catch(e){return '';}
 }
+// agent name → what Slack shows for its bot (from the live state)
+let LIVE_SLACK={};
+// The title is the Slack name (renames happen in Slack); agents.yaml's name
+// stays visible beside it because commands, env vars and @handoffs use it.
+function agentTitleHtml(name,sl){
+  const shown=(sl&&(sl.display_name||sl.app_name))||name;
+  return `<span class="nm">${esc(shown)}</span>${shown!==name?`<span class="nm-id" title="${esc(t('nm.internal'))}">${esc(name)}</span>`:''}`;
+}
 let MODELS={claude:[''],codex:[''],openai:[''],sources:{},current:{}}, MODELS_READY=false,
   MODELS_LOADING=null, NEWRT='claude', PENDING=Object.create(null);
 
 const I18N={
- zh:{'nav.guide':'指引','nav.mon':'监视','nav.cfg':'构成','tasks.title':'关注中的任务','agents.title':'智能体','tasks.empty':'没有开放的 issue','tasks.unassigned':'未认领','rules.title':'共通频道规则（模板）','rules.sub':'贴到 Slack 共通频道的 topic/说明，各 agent 会遵守这些规则。','rules.copy':'复制','rules.copied':'规则已复制',
+ zh:{'nav.guide':'指引','nav.mon':'监视','nav.cfg':'构成','tasks.title':'关注中的任务','agents.title':'智能体','tasks.empty':'没有开放的 issue','tasks.unassigned':'未认领','tasks.loading':'更新中…','tasks.updated':'✓ 已更新 {t}','tasks.notfound':'GitHub 上找不到这个仓库，或当前 gh 账号无权访问。到「构成」改正 github_repo（全局默认值在 agents.yaml 的 github.repo）','rules.title':'共通频道规则（模板）','rules.sub':'贴到 Slack 共通频道的 topic/说明，各 agent 会遵守这些规则。','rules.copy':'复制','rules.copied':'规则已复制',
    'guide.kicker':'从这里开始 · OWNER 运行手册','guide.title':'从本机账号，到第一次安全交接','guide.sub':'按顺序完成五步。每个人只配置自己的节点；团队通过 Slack 协调，通过 GitHub 交付代码。',
    'guide.boundary':'只共享无凭据 roster、Slack 消息与 PR URL。不要共享 AI 登录、API Key、Slack Token、GitHub Token、状态库或工作区。',
    'guide.progress':'本浏览器的上手进度','guide.map.slack':'共享 Slack 线程','guide.map.local':'每人独立本地节点','guide.map.artifact':'GitHub PR / Issue',
    'guide.done':'标记完成','guide.evidence':'完成证据','guide.do':'按这个顺序','guide.copy':'复制','guide.copied':'模板已复制','guide.copyselect':'浏览器禁止复制；模板已全选，请按系统复制键','guide.copyfail':'复制失败',
    'guide.next':'下一步：{n}','guide.complete':'上手完成。现在按“一任务一线程”开始协作。','guide.next.roles':'确定角色与 owner/node','guide.next.slack':'创建并邀请 Slack Apps','guide.next.local':'连接本机账号与仓库','guide.next.prompts':'为每个 agent 写职责 Prompt','guide.next.first-task':'跑通第一次任务与交接',
-   'guide.goto.cfg':'去团队构成','guide.goto.slack':'去设置 Slack App','guide.goto.auth':'去认证','guide.goto.prompt':'去编辑 Prompt','guide.goto.mon':'去监视运行',
-   'guide.roles.eye':'团队契约','guide.roles.title':'先分清谁负责什么','guide.roles.body':'每人保留 2–3 个 agent。dev 写代码，reviewer 独立审查，planner/pm 只拆任务；OpenAI agent 默认没有本地文件工具。',
+   'guide.goto.cfg':'去团队构成','guide.goto.slack':'去设置 Slack App','guide.open.slack':'打开 api.slack.com/apps','guide.slack.do5':'也可以在 Claude Code 里运行 /slack-app-setup，由 agent 操作浏览器完成，只在关键步骤请你确认','guide.goto.auth':'去认证','guide.goto.prompt':'去编辑 Prompt','guide.goto.mon':'去监视运行',
+   'guide.roles.eye':'团队契约','guide.roles.title':'先分清谁负责什么','guide.roles.body':'每人保留 2–3 个 agent。developer 写代码，reviewer 独立审查，planner/pm 只拆任务；OpenAI agent 默认没有本地文件工具。',
    'guide.agent.role':'角色','guide.agent.must':'必须做到','guide.agent.never':'不要做',
    'guide.dev.must':'确认完成标准；实现并测试；commit、push、贴 PR；只交给一个 reviewer。','guide.dev.never':'不要在别人的节点登录；不要把未 push 的本地路径当成交付物。',
    'guide.reviewer.must':'独立查看 PR/diff；按严重度和文件行号报告；明确通过或退回。','guide.reviewer.never':'未经要求不要直接改代码；不要用实现者结论代替验证。',
@@ -3091,10 +3666,10 @@ const I18N={
    'guide.prompt.channel':'Slack 频道规则模板','guide.local.eye':'私有节点','guide.local.title':'只连接这台机器自己的账号','guide.local.body':'登录本人 Claude/Codex/GitHub，OpenAI Key 只放本机 env；创建独立 workspace、state 和 worktree volume。绝不挂载另一位 owner 的认证目录。',
    'guide.local.ev1':'「认证」显示所选 runtime 与 GitHub 已验证','guide.local.ev2':'本机 env 只含本人 Slack Token、控制 Bearer 和 AI Key','guide.local.ev3':'仓库 origin 与 agent 的 canonical OWNER/REPO 一致',
    'guide.prompts.eye':'PROMPT 契约','guide.prompts.title':'Prompt 写职责，不写口号','guide.prompts.body':'card 让队友知道何时找它、交什么、拿回什么；persona 约束它如何工作。推荐模板可复制后按项目改写。',
-   'guide.prompt.dev':'dev persona 推荐','guide.prompt.reviewer':'reviewer persona 推荐','guide.prompt.planner':'planner / pm persona 推荐',
-   'guide.prompts.ev1':'每个 card 能在 6 行内说清输入、输出和禁区','guide.prompts.ev2':'reviewer 与 dev 使用独立验证标准，OpenAI persona 明示无本地工具',
-   'guide.task.eye':'第一次真实闭环','guide.task.title':'在一个 Slack 线程跑完整闭环','guide.task.body':'人类给一个明确任务；dev 在本地 worktree 实现并产出 PR；reviewer 独立验证。跨机器只传 Slack 上下文和 durable artifact。',
-   'guide.prompt.task':'人类启动任务模板','guide.prompt.handoff':'结构化 HANDOFF 模板','guide.task.ev1':'同一个根线程里能看到目标、测试结果、PR URL 和单目标 handoff','guide.task.ev2':'reviewer 给出明确通过，或带严重度与文件行号的退回意见',
+   'guide.prompt.dev':'developer persona 推荐','guide.prompt.reviewer':'reviewer persona 推荐','guide.prompt.planner':'planner / pm persona 推荐',
+   'guide.prompts.ev1':'每个 card 能在 6 行内说清输入、输出和禁区','guide.prompts.ev2':'reviewer 与 developer 使用独立验证标准，OpenAI persona 明示无本地工具',
+   'guide.task.eye':'第一次真实闭环','guide.task.title':'在一个 Slack 线程跑完整闭环','guide.task.body':'人类给一个明确任务；developer 在本地 worktree 实现并产出 PR；reviewer 独立验证。跨机器只传 Slack 上下文和 durable artifact。',
+   'guide.prompt.task':'人类启动任务模板','guide.prompt.handoff':'结构化 HANDOFF 模板','guide.task.ev1':'同一个根线程里能看到目标、测试结果、PR URL 和单目标 handoff','guide.task.ev2':'reviewer 在 PR 上留下行内 thread 和判定评论，并在 Slack 明确通过，或带严重度与文件行号退回',
    'mon.title':'智能体运行状况','mon.sub':'一览各智能体的状态与模型；模型和 runtime 可在此免重启切换。',
    'status.live':'运行中','status.down':'未启动','status.dis':'未连接',
    'meta.budget':'往复预算','meta.offline':'请启动 multi_app（make run）',
@@ -3109,7 +3684,7 @@ const I18N={
    'empty.noagents':'没有智能体。请在「构成」添加并启动 multi_app。',
    'st.busy':'运行中','st.idle':'待机','st.off':'未连接','model.def':'既定模型',
    'model.custom':'自定义模型 id','model.custom.hint':'任意模型名，如 grok-4.5 / Antigravity 转出模型；回车确认',
-   'lbl.runtime':'runtime','lbl.model':'模型','lbl.replylang':'回复语言','toast.lang':'✓ {n} 回复语言 → {l}','lbl.effort':'推理强度','toast.effort':'✓ {n} 推理强度 → {e}','btn.restart':'会话重启',
+   'lbl.runtime':'runtime','lbl.model':'模型','lbl.replylang':'回复语言','toast.lang':'✓ {n} 回复语言 → {l}','lbl.effort':'推理强度','toast.effort':'✓ {n} 推理强度 → {e}','btn.restart':'会话重启','nm.internal':'控制台内部名（agents.yaml）：命令、环境变量和 @交接都用它','slack.lbl':'Slack 名称','slack.sync':'同步','slack.edit':'改显示名','slack.hint':'Slack 消息上显示的是 App Home 里的 Display Name (Bot Name)；App 名和用户名不会改变它','slack.unknown':'尚未读取（连接后点同步）','toast.slack':'✓ {n} 在 Slack 显示为「{d}」','btn.stop':'停止','btn.resume':'恢复','st.paused':'已停止','stop.confirm':'停止 {n}：中断进行中的 {c} 个任务（巡检领取的 issue 退回 todo），之后不接新任务，直到点「恢复」。','toast.stop':'⏹ {n} 已停止（中断 {c} 个任务）','toast.resume':'▶ {n} 已恢复','toast.notsaved':'未能保存到 state.db，重启后会恢复原状态',
    'confirm.q':'{n} 切换到 {m}？','btn.apply':'应用','btn.cancel':'取消',
    'threads.cap':'线程 {a} / {b}','th.run':'运行中','th.wait':'待机','th.left':'剩余',
    'aux':'会话 {s} · 巡逻 {p}','tk':'tok',
@@ -3121,9 +3696,9 @@ const I18N={
    'cfg.newagent':'新增 agent','cfg.name':'name','cfg.workspace':'workspace','cfg.persona':'persona（自己的行为约束）',
    'cfg.card':'card（队友接口卡）','cfg.cardhint':'给队友看的接口卡：何时找我 / handoff 带什么 / 我交付什么 / 什么别找我。留空则用 persona 首行','cfg.cardlong':'建议 ≤400 字符 / 6 行（仅警告，不阻止保存）',
    'cfg.save':'保存','cfg.setup':'设置','cfg.retoken':'重设 token','cfg.required':'必需','cfg.optional':'可选',
-   'wz.s1':'1. 打开 api.slack.com/apps →「From a manifest」贴入下方 → Install to Workspace',
-   'wz.copy':'复制 manifest','wz.s2':'2. 粘贴 Bot Token (xoxb-) 与 App-Level Token (xapp-, connections:write)：',
-   'wz.save':'验证并写入 .env','tok.copied':'manifest 已复制','saved':'✓ 已保存','savefail':'保存失败','cfg.editpersona':'编辑内容','cfg.restarthint':'重启 multi_app 生效','cfg.worktreerootrestart':'worktree root 仅在重启后生效；重启前请先用旧 root clean remove 仍存活的映射',
+   'wz.s1':'1. 点「用此 manifest 在 Slack 创建」（或打开 api.slack.com/apps →「From a manifest」贴入下方）→ 选择 workspace → Create → Install to Workspace',
+   'wz.copy':'复制 manifest','wz.create':'用此 manifest 在 Slack 创建','wz.s2':'2. 粘贴 Bot Token (xoxb-) 与 App-Level Token (xapp-, connections:write)：',
+   'wz.save':'验证并写入 .env','tok.copied':'manifest 已复制','saved':'✓ 已保存','savefail':'保存失败','unlock.title':'需要控制令牌','unlock.hint':'这个节点启用了控制认证。输入 .env 里为你（owner）配置的控制 Bearer 令牌；只保存在本标签页的会话里。','unlock.save':'解锁','unlock.bad':'令牌不正确，请重新输入。','ws.title':'本地 workspace','ws.edit':'修改','ws.path':'目录（绝对路径或 ~/…）','ws.repo':'GitHub 仓库（OWNER/REPO，留空沿用默认）','ws.check':'检查','ws.unset':'未设置（使用 CLAUDE_WORKSPACE 或启动目录）','ws.nogit':'不是 git 仓库，GitHub 协作不可用','ws.branch':'分支','ws.mismatch':'origin 与 GitHub 仓库不一致，GitHub 协作会被禁用','ws.useorigin':'改用 {r}','ws.setup':'设置 workspace','ws.ok':'就绪','ws.missing':'目录不存在','ws.unsetshort':'未设置','ws.nogitshort':'不是 git 仓库','ws.mismatchshort':'origin 不一致','ws.badreposhort':'GitHub 仓库不可用','ws.badrepo':'GitHub 上找不到 {r}，或当前 gh 账号无权访问；GitHub 协作会被禁用','ws.checking':'检查中…','guide.local.ws':'workspace 是 agent 读写代码的本机目录，必须是目标 GitHub 仓库的 clone（origin 指向 agent 的 OWNER/REPO）。在「团队构成」每张 agent 卡片里设置；打开时会自动检查目录、git、origin 和仓库能否访问。','guide.local.ev4':'每张 agent 卡片的 workspace 显示「就绪」','guide.goto.ws':'去设置 workspace','guide.join.title':'把你新建的 agent 加进 Slack','guide.join.sub':'在「构成」新增的 agent，要有自己的 Slack App、重启上线并被邀请进频道，才能在 Slack 里被 @。每个新 agent 做一遍：','guide.join.s1':'「构成」→「新增 agent」：填名字（如 qa）和 workspace，保存','guide.join.s2':'在它的卡片点「设置」→「用此 manifest 在 Slack 创建」→ 选择 workspace → Create → Install to Workspace → 允许','guide.join.s3':'在该 App 的 Basic Information → App-Level Tokens → Generate Token and Scopes，添加 connections:write，生成后复制 xapp-…','guide.join.s4':'在 OAuth & Permissions 复制 Bot User OAuth Token（xoxb-…）；两个 token 粘贴回卡片，点「验证并写入 .env」','guide.join.s5':'重启 multi_app（新增 agent 必须重启才会上线）；「监视」里它显示已连接','guide.join.s6':'在 Slack 打开项目频道，发送 /invite @agent名（例如 /invite @qa）；或点频道名 → 集成 → 添加应用','guide.join.s7':'在频道里 @它 发一句测试：消息挂上 ⏳ 表示在处理，✅ 表示完成，回复在该消息的线程里','guide.join.tip':'@ 时找不到它：App 还没安装到这个 workspace。@ 了没反应：确认它在频道成员里、multi_app 已重启、「监视」里显示已连接。也可以在 Slack 左侧「应用」里找到它直接私信，私信不用 @。','ws.ghoff':'{r} 的 GitHub 协作已禁用','ws.pick':'选择…','ws.browse':'浏览','ws.pickfail':'这台机器无法弹出系统对话框，已改用页面内浏览','ws.up':'上一级','ws.choose':'选择此目录','ws.close':'收起','ws.nodirs':'这里没有子目录','ws.loading':'加载中…','ws.search':'搜索仓库','ws.inherit':'沿用默认','ws.private':'私有','ws.archived':'已归档','ws.norepos':'没有匹配的仓库','ws.ghfail':'gh 无法列出仓库：{e}','ws.create':'在 GitHub 创建 {r}','ws.createq':'将在 GitHub 创建私有仓库 {r}，确定吗？','ws.createbtn':'创建','ws.created':'✓ 已在 GitHub 创建 {r}','ws.ghmissing':'本机没有安装 gh（GitHub CLI），GitHub 协作无法使用。安装后刷新本页：','ws.ghlogin':'本机的 gh 还没有登录，GitHub 协作无法使用。','ws.gotoauth':'去认证页登录 GitHub','ws.ghmissingshort':'gh 未安装','ws.ghloginshort':'gh 未登录','cfg.editpersona':'编辑内容','cfg.restarthint':'重启 multi_app 生效','cfg.worktreerootrestart':'worktree root 仅在重启后生效；重启前请先用旧 root clean remove 仍存活的映射',
       'nav.auth':'认证','auth.title':'认证','auth.sub':'智能体实际运行环境（优先 Docker 容器，否则本机）的登录凭据。',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
    'auth.signin':'开始登录','auth.openurl':'打开下方链接完成授权，再把页面给出的 code 粘贴回来。',
@@ -3141,14 +3716,14 @@ const I18N={
    'auth.ghsaved':'✓ GH_TOKEN 已写入 .env','auth.importing':'导入中…',
    'auth.verified':'✓ 验证成功','auth.verified.detail':'运行环境已可用 · {m}',
    'auth.method':'方式：{m}','auth.user':'账号：{u}'},
- ja:{'nav.guide':'ガイド','nav.mon':'監視','nav.cfg':'構成','tasks.title':'注目タスク','agents.title':'エージェント','tasks.empty':'オープンな issue はありません','tasks.unassigned':'未割り当て','rules.title':'共通チャンネルのルール（テンプレート）','rules.sub':'Slack 共通チャンネルの topic/説明に貼ると各 agent が従います。','rules.copy':'コピー','rules.copied':'ルールをコピー',
+ ja:{'nav.guide':'ガイド','nav.mon':'監視','nav.cfg':'構成','tasks.title':'注目タスク','agents.title':'エージェント','tasks.empty':'オープンな issue はありません','tasks.unassigned':'未割り当て','tasks.loading':'更新中…','tasks.updated':'✓ 更新しました {t}','tasks.notfound':'GitHub にこのリポジトリがないか、今の gh アカウントでは見られません。「構成」で github_repo を直してください（全体の既定値は agents.yaml の github.repo）','rules.title':'共通チャンネルのルール（テンプレート）','rules.sub':'Slack 共通チャンネルの topic/説明に貼ると各 agent が従います。','rules.copy':'コピー','rules.copied':'ルールをコピー',
    'guide.kicker':'ここから開始 · OWNER ランブック','guide.title':'ローカル認証から、最初の安全な引き継ぎまで','guide.sub':'5つの手順を順番に進めます。各自は自分のノードだけを構成し、Slack で調整、GitHub でコードを受け渡します。',
    'guide.boundary':'共有するのは認証情報を含まない roster、Slack メッセージ、PR URL だけです。AI ログイン、API Key、Slack/GitHub Token、状態 DB、workspace は共有しません。',
    'guide.progress':'このブラウザのセットアップ進捗','guide.map.slack':'共有 Slack スレッド','guide.map.local':'各自の独立ローカルノード','guide.map.artifact':'GitHub PR / Issue',
    'guide.done':'完了にする','guide.evidence':'完了の証拠','guide.do':'この順で実施','guide.copy':'コピー','guide.copied':'テンプレートをコピーしました','guide.copyselect':'browser がコピーを拒否しました。テンプレートを全選択したのでコピーキーを押してください','guide.copyfail':'コピーできませんでした',
    'guide.next':'次：{n}','guide.complete':'準備完了です。「1タスク・1スレッド」で運用を始めてください。','guide.next.roles':'role と owner/node を決める','guide.next.slack':'Slack App を作成して招待する','guide.next.local':'このノードの認証と repo を接続する','guide.next.prompts':'agent ごとの責務 Prompt を書く','guide.next.first-task':'最初のタスクと引き継ぎを完走する',
-   'guide.goto.cfg':'チーム構成へ','guide.goto.slack':'Slack App 設定へ','guide.goto.auth':'認証へ','guide.goto.prompt':'Prompt 編集へ','guide.goto.mon':'運用監視へ',
-   'guide.roles.eye':'チーム契約','guide.roles.title':'最初に責務を分ける','guide.roles.body':'各自 2〜3 agent を持ちます。dev は実装、reviewer は独立レビュー、planner/pm は分解のみ。OpenAI agent は既定でローカルファイルを扱いません。',
+   'guide.goto.cfg':'チーム構成へ','guide.goto.slack':'Slack App 設定へ','guide.open.slack':'api.slack.com/apps を開く','guide.slack.do5':'Claude Code で /slack-app-setup を実行すると、agent がブラウザを操作して設定し、要所だけ確認を求めます','guide.goto.auth':'認証へ','guide.goto.prompt':'Prompt 編集へ','guide.goto.mon':'運用監視へ',
+   'guide.roles.eye':'チーム契約','guide.roles.title':'最初に責務を分ける','guide.roles.body':'各自 2〜3 agent を持ちます。developer は実装、reviewer は独立レビュー、planner/pm は分解のみ。OpenAI agent は既定でローカルファイルを扱いません。',
    'guide.agent.role':'role','guide.agent.must':'必須','guide.agent.never':'しないこと',
    'guide.dev.must':'完了条件を確認し、実装・テスト・commit・push・PR を行い、1人の reviewer に渡す。','guide.dev.never':'他人のノードへログインしない。未 push のローカルパスを成果物にしない。',
    'guide.reviewer.must':'PR/diff を独立確認し、重大度とファイル行を付け、承認か差し戻しかを明示する。','guide.reviewer.never':'依頼なしに直接修正しない。実装者の結論を検証の代わりにしない。',
@@ -3160,10 +3735,10 @@ const I18N={
    'guide.prompt.channel':'Slack チャンネルルール','guide.local.eye':'プライベートノード','guide.local.title':'このマシンの自分のアカウントだけを接続','guide.local.body':'自分の Claude/Codex/GitHub にログインし、OpenAI Key はローカル env のみに保存します。workspace、state、worktree volume は owner ごとに分離します。',
    'guide.local.ev1':'「認証」で利用 runtime と GitHub が検証済み','guide.local.ev2':'ローカル env には本人の Slack Token、control Bearer、AI Key だけがある','guide.local.ev3':'repo origin が agent の canonical OWNER/REPO と一致する',
    'guide.prompts.eye':'PROMPT 契約','guide.prompts.title':'Prompt には責務を書く','guide.prompts.body':'card は、いつ呼ぶか・何を渡すか・何を返すかを仲間へ示します。persona は作業手順を制約します。テンプレートをコピーしてプロジェクトに合わせてください。',
-   'guide.prompt.dev':'dev persona 推奨','guide.prompt.reviewer':'reviewer persona 推奨','guide.prompt.planner':'planner / pm persona 推奨',
-   'guide.prompts.ev1':'各 card は6行以内で入力・出力・禁止事項が分かる','guide.prompts.ev2':'reviewer と dev は別の検証基準を持ち、OpenAI persona はローカルツールなしと明記',
-   'guide.task.eye':'最初の実運用ループ','guide.task.title':'1つの Slack スレッドで完走する','guide.task.body':'人が明確なタスクを渡し、dev はローカル worktree で実装して PR を作成、reviewer が独立検証します。ノード間では Slack 文脈と永続成果物だけを渡します。',
-   'guide.prompt.task':'人が開始するタスクのテンプレート','guide.prompt.handoff':'構造化 HANDOFF テンプレート','guide.task.ev1':'同じルートスレッドに目的、テスト結果、PR URL、単一 target の handoff がある','guide.task.ev2':'reviewer が明確に承認、または重大度とファイル行付きで差し戻す',
+   'guide.prompt.dev':'developer persona 推奨','guide.prompt.reviewer':'reviewer persona 推奨','guide.prompt.planner':'planner / pm persona 推奨',
+   'guide.prompts.ev1':'各 card は6行以内で入力・出力・禁止事項が分かる','guide.prompts.ev2':'reviewer と developer は別の検証基準を持ち、OpenAI persona はローカルツールなしと明記',
+   'guide.task.eye':'最初の実運用ループ','guide.task.title':'1つの Slack スレッドで完走する','guide.task.body':'人が明確なタスクを渡し、developer はローカル worktree で実装して PR を作成、reviewer が独立検証します。ノード間では Slack 文脈と永続成果物だけを渡します。',
+   'guide.prompt.task':'人が開始するタスクのテンプレート','guide.prompt.handoff':'構造化 HANDOFF テンプレート','guide.task.ev1':'同じルートスレッドに目的、テスト結果、PR URL、単一 target の handoff がある','guide.task.ev2':'reviewer が PR に行内 thread と判定コメントを残し、Slack で明確に承認、または重大度とファイル行付きで差し戻す',
    'mon.title':'エージェント運用状況','mon.sub':'稼働中の各エージェントの状態・モデルをひと目で。モデルと runtime はここから再起動なしで切り替えられます。',
    'status.live':'稼働中','status.down':'未起動','status.dis':'未接続',
    'meta.budget':'往復予算','meta.offline':'multi_app を起動してください（make run）',
@@ -3178,7 +3753,7 @@ const I18N={
    'empty.noagents':'エージェントがありません。「構成」で追加し multi_app を起動してください。',
    'st.busy':'実行中','st.idle':'待機','st.off':'未接続','model.def':'既定モデル',
    'model.custom':'カスタムモデル id','model.custom.hint':'任意のモデル名（例: grok-4.5 / Antigravity）。Enter で確定',
-   'lbl.runtime':'runtime','lbl.model':'モデル','lbl.replylang':'返信言語','toast.lang':'✓ {n} 返信言語 → {l}','lbl.effort':'推論強度','toast.effort':'✓ {n} 推論強度 → {e}','btn.restart':'セッション再起動',
+   'lbl.runtime':'runtime','lbl.model':'モデル','lbl.replylang':'返信言語','toast.lang':'✓ {n} 返信言語 → {l}','lbl.effort':'推論強度','toast.effort':'✓ {n} 推論強度 → {e}','btn.restart':'セッション再起動','nm.internal':'内部名（agents.yaml）：コマンド・環境変数・@ハンドオフで使います','slack.lbl':'Slack 名','slack.sync':'同期','slack.edit':'表示名を変更','slack.hint':'Slack のメッセージには App Home の Display Name (Bot Name) が表示されます。App 名やユーザー名では変わりません','slack.unknown':'未取得（接続後に同期）','toast.slack':'✓ {n} は Slack で「{d}」と表示されます','btn.stop':'停止','btn.resume':'再開','st.paused':'停止中','stop.confirm':'{n} を停止します：実行中の {c} 件を中断し（巡回で取った issue は todo に戻します）、「再開」するまで新しい依頼を受けません。','toast.stop':'⏹ {n} を停止（{c} 件中断）','toast.resume':'▶ {n} を再開','toast.notsaved':'state.db に保存できませんでした。再起動すると元の状態に戻ります',
    'confirm.q':'{n} を {m} に切り替えますか？','btn.apply':'適用','btn.cancel':'取消',
    'threads.cap':'スレッド {a} / {b}','th.run':'実行中','th.wait':'待機','th.left':'残',
    'aux':'セッション {s} · 巡回 {p}','tk':'tok',
@@ -3190,9 +3765,9 @@ const I18N={
    'cfg.newagent':'新しいエージェント','cfg.name':'name','cfg.workspace':'workspace','cfg.persona':'persona（自分向けの行動制約）',
    'cfg.card':'card（仲間向けカード）','cfg.cardhint':'仲間向けの窓口：いつ呼ぶか / handoff に何を含めるか / 何を返すか / 何は扱わないか。空なら persona 1行目','cfg.cardlong':'目安 ≤400 文字 / 6 行（警告のみ、保存は可）',
    'cfg.save':'保存','cfg.setup':'セットアップ','cfg.retoken':'token 再設定','cfg.required':'必須','cfg.optional':'任意',
-   'wz.s1':'1. api.slack.com/apps →「From a manifest」に下記を貼付 → Install to Workspace',
-   'wz.copy':'manifest をコピー','wz.s2':'2. Bot Token (xoxb-) と App-Level Token (xapp-, connections:write) を貼付:',
-   'wz.save':'検証して .env に保存','tok.copied':'manifest コピー','saved':'✓ 保存','savefail':'保存に失敗しました','cfg.editpersona':'内容を編集','cfg.restarthint':'multi_app 再起動で反映','cfg.worktreerootrestart':'worktree root は再起動時だけ反映されます。稼働中の mapping は先に旧 root 設定で clean remove してください',
+   'wz.s1':'1.「この manifest で Slack に作成」を押す（または api.slack.com/apps →「From a manifest」に下記を貼付）→ workspace を選択 → Create → Install to Workspace',
+   'wz.copy':'manifest をコピー','wz.create':'この manifest で Slack に作成','wz.s2':'2. Bot Token (xoxb-) と App-Level Token (xapp-, connections:write) を貼付:',
+   'wz.save':'検証して .env に保存','tok.copied':'manifest コピー','saved':'✓ 保存','savefail':'保存に失敗しました','unlock.title':'コントロールトークンが必要です','unlock.hint':'このノードはコントロール認証が有効です。.env に自分（owner）用に設定したコントロール Bearer トークンを入力してください。このタブのセッションにだけ保存されます。','unlock.save':'ロック解除','unlock.bad':'トークンが正しくありません。もう一度入力してください。','ws.title':'ローカル workspace','ws.edit':'変更','ws.path':'ディレクトリ（絶対パスまたは ~/…）','ws.repo':'GitHub リポジトリ（OWNER/REPO、空欄なら既定を使用）','ws.check':'確認','ws.unset':'未設定（CLAUDE_WORKSPACE または起動ディレクトリ）','ws.nogit':'git リポジトリではないため GitHub 連携は使えません','ws.branch':'ブランチ','ws.mismatch':'origin と GitHub リポジトリが一致しないため GitHub 連携は無効になります','ws.useorigin':'{r} を使う','ws.setup':'workspace を設定','ws.ok':'準備完了','ws.missing':'ディレクトリなし','ws.unsetshort':'未設定','ws.nogitshort':'git リポジトリではない','ws.mismatchshort':'origin 不一致','ws.badreposhort':'GitHub リポジトリ不可','ws.badrepo':'GitHub に {r} が見つからないか、現在の gh アカウントに権限がありません。GitHub 連携は無効になります','ws.checking':'確認中…','guide.local.ws':'workspace は agent がコードを読み書きするローカルディレクトリで、対象 GitHub リポジトリの clone（origin が agent の OWNER/REPO）である必要があります。「チーム構成」の各 agent カードで設定し、開くとディレクトリ・git・origin・リポジトリへのアクセスを自動で確認します。','guide.local.ev4':'各 agent カードの workspace が「準備完了」','guide.goto.ws':'workspace を設定','guide.join.title':'新しく作った agent を Slack に追加する','guide.join.sub':'「構成」で追加した agent は、専用の Slack App を作り、再起動でオンラインにし、チャンネルに招待して初めて Slack で @ できます。新しい agent ごとに:','guide.join.s1':'「構成」→「新しいエージェント」：名前（例: qa）と workspace を入れて保存','guide.join.s2':'カードの「セットアップ」→「この manifest で Slack に作成」→ workspace を選択 → Create → Install to Workspace → 許可する','guide.join.s3':'その App の Basic Information → App-Level Tokens → Generate Token and Scopes で connections:write を追加し、生成された xapp-… をコピー','guide.join.s4':'OAuth & Permissions で Bot User OAuth Token（xoxb-…）をコピー。2 つの token をカードに貼り「検証して .env に保存」','guide.join.s5':'multi_app を再起動（agent の追加は再起動で反映）。「監視」で接続済みになります','guide.join.s6':'Slack でプロジェクトチャンネルを開き /invite @agent名（例: /invite @qa）を送信。またはチャンネル名 → インテグレーション → アプリを追加する','guide.join.s7':'チャンネルで @agent名 にテスト投稿：⏳ が付けば処理中、✅ で完了、返信はそのメッセージのスレッドに届きます','guide.join.tip':'@ の候補に出ない：App がこの workspace に未インストール。@ しても反応がない：チャンネルのメンバーか、multi_app を再起動したか、「監視」で接続済みかを確認。Slack 左の「アプリ」から DM もでき、DM では @ 不要です。','ws.ghoff':'{r} の GitHub 連携は無効','ws.pick':'選択…','ws.browse':'参照','ws.pickfail':'このマシンではシステムのダイアログを開けないため、画面内で参照します','ws.up':'上へ','ws.choose':'このフォルダを選択','ws.close':'閉じる','ws.nodirs':'サブフォルダはありません','ws.loading':'読み込み中…','ws.search':'リポジトリを検索','ws.inherit':'既定を使う','ws.private':'非公開','ws.archived':'アーカイブ済み','ws.norepos':'一致するリポジトリはありません','ws.ghfail':'gh でリポジトリを取得できません：{e}','ws.create':'GitHub に {r} を作成','ws.createq':'GitHub に非公開リポジトリ {r} を作成します。よろしいですか？','ws.createbtn':'作成','ws.created':'✓ GitHub に {r} を作成しました','ws.ghmissing':'このマシンに gh（GitHub CLI）がないため GitHub 連携を使えません。インストール後にこのページを再読み込み：','ws.ghlogin':'このマシンの gh はまだログインしていないため GitHub 連携を使えません。','ws.gotoauth':'認証ページで GitHub にログイン','ws.ghmissingshort':'gh 未インストール','ws.ghloginshort':'gh 未ログイン','cfg.editpersona':'内容を編集','cfg.restarthint':'multi_app 再起動で反映','cfg.worktreerootrestart':'worktree root は再起動時だけ反映されます。稼働中の mapping は先に旧 root 設定で clean remove してください',
       'nav.auth':'認証','auth.title':'認証','auth.sub':'エージェントが実際に動く環境（優先：Docker コンテナ／なければこのホスト）のログイン情報です。',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
    'auth.signin':'ログイン開始','auth.openurl':'下のリンクで承認し、表示された code を貼り付けてください。',
@@ -3210,14 +3785,14 @@ const I18N={
    'auth.ghsaved':'✓ GH_TOKEN を .env に保存しました','auth.importing':'取り込み中…',
    'auth.verified':'✓ 検証成功','auth.verified.detail':'実行環境で利用できます · {m}',
    'auth.method':'方式：{m}','auth.user':'アカウント：{u}'},
- en:{'nav.guide':'Guide','nav.mon':'Monitor','nav.cfg':'Setup','tasks.title':'Watched tasks','agents.title':'Agents','tasks.empty':'No open issues','tasks.unassigned':'unassigned','rules.title':'Shared channel rules (template)','rules.sub':'Paste into the shared Slack channel topic/description; agents will follow these rules.','rules.copy':'Copy','rules.copied':'rules copied',
+ en:{'nav.guide':'Guide','nav.mon':'Monitor','nav.cfg':'Setup','tasks.title':'Watched tasks','agents.title':'Agents','tasks.empty':'No open issues','tasks.unassigned':'unassigned','tasks.loading':'Refreshing…','tasks.updated':'✓ Updated {t}','tasks.notfound':'This repo does not exist on GitHub, or the current gh account cannot see it. Fix github_repo on Setup (the shared default is github.repo in agents.yaml)','rules.title':'Shared channel rules (template)','rules.sub':'Paste into the shared Slack channel topic/description; agents will follow these rules.','rules.copy':'Copy','rules.copied':'rules copied',
    'guide.kicker':'START HERE · OWNER RUNBOOK','guide.title':'From local accounts to a safe first handoff','guide.sub':'Complete five steps in order. Each person configures only their node; coordinate in Slack and deliver code through GitHub.',
    'guide.boundary':'Share only the credential-free roster, Slack messages, and PR URLs. Never share AI logins, API keys, Slack or GitHub tokens, state databases, or workspaces.',
    'guide.progress':'Setup progress in this browser','guide.map.slack':'Shared Slack thread','guide.map.local':'One private node per person','guide.map.artifact':'GitHub PR / Issue',
    'guide.done':'Mark complete','guide.evidence':'Completion evidence','guide.do':'Do this in order','guide.copy':'Copy','guide.copied':'template copied','guide.copyselect':'Browser copy is blocked; the template is selected—use the system copy shortcut','guide.copyfail':'copy failed',
    'guide.next':'Next: {n}','guide.complete':'Setup complete. Start collaborating with one task per thread.','guide.next.roles':'assign roles and owner/node','guide.next.slack':'create and invite Slack Apps','guide.next.local':'connect this node’s accounts and repository','guide.next.prompts':'write a responsibility prompt for each agent','guide.next.first-task':'complete the first task and handoff',
-   'guide.goto.cfg':'Open Team setup','guide.goto.slack':'Set up Slack Apps','guide.goto.auth':'Open Auth','guide.goto.prompt':'Edit prompts','guide.goto.mon':'Monitor the run',
-   'guide.roles.eye':'TEAM CONTRACT','guide.roles.title':'Assign responsibility first','guide.roles.body':'Keep two or three agents per person. dev writes code, reviewer verifies independently, and planner/pm only scopes work. OpenAI agents have no local file tools by default.',
+   'guide.goto.cfg':'Open Team setup','guide.goto.slack':'Set up Slack Apps','guide.open.slack':'Open api.slack.com/apps','guide.slack.do5':'Or run /slack-app-setup in Claude Code: an agent drives the browser and asks you to confirm only the key steps','guide.goto.auth':'Open Auth','guide.goto.prompt':'Edit prompts','guide.goto.mon':'Monitor the run',
+   'guide.roles.eye':'TEAM CONTRACT','guide.roles.title':'Assign responsibility first','guide.roles.body':'Keep two or three agents per person. developer writes code, reviewer verifies independently, and planner/pm only scopes work. OpenAI agents have no local file tools by default.',
    'guide.agent.role':'role','guide.agent.must':'must do','guide.agent.never':'do not',
    'guide.dev.must':'Confirm done criteria; implement and test; commit, push, link a PR; hand off to one reviewer.','guide.dev.never':'Never sign in on someone else’s node or treat an unpushed local path as a deliverable.',
    'guide.reviewer.must':'Inspect the PR/diff independently; report severity and file lines; clearly approve or return it.','guide.reviewer.never':'Do not edit unless asked or substitute the implementer’s conclusion for verification.',
@@ -3229,10 +3804,10 @@ const I18N={
    'guide.prompt.channel':'Slack channel rules','guide.local.eye':'PRIVATE NODE','guide.local.title':'Connect only this machine’s accounts','guide.local.body':'Sign in to your own Claude/Codex/GitHub and keep the OpenAI key in local env only. Use separate workspace, state, and worktree volumes; never mount another owner’s auth directory.',
    'guide.local.ev1':'Auth shows the chosen runtime and GitHub as verified','guide.local.ev2':'Local env contains only this owner’s Slack tokens, control Bearer, and AI key','guide.local.ev3':'Repository origin matches the agent’s canonical OWNER/REPO',
    'guide.prompts.eye':'PROMPT CONTRACT','guide.prompts.title':'Write responsibilities, not slogans','guide.prompts.body':'The card tells teammates when to call an agent, what to hand over, and what comes back. The persona constrains how it works. Copy a template and adapt it to the project.',
-   'guide.prompt.dev':'Recommended dev persona','guide.prompt.reviewer':'Recommended reviewer persona','guide.prompt.planner':'Recommended planner / pm persona',
-   'guide.prompts.ev1':'Each card explains input, output, and boundaries in six lines or fewer','guide.prompts.ev2':'reviewer and dev use independent standards; an OpenAI persona states that local tools are unavailable',
-   'guide.task.eye':'FIRST LIVE LOOP','guide.task.title':'Complete one loop in one Slack thread','guide.task.body':'A human provides one clear task; dev implements in the local worktree and publishes a PR; reviewer verifies independently. Across machines, pass only Slack context and durable artifacts.',
-   'guide.prompt.task':'Human task kickoff template','guide.prompt.handoff':'Structured HANDOFF template','guide.task.ev1':'One root thread contains the goal, test result, PR URL, and a single-target handoff','guide.task.ev2':'reviewer clearly approves or returns findings with severity and file lines',
+   'guide.prompt.dev':'Recommended developer persona','guide.prompt.reviewer':'Recommended reviewer persona','guide.prompt.planner':'Recommended planner / pm persona',
+   'guide.prompts.ev1':'Each card explains input, output, and boundaries in six lines or fewer','guide.prompts.ev2':'reviewer and developer use independent standards; an OpenAI persona states that local tools are unavailable',
+   'guide.task.eye':'FIRST LIVE LOOP','guide.task.title':'Complete one loop in one Slack thread','guide.task.body':'A human provides one clear task; developer implements in the local worktree and publishes a PR; reviewer verifies independently. Across machines, pass only Slack context and durable artifacts.',
+   'guide.prompt.task':'Human task kickoff template','guide.prompt.handoff':'Structured HANDOFF template','guide.task.ev1':'One root thread contains the goal, test result, PR URL, and a single-target handoff','guide.task.ev2':'reviewer leaves inline threads and a verdict comment on the PR, then clearly approves or returns findings with severity and file lines in Slack',
    'mon.title':'Agent Operations','mon.sub':'Every agent’s status and model at a glance. Switch model and runtime here without restarting.',
    'status.live':'Online','status.down':'Offline','status.dis':'Disconnected',
    'meta.budget':'round budget','meta.offline':'Start multi_app (make run)',
@@ -3247,7 +3822,7 @@ const I18N={
    'empty.noagents':'No agents. Add one under Setup and start multi_app.',
    'st.busy':'Running','st.idle':'Idle','st.off':'Offline','model.def':'default model',
    'model.custom':'custom model id','model.custom.hint':'Any model id (e.g. grok-4.5 / Antigravity). Press Enter',
-   'lbl.runtime':'runtime','lbl.model':'model','lbl.replylang':'Reply language','toast.lang':'✓ {n} reply language → {l}','lbl.effort':'Reasoning effort','toast.effort':'✓ {n} effort → {e}','btn.restart':'Restart session',
+   'lbl.runtime':'runtime','lbl.model':'model','lbl.replylang':'Reply language','toast.lang':'✓ {n} reply language → {l}','lbl.effort':'Reasoning effort','toast.effort':'✓ {n} effort → {e}','btn.restart':'Restart session','nm.internal':'internal name (agents.yaml), used by commands, env vars and @handoffs','slack.lbl':'Slack name','slack.sync':'Sync','slack.edit':'Change display name','slack.hint':'Slack messages show the App Home Display Name (Bot Name); the app name and username do not change it','slack.unknown':'not read yet (sync once connected)','toast.slack':'✓ {n} shows in Slack as “{d}”','btn.stop':'Stop','btn.resume':'Resume','st.paused':'Stopped','stop.confirm':'Stop {n}: interrupt {c} running task(s) (a patrol issue goes back to todo) and take no new work until you click Resume.','toast.stop':'⏹ {n} stopped ({c} task(s) interrupted)','toast.resume':'▶ {n} resumed','toast.notsaved':'not saved to state.db: a restart would undo this',
    'confirm.q':'Switch {n} to {m}?','btn.apply':'Apply','btn.cancel':'Cancel',
    'threads.cap':'threads {a} / {b}','th.run':'running','th.wait':'idle','th.left':'left',
    'aux':'sessions {s} · patrol {p}','tk':'tok',
@@ -3259,9 +3834,9 @@ const I18N={
    'cfg.newagent':'New agent','cfg.name':'name','cfg.workspace':'workspace','cfg.persona':'persona (self-facing behaviour constraints)',
    'cfg.card':'card (teammate interface)','cfg.cardhint':'For teammates: when to call me / what to hand off / what I deliver / what not to ask. Empty = persona first line','cfg.cardlong':'Prefer ≤400 chars / 6 lines (warning only; save still works)',
    'cfg.save':'Save','cfg.setup':'Set up','cfg.retoken':'Reset tokens','cfg.required':'required','cfg.optional':'optional',
-   'wz.s1':'1. Open api.slack.com/apps → "From a manifest", paste below → Install to Workspace',
-   'wz.copy':'Copy manifest','wz.s2':'2. Paste Bot Token (xoxb-) and App-Level Token (xapp-, connections:write):',
-   'wz.save':'Verify & save to .env','tok.copied':'manifest copied','saved':'✓ Saved','savefail':'save failed','cfg.editpersona':'Edit content','cfg.restarthint':'restart multi_app to apply','cfg.worktreerootrestart':'worktree root applies only after restart; clean-remove live mappings with the old root first',
+   'wz.s1':'1. Click "Create in Slack from this manifest" (or open api.slack.com/apps → "From a manifest" and paste below) → pick the workspace → Create → Install to Workspace',
+   'wz.copy':'Copy manifest','wz.create':'Create in Slack from this manifest','wz.s2':'2. Paste Bot Token (xoxb-) and App-Level Token (xapp-, connections:write):',
+   'wz.save':'Verify & save to .env','tok.copied':'manifest copied','saved':'✓ Saved','savefail':'save failed','unlock.title':'Control token required','unlock.hint':'This node requires control authentication. Enter the control bearer token configured for you (the owner) in .env; it is kept in this tab session only.','unlock.save':'Unlock','unlock.bad':'That token was rejected. Try again.','ws.title':'Local workspace','ws.edit':'Change','ws.path':'Directory (absolute path or ~/…)','ws.repo':'GitHub repo (OWNER/REPO; empty inherits the default)','ws.check':'Check','ws.unset':'not set (falls back to CLAUDE_WORKSPACE or the launch directory)','ws.nogit':'not a git repo; GitHub collaboration is unavailable','ws.branch':'branch','ws.mismatch':'origin differs from the GitHub repo; GitHub collaboration will be disabled','ws.useorigin':'Use {r}','ws.setup':'Set workspace','ws.ok':'ready','ws.missing':'directory missing','ws.unsetshort':'not set','ws.nogitshort':'not a git repo','ws.mismatchshort':'origin mismatch','ws.badreposhort':'repo unreachable','ws.badrepo':'{r} was not found on GitHub, or the current gh account cannot access it; GitHub collaboration will be disabled','ws.checking':'checking…','guide.local.ws':'The workspace is the local directory where an agent reads and writes code. It must be a clone of the target GitHub repository (origin points at the agent OWNER/REPO). Set it on each agent card under Setup; opening it checks the directory, git, origin, and repo access automatically.','guide.local.ev4':'Every agent card shows its workspace as ready','guide.goto.ws':'Set up workspaces','guide.join.title':'Add an agent you created to Slack','guide.join.sub':'An agent added on the Setup tab can be @mentioned in Slack only after it has its own Slack App, multi_app restarts, and it is invited to the channel. For each new agent:','guide.join.s1':'Setup → New agent: enter a name (e.g. qa) and a workspace, then save','guide.join.s2':'On its card click Set up → Create in Slack from this manifest → pick the workspace → Create → Install to Workspace → Allow','guide.join.s3':'In that app’s Basic Information → App-Level Tokens → Generate Token and Scopes, add connections:write, then copy the xapp-… token','guide.join.s4':'On OAuth & Permissions copy the Bot User OAuth Token (xoxb-…); paste both tokens into the card and click Verify & save to .env','guide.join.s5':'Restart multi_app (new agents come online only after a restart); Monitor shows it connected','guide.join.s6':'In Slack, open the project channel and send /invite @agent-name (e.g. /invite @qa), or click the channel name → Integrations → Add apps','guide.join.s7':'@mention it in the channel with a test message: ⏳ means it is working, ✅ means done, and the reply lands in that message’s thread','guide.join.tip':'Not in the @ list: the app is not installed in this workspace. No reaction: check it is a channel member, multi_app was restarted, and Monitor shows it connected. You can also DM it from Apps in Slack’s sidebar; DMs need no @.','ws.ghoff':'GitHub disabled for {r}','ws.pick':'Choose…','ws.browse':'Browse','ws.pickfail':'No system folder dialog on this machine; browsing in the page instead','ws.up':'Up','ws.choose':'Use this folder','ws.close':'Close','ws.nodirs':'No subfolders here','ws.loading':'loading…','ws.search':'Search repositories','ws.inherit':'Inherit the default','ws.private':'private','ws.archived':'archived','ws.norepos':'No matching repositories','ws.ghfail':'gh could not list repositories: {e}','ws.create':'Create {r} on GitHub','ws.createq':'Create the private repository {r} on GitHub?','ws.createbtn':'Create','ws.created':'✓ Created {r} on GitHub','ws.ghmissing':'gh (GitHub CLI) is not installed on this machine, so GitHub collaboration cannot work. Install it, then reload:','ws.ghlogin':'gh on this machine is not signed in, so GitHub collaboration cannot work.','ws.gotoauth':'Sign in to GitHub on the Auth tab','ws.ghmissingshort':'gh not installed','ws.ghloginshort':'gh not signed in','cfg.editpersona':'Edit content','cfg.restarthint':'restart multi_app to apply','cfg.worktreerootrestart':'worktree root applies only after restart; clean-remove live mappings with the old root first',
       'nav.auth':'Auth','auth.title':'Authentication','auth.sub':'Sign-in for the runtime agents actually use (Docker when up, otherwise this host).',
    'auth.claude':'Claude','auth.codex':'Codex','auth.gh':'GitHub',
    'auth.signin':'Start sign-in','auth.openurl':'Open the link below to authorize, then paste the code it shows.',
@@ -3301,8 +3876,12 @@ const GUIDE_PROMPTS={
       '你是独立 reviewer，不复述实现者结论。',
       '先读取任务完成标准，再检查 PR/diff、失败路径、并发与安全边界，并运行适当验证。',
       '按 Critical / Important / Suggestion 报告问题，附文件与行号、影响和可复现证据。',
-      '有 Critical/Important 时明确退回给一个 dev；没有时明确写“通过”并列出验证。',
-      '未经要求不要直接改实现；没有本地工具时必须说明，并基于 Slack 中可见材料评审。'
+      '评审完写回对应的 GitHub PR：每个能定位到 diff 行的问题单独一条行内 review thread（严重度、问题、影响、如何验证修复）；判定与总结写在 review 正文评论里。',
+      '用 gh api repos/{owner}/{repo}/pulls/<N>/reviews 提交，event 固定为 COMMENT（同一 GitHub 账号不能 approve 或 request changes 自己的 PR，批准留给人类）；正文以「判定：通过」或「判定：退回」开头，列出验证内容。',
+      '复审时在原 thread 回复「已在 <sha> 修复」或「仍未解决」，不要重开新 thread。',
+      '最后在 Slack 线程回复判定、review 链接和各级问题数；有 Critical/Important 时只退回给一个 developer。',
+      'PR 评论是公开的：不要写 token、env、本机绝对路径或只在 Slack 里讨论的内容。',
+      '未经要求不要直接改实现；没有本地工具或 gh 时必须说明，只基于 Slack 中可见材料评审并只在 Slack 报告。'
     ].join(GUIDE_NL),
     planner:[
       '你是 planner / pm，只负责把需求变成可执行任务。',
@@ -3311,7 +3890,7 @@ const GUIDE_PROMPTS={
       '不要写代码，也不要声称访问过本地仓库；需要事实时要求提供 Issue、PR 或文件摘录。'
     ].join(GUIDE_NL),
     task:[
-      '@alice/dev 处理 TASK-123',
+      '@alice_dev 处理 TASK-123',
       '',
       '目标：<最终要得到什么>',
       '背景：<相关 Issue / PR / 现状>',
@@ -3320,9 +3899,9 @@ const GUIDE_PROMPTS={
       '1. <可验证结果一>',
       '2. <测试与失败路径>',
       '交付物：PR URL + 测试命令与结果',
-      '完成后：只 handoff 给 bob/reviewer'
+      '完成后：只 handoff 给 bob_rev'
     ].join(GUIDE_NL),
-    handoff:'HANDOFF {"target_agent_id":"bob/reviewer","task_id":"TASK-123","goal":"独立审查 PR","done_criteria":["测试通过","无 Critical/Important","给出文件行号证据"],"artifact":"https://github.com/ORG/REPO/pull/123"}'
+    handoff:'HANDOFF {"target_agent_id":"bob_rev","task_id":"TASK-123","goal":"独立审查 PR","done_criteria":["测试通过","无 Critical/Important","给出文件行号证据"],"artifact":"https://github.com/ORG/REPO/pull/123"}'
   },
   ja:{
     channel:[
@@ -3343,8 +3922,12 @@ const GUIDE_PROMPTS={
       'あなたは独立 reviewer です。実装者の結論をそのまま採用しません。',
       '完了条件を読み、PR/diff、失敗経路、並行性、安全境界を確認し、適切な検証を実行します。',
       'Critical / Important / Suggestion で分類し、ファイル行、影響、再現証拠を付けます。',
-      'Critical/Important があれば dev 1人へ差し戻し、なければ「承認」と検証内容を明記します。',
-      '依頼なしに実装を変更しません。ローカルツールがなければ明示し、Slack 上の材料だけで評価します。'
+      'レビュー後は該当する GitHub PR に書き戻します：diff の行に結び付く指摘は1件ずつ行内 review thread にし（重大度・問題・影響・修正の確認方法）、判定とまとめは review 本文のコメントに書きます。',
+      'gh api repos/{owner}/{repo}/pulls/<N>/reviews で投稿し、event は常に COMMENT（同じ GitHub アカウントは自分の PR を approve / request changes できず、承認は人が行います）。本文は「判定：承認」か「判定：差し戻し」で始め、検証内容を書きます。',
+      '再レビューでは既存 thread に「<sha> で修正済み」か「未解決」と返信し、新しい thread を重複して作りません。',
+      '最後に Slack スレッドへ判定、review の URL、重大度ごとの件数を返します。Critical/Important があれば developer 1人へ差し戻します。',
+      'PR コメントは公開されます：token、env、ローカル絶対パス、Slack 内だけの議論を書きません。',
+      '依頼なしに実装を変更しません。ローカルツールや gh がなければ明示し、Slack 上の材料だけで評価して Slack にだけ報告します。'
     ].join(GUIDE_NL),
     planner:[
       'あなたは planner / pm で、要求を実行可能なタスクへ分解します。',
@@ -3353,7 +3936,7 @@ const GUIDE_PROMPTS={
       'コードを書かず、ローカル repo を見たと主張しません。必要なら Issue、PR、抜粋を要求します。'
     ].join(GUIDE_NL),
     task:[
-      '@alice/dev TASK-123 を対応してください',
+      '@alice_dev TASK-123 を対応してください',
       '',
       '目的：<最終的に得たいもの>',
       '背景：<Issue / PR / 現状>',
@@ -3362,9 +3945,9 @@ const GUIDE_PROMPTS={
       '1. <検証可能な結果>',
       '2. <テストと失敗経路>',
       '成果物：PR URL + テストコマンドと結果',
-      '完了後：bob/reviewer 1人だけへ handoff'
+      '完了後：bob_rev 1人だけへ handoff'
     ].join(GUIDE_NL),
-    handoff:'HANDOFF {"target_agent_id":"bob/reviewer","task_id":"TASK-123","goal":"PR を独立レビュー","done_criteria":["テスト合格","Critical/Important なし","ファイル行の証拠"],"artifact":"https://github.com/ORG/REPO/pull/123"}'
+    handoff:'HANDOFF {"target_agent_id":"bob_rev","task_id":"TASK-123","goal":"PR を独立レビュー","done_criteria":["テスト合格","Critical/Important なし","ファイル行の証拠"],"artifact":"https://github.com/ORG/REPO/pull/123"}'
   },
   en:{
     channel:[
@@ -3385,8 +3968,12 @@ const GUIDE_PROMPTS={
       'You are an independent reviewer; do not repeat the implementer’s conclusion.',
       'Read the done criteria, inspect the PR/diff, failure paths, concurrency, and security boundaries, then run proportionate checks.',
       'Classify findings as Critical, Important, or Suggestion, with file lines, impact, and reproducible evidence.',
-      'Return Critical/Important findings to one dev. Otherwise explicitly approve and list verification.',
-      'Do not edit unless asked. If local tools are unavailable, say so and review only material visible in Slack.'
+      'After reviewing, write back to the GitHub PR: each finding that maps to a diff line gets its own inline review thread (severity, problem, impact, how to verify the fix); the verdict and summary go in the review body comment.',
+      'Post with gh api repos/{owner}/{repo}/pulls/<N>/reviews, always event COMMENT (one GitHub account cannot approve or request changes on its own PR, and approval stays human). Start the body with “Verdict: PASS” or “Verdict: CHANGES REQUESTED” and list what you verified.',
+      'On re-review, reply in the existing threads (“Fixed in <sha>” or “Still open”) instead of opening duplicates.',
+      'Finally reply in the Slack thread with the verdict, the review URL, and counts per severity; return Critical/Important findings to one developer.',
+      'PR comments are public: never include tokens, env values, local absolute paths, or Slack-only discussion.',
+      'Do not edit unless asked. Without local tools or gh, say so, review only material visible in Slack, and report only in Slack.'
     ].join(GUIDE_NL),
     planner:[
       'You are a planner / pm. Turn a request into an executable task.',
@@ -3395,7 +3982,7 @@ const GUIDE_PROMPTS={
       'Do not write code or claim local repository access. Ask for an Issue, PR, or excerpt when facts are needed.'
     ].join(GUIDE_NL),
     task:[
-      '@alice/dev handle TASK-123',
+      '@alice_dev handle TASK-123',
       '',
       'Goal: <the final outcome>',
       'Context: <Issue / PR / current behavior>',
@@ -3404,9 +3991,9 @@ const GUIDE_PROMPTS={
       '1. <verifiable result>',
       '2. <tests and failure path>',
       'Deliverable: PR URL + test commands and results',
-      'When done: hand off only to bob/reviewer'
+      'When done: hand off only to bob_rev'
     ].join(GUIDE_NL),
-    handoff:'HANDOFF {"target_agent_id":"bob/reviewer","task_id":"TASK-123","goal":"Independently review the PR","done_criteria":["tests pass","no Critical/Important findings","file-line evidence included"],"artifact":"https://github.com/ORG/REPO/pull/123"}'
+    handoff:'HANDOFF {"target_agent_id":"bob_rev","task_id":"TASK-123","goal":"Independently review the PR","done_criteria":["tests pass","no Critical/Important findings","file-line evidence included"],"artifact":"https://github.com/ORG/REPO/pull/123"}'
   }
 };
 let LANG='zh';
@@ -3642,6 +4229,7 @@ const ICON_CROSS='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" str
 function armQuestion(a){
   if(a.kind==='runtime')return t('rt.confirm',{n:a.agent,r:a.value});
   if(a.kind==='restart')return t('rs.confirm',{n:a.agent});
+  if(a.kind==='stop')return t('stop.confirm',{n:a.agent,c:a.value||0});
   return t('worktree.confirm');
 }
 function armBar(key){
@@ -3669,6 +4257,7 @@ async function fireArmed(key,bar){
   await new Promise(done=>setTimeout(done,reducedMotion()?0:420));
   if(a.kind==='runtime')await switchRuntime(a.agent,a.value);
   else if(a.kind==='restart')await restartSessions(a.agent);
+  else if(a.kind==='stop')await stopAgent(a.agent);
   else if(a.kind==='worktree')await doRemoveWorktree(a.digest);
 }
 document.addEventListener('click',event=>{
@@ -3742,13 +4331,39 @@ function stageCustomModel(n,el,root){
   if(!m)return;
   stageModel(n,m,root);
 }
-async function loadIssues(){
-  let d; try{d=await j('/api/issues');}catch(e){d={issues:[],error:'fetch failed'};}
+let ISSUES_BUSY=false, ISSUES_FLASH=0;
+function issueErrorRow(e){
+  const missing=/Could not resolve to a Repository/i.test(e.error||'');
+  return `<div class="ierr" title="${esc(e.error||'')}"><span class="ierr-repo">${esc(e.repo||'')}</span>
+    <span>${esc(missing?t('tasks.notfound'):(e.error||''))}</span></div>`;
+}
+async function loadIssues(manual){
+  const btn=$('#issues-refresh');
+  if(manual){
+    if(ISSUES_BUSY)return;
+    ISSUES_BUSY=true;clearTimeout(ISSUES_FLASH);
+    btn.disabled=true;btn.textContent=t('tasks.loading');
+  }
+  let d;
+  try{d=await j('/api/issues'+(manual?'?refresh=1':''));}
+  catch(e){d={issues:[],error:'fetch failed'};}
+  finally{if(manual){ISSUES_BUSY=false;btn.disabled=false;}}
+  renderIssues(d);
+  if(manual){
+    const at=d.fetched_at?new Date(d.fetched_at*1000):new Date();
+    btn.textContent=t('tasks.updated').replace('{t}',at.toLocaleTimeString());
+    ISSUES_FLASH=setTimeout(()=>{btn.textContent=t('sw.now');},2600);
+  }
+}
+function renderIssues(d){
   $('#tasks-repo').textContent=d.repo||'';
   const its=d.issues||[];
-  if(d.error){$('#issues').innerHTML=`<div class="empty">${esc(d.error)}</div>`;return;}
-  if(!its.length){$('#issues').innerHTML=`<div class="empty">${t('tasks.empty')}</div>`;return;}
-  $('#issues').innerHTML=its.map(it=>{
+  // One unreachable repo must not hide the issues of the others.
+  const errs=d.errors||[];
+  if(!errs.length&&d.error){$('#issues').innerHTML=`<div class="empty">${esc(d.error)}</div>`;return;}
+  const head=errs.map(issueErrorRow).join('');
+  if(!its.length){$('#issues').innerHTML=head+(errs.length?'':`<div class="empty">${t('tasks.empty')}</div>`);return;}
+  $('#issues').innerHTML=head+its.map(it=>{
     const status=(it.labels||[]).filter(l=>/^status:/.test(l)).map(l=>l.replace('status:','')).join(', ');
     const other=(it.labels||[]).filter(l=>!/^status:/.test(l));
     const asg=(it.assignees||[]).length?('@'+it.assignees.join(', @')):t('tasks.unassigned');
@@ -3767,6 +4382,7 @@ async function loadRules(){try{const d=await j('/api/channel-rules');$('#rules-p
 async function loadLive(){
   loadIssues();
   const st=await j('/api/live/state'), on=st.online, ags=st.agents||[];
+  LIVE_SLACK=Object.fromEntries(ags.map(a=>[a.name,a.slack||null]));
   $('#beacon').className='beacon '+(on?'live':'down');
   $('#beacon-t').textContent=on?t('status.live'):t('status.down');
   const liveRepos=[...new Set(ags.map(a=>a.github_repo).filter(Boolean))];
@@ -3797,8 +4413,8 @@ async function loadLive(){
     .map(([l,n])=>`<span class="metric">${t(l)} <b>${n}</b></span>`).join('');
   if(!ags.length){$('#roster').innerHTML=`<div class="node"><div class="empty">${t('empty.noagents')}</div></div>`;return;}
   $('#roster').innerHTML=ags.map((a,i)=>{
-    const c=a.busy_threads>0?'work':(a.connected?'idle':'off');
-    const s=a.busy_threads>0?t('st.busy'):(a.connected?t('st.idle'):t('st.off'));
+    const c=a.stopped?'paused':(a.busy_threads>0?'work':(a.connected?'idle':'off'));
+    const s=a.stopped?t('st.paused'):(a.busy_threads>0?t('st.busy'):(a.connected?t('st.idle'):t('st.off')));
     const dispModel=a.model?esc(a.model):((MODELS.current||{})[a.runtime]?esc((MODELS.current)[a.runtime]):t('model.def'));
     const pend=PENDING[a.name];
     const cfgPending=((a.config_reload||{}).pending||null);
@@ -3810,7 +4426,7 @@ async function loadLive(){
       ||`<div class="empty">—</div>`;
     return `<div class="node" data-agent="${esc(a.name)}" data-runtime="${esc(a.runtime)}" style="animation-delay:${i*60}ms">
       <div class="head">
-        <span class="nm">${esc(a.name)}</span>
+        ${agentTitleHtml(a.name,a.slack)}
         <span class="state ${c}">${s}</span>
         ${cfgPending?`<span class="state work" title="${esc((cfgPending.fields||[]).join(', '))}">${t('cfg.pending')}</span>`:''}
         <span class="rtline">${esc(a.runtime)} · ${dispModel}</span>
@@ -3823,7 +4439,9 @@ async function loadLive(){
           <button class="rt ${a.runtime==='codex'?'on':''}" data-action="runtime" data-value="codex">codex</button>
           <button class="rt ${a.runtime==='openai'?'on':''}" data-action="runtime" data-value="openai">openai api</button>
         </div>
-        <div class="rowbtns"><button class="btn line" data-action="restart">${t('btn.restart')}</button></div>
+        <div class="rowbtns"><button class="btn line" data-action="restart">${t('btn.restart')}</button>
+          ${a.stopped?`<button class="btn solid" data-action="resume">${t('btn.resume')}</button>`
+            :`<button class="btn line stop" data-action="stop" data-busy="${a.busy_threads||0}">${t('btn.stop')}</button>`}</div>
         <span class="lbl">${t('lbl.model')}</span>
         <div class="field">
           <select data-action="model">${modelOpts(a.runtime,a.model||'')}</select>
@@ -3838,6 +4456,17 @@ async function loadLive(){
         <div class="field">
           <select data-action="reply-language">${langOpts(a.reply_language||'')}</select>
         </div><span></span>
+        <span class="lbl">${t('slack.lbl')}</span>
+        <div class="field slackid">${slackIdentity(a.slack)}</div>
+        <button class="btn line" data-action="sync-slack">${t('slack.sync')}</button>
+        <span class="lbl">${t('ws.title')}</span>
+        <div class="field">
+          <span class="wspath">${a.workspace?esc(a.workspace):`<span class="faint">${t('ws.unset')}</span>`}</span>
+          ${a.github_repo?`<span class="chip">${esc(a.github_repo)}</span>`
+            :(a.configured_github_repo?`<span class="state ws-state warn">${t('ws.ghoff',{r:esc(a.configured_github_repo)})}</span>`:'')}
+        </div>
+        <button class="btn line" data-action="edit-workspace">${t('ws.setup')}</button>
+        ${workspaceEditor(a.workspace,'',a.github_repo||a.configured_github_repo)}
         <div class="arm-slot">${armBar('agent:'+a.name)}</div>
         <div class="confirm ${pend!==undefined?'on':''}">
           <span class="q">${esc(t('confirm.q',{n:a.name,m:pend!==undefined?(pend||t('def.plain')):''}))}</span>
@@ -3858,6 +4487,23 @@ async function applyModel(n){const m=PENDING[n]||'';
 function askRuntime(n,rt,cur,root){if(rt===cur)return;
   arm('agent:'+n,{kind:'runtime',agent:n,value:rt},root&&root.querySelector('.arm-slot'));}
 function askRestart(n,root){arm('agent:'+n,{kind:'restart',agent:n},root&&root.querySelector('.arm-slot'));}
+function slackIdentity(sl){
+  if(!sl||!sl.display_name)return `<span class="faint">${t('slack.unknown')}</span>`;
+  const home=safeHttpUrl(sl.app_home_url||'');
+  return `<span class="slackname">${esc(sl.display_name)}</span>
+    <span class="src">@${esc(sl.username||'')}${sl.app_name?' · '+esc(sl.app_name):''}</span>
+    ${home?`<a class="linkbtn" href="${esc(home)}" target="_blank" rel="noopener noreferrer" title="${esc(t('slack.hint'))}">${t('slack.edit')} ↗</a>`:''}`;
+}
+async function syncSlack(n){
+  const r=await j('/api/live/'+encodeURIComponent(n)+'/slack-identity',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  if(r.ok){toast(t('toast.slack',{n:n,d:(r.slack||{}).display_name||'?'}));loadLive();}else toast('✕ '+(r.error||t('toast.fail')),1);}
+function askStop(n,busy,root){arm('agent:'+n,{kind:'stop',agent:n,value:busy},root&&root.querySelector('.arm-slot'));}
+async function stopAgent(n){
+  const r=await j('/api/live/'+encodeURIComponent(n)+'/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  if(r.ok){toast(t('toast.stop',{n:n,c:r.cancelled||0})+(r.persisted===false?' · '+t('toast.notsaved'):''),r.persisted===false?1:0);loadLive();}else toast('✕ '+(r.error||t('toast.fail')),1);}
+async function resumeAgent(n){
+  const r=await j('/api/live/'+encodeURIComponent(n)+'/resume',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+  if(r.ok){toast(t('toast.resume',{n:n})+(r.persisted===false?' · '+t('toast.notsaved'):''),r.persisted===false?1:0);loadLive();}else toast('✕ '+(r.error||t('toast.fail')),1);}
 async function switchRuntime(n,rt){
   const r=await j('/api/live/'+encodeURIComponent(n)+'/runtime',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({runtime:rt})});
   if(r.ok){toast(t('toast.rt',{n:n,r:r.runtime}));loadLive();}else toast('✕ '+(r.error||t('toast.fail')),1);}
@@ -3879,17 +4525,30 @@ function watchCard(el, longId){
   const h=typeof longId==='string'?document.getElementById(longId):longId;
   if(h) h.classList.toggle('on', long);
 }
-async function loadCfg(){loadRules();const st=await j('/api/state');
+// Setup can be opened before Monitor ever loaded: read the Slack names too.
+async function syncLiveSlack(){
+  try{const st=await j('/api/live/state');
+    LIVE_SLACK=Object.fromEntries((st.agents||[]).map(a=>[a.name,a.slack||null]));}catch(e){}
+}
+async function loadCfg(){loadRules();const [st]=await Promise.all([j('/api/state'),syncLiveSlack()]);
   $('#agents').innerHTML=st.agents.map(a=>`
   <div class="card" data-agent="${esc(a.name)}">
     <div class="head">
-      <span class="nm">${esc(a.name)}</span>
+      ${agentTitleHtml(a.name,LIVE_SLACK[a.name])}
       <span class="chip">${esc(a.runtime)} · ${a.optional?t('cfg.optional'):t('cfg.required')}</span>
       <span class="tok">bot <span class="${a.bot_set?'ok':'ng'}">${a.bot_set?'✓':'—'}</span>
         · app <span class="${a.app_set?'ok':'ng'}">${a.app_set?'✓':'—'}</span>
         ${a.runtime==='openai'?` · api <span class="${a.openai_api_key_set||a.openai_base_url?'ok':'ng'}">${a.openai_api_key_set||a.openai_base_url?'✓':'—'}</span>${a.openai_base_url?` · proxy <span class="ok" title="${esc(a.openai_base_url)}">✓</span>`:''}`:''}</span>
       <span class="aux" style="margin-left:auto"><button class="btn line" data-action="setup">${a.bot_set&&a.app_set?t('cfg.retoken'):t('cfg.setup')}</button></span>
     </div>
+    <div class="wsrow">
+      <span class="lbl">${t('ws.title')}</span>
+      <span class="wspath">${a.workspace?esc(a.workspace):`<span class="faint">${t('ws.unset')}</span>`}</span>
+      ${a.github_repo?`<span class="chip">${esc(a.github_repo)}</span>`:''}
+      <span class="state ws-state">${a.workspace?t('ws.checking'):t('ws.unsetshort')}</span>
+      <button class="btn line" data-action="edit-workspace">${t('ws.setup')}</button>
+    </div>
+    ${workspaceEditor(a.workspace,a.github_repo_explicit,a.github_repo)}
     <div class="persona">
       <div>${cardPreview(a)}</div>
       <button class="btn text" style="padding-left:0" data-action="edit-persona">✎ ${t('cfg.editpersona')}</button>
@@ -3907,7 +4566,10 @@ async function loadCfg(){loadRules();const st=await j('/api/state');
     <div class="wiz">
       <p>${t('wz.s1')}</p>
       <pre class="manifest">…</pre>
-      <button class="btn text" data-action="copy-manifest">${t('wz.copy')}</button>
+      <div class="rowbtns">
+        <a class="btn solid create-app" href="https://api.slack.com/apps?new_app=1" target="_blank" rel="noopener noreferrer">${t('wz.create')} ↗</a>
+        <button class="btn text" data-action="copy-manifest">${t('wz.copy')}</button>
+      </div>
       <p>${t('wz.s2')}</p>
       <span class="lbl">Bot User OAuth Token</span><input class="bot-token" placeholder="xoxb-...">
       <span class="lbl">App-Level Token</span><input class="app-token" placeholder="xapp-...">
@@ -3919,8 +4581,200 @@ async function loadCfg(){loadRules();const st=await j('/api/state');
     const el=card.querySelector('.card-input');
     if(el)watchCard(el,card.querySelector('.cardlong'));
   });
+  await checkAllWorkspaces(st.agents);
 }
 function editP(card){const e=card.querySelector('.pedit');e.style.display=e.style.display==='none'?'block':'none';}
+function workspaceEditor(workspace,explicitRepo,effectiveRepo){
+  return `<div class="wsedit" hidden>
+      <div class="grid2">
+        <div><span class="lbl">${t('ws.path')}</span>
+          <div class="wspick"><input class="ws-input" value="${esc(workspace||'')}" placeholder="~/workspace/my-repo" spellcheck="false" autocomplete="off">
+            <button class="btn line" type="button" data-action="pick-dir">${t('ws.pick')}</button>
+            <button class="btn text" type="button" data-action="browse-dir">${t('ws.browse')}</button></div></div>
+        <div><span class="lbl">${t('ws.repo')}</span>
+          <div class="wspick"><input class="repo-input" value="${esc(explicitRepo||'')}" placeholder="${esc(effectiveRepo||'OWNER/REPO')}" spellcheck="false" autocomplete="off">
+            <button class="btn line" type="button" data-action="pick-repo">${t('ws.pick')}</button></div></div>
+      </div>
+      <div class="dirbrowser" hidden></div>
+      <div class="dirbrowser repobrowser" hidden></div>
+      <div class="wsinfo"></div>
+      <div class="rowbtns" style="margin-top:12px">
+        <button class="btn line" data-action="check-workspace">${t('ws.check')}</button>
+        <button class="btn solid" data-action="save-workspace">${t('cfg.save')}</button>
+      </div>
+      <span class="msg ws-msg"></span>
+    </div>`;
+}
+// open monitor editors pause the 5s re-render, which would wipe typed input
+const WS_EDITING=new Set();
+async function editWorkspace(card){
+  const e=card.querySelector('.wsedit');e.hidden=!e.hidden;e.classList.toggle('open',!e.hidden);
+  const n=card.dataset.agent, live=card.classList.contains('node');
+  if(live){if(e.hidden)WS_EDITING.delete(n);else WS_EDITING.add(n);}
+  if(e.hidden)return;
+  if(live&&!card.dataset.wsLoaded){
+    // the live view knows the resolved path; edit the configured values instead
+    try{const st=await j('/api/state'), a=(st.agents||[]).find(x=>x.name===n);
+      if(a){card.querySelector('.ws-input').value=a.workspace||'';
+        const repo=card.querySelector('.repo-input');repo.value=a.github_repo_explicit||'';
+        repo.placeholder=a.github_repo||'OWNER/REPO';card.dataset.wsLoaded='1';}}catch(err){}
+  }
+  card.querySelector('.ws-input').focus();
+  checkWorkspace(n,card);
+}
+// folder picking: the OS dialog when this machine has one, else in-page browsing
+async function pickDir(n,card){
+  const input=card.querySelector('.ws-input');
+  let r;try{r=await j('/api/fs/pick-dir',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({start:input.value})});}catch(e){r={ok:false,error:'unavailable'};}
+  if(r.ok){input.value=r.path;closeDirs(card);checkWorkspace(n,card);return;}
+  if(r.error==='cancelled'||r.error==='busy')return;
+  toast(t('ws.pickfail'));browseDirs(card,input.value||'~');
+}
+async function browseDirs(card,path){
+  const box=card.querySelector('.dirbrowser:not(.repobrowser)');
+  let r;try{r=await j('/api/fs/dirs?path='+encodeURIComponent(path||'~'));}catch(e){r={ok:false,error:'fetch failed'};}
+  if(!r.ok&&path!=='~'){return browseDirs(card,'~');}
+  box.hidden=false;
+  if(!r.ok){box.innerHTML=`<div class="empty">✕ ${esc(r.error||'')}</div>`;return;}
+  const rows=(r.dirs||[]).map(d=>`<button class="dir${d.git?' git':''}" type="button" data-action="dir-open" data-path="${esc(d.path)}">${esc(d.name)}${d.git?'<span class="chip">git</span>':''}</button>`).join('');
+  box.innerHTML=`<div class="dirbar">
+      <button class="btn text" type="button" data-action="dir-open" data-path="${esc(r.parent||'')}" ${r.parent?'':'disabled'}>↑ ${t('ws.up')}</button>
+      <span class="dirpath" title="${esc(r.path)}">${esc(r.path)}</span>
+      <button class="btn solid" type="button" data-action="dir-choose" data-path="${esc(r.path)}">${t('ws.choose')}</button>
+      <button class="btn text" type="button" data-action="dir-close" aria-label="${esc(t('ws.close'))}">✕</button>
+    </div>
+    <div class="dirlist">${rows||`<div class="empty">${t('ws.nodirs')}</div>`}</div>`;
+}
+function closeDirs(card){const box=card.querySelector('.dirbrowser:not(.repobrowser)');if(box){box.hidden=true;box.innerHTML='';}}
+// repo picker: what the local gh account can see, by owner, filterable
+async function browseRepos(card,owner){
+  const box=card.querySelector('.repobrowser');box.hidden=false;
+  box.innerHTML=`<div class="empty">${t('ws.loading')}</div>`;
+  let r;try{r=await j('/api/github/repos'+(owner?'?owner='+encodeURIComponent(owner):''));}catch(e){r={ok:false,error:'fetch failed'};}
+  const owners=(r.owners||[]).map(o=>`<option value="${esc(o)}"${o===r.owner?' selected':''}>${esc(o)}</option>`).join('');
+  const bar=`<div class="dirbar">
+      ${owners?`<select class="repo-owner" data-action="repo-owner" aria-label="owner">${owners}</select>`:''}
+      <input class="repo-search" type="search" placeholder="${esc(t('ws.search'))}" spellcheck="false" autocomplete="off">
+      <button class="btn text" type="button" data-action="repo-inherit">${t('ws.inherit')}</button>
+      <button class="btn text" type="button" data-action="repo-close" aria-label="${esc(t('ws.close'))}">✕</button>
+    </div>`;
+  if(!r.ok){
+    const hint=ghStatusHint(r.gh);
+    box.innerHTML=bar+`<div class="empty">${hint||'✕ '+esc(t('ws.ghfail',{e:r.error||''}))}</div>`;return;}
+  const rows=(r.repos||[]).map(x=>`<button class="dir repo${x.archived?' archived':''}" type="button" data-action="repo-choose" data-repo="${esc(x.name)}" data-filter="${esc((x.name+' '+x.description).toLowerCase())}">${esc(x.name)}${x.private?`<span class="chip">${t('ws.private')}</span>`:''}${x.archived?`<span class="chip">${t('ws.archived')}</span>`:''}${x.description?`<span class="desc">${esc(x.description)}</span>`:''}</button>`).join('');
+  box.innerHTML=bar+`<div class="dirlist">${rows||`<div class="empty">${t('ws.norepos')}</div>`}</div>`;
+  const search=box.querySelector('.repo-search');if(search)search.focus();
+}
+function filterRepos(box,q){
+  q=(q||'').trim().toLowerCase();let shown=0;
+  box.querySelectorAll('.repo').forEach(row=>{const hit=!q||row.dataset.filter.includes(q);row.hidden=!hit;if(hit)shown++;});
+  let none=box.querySelector('.norepo');
+  if(!shown&&!none){none=document.createElement('div');none.className='empty norepo';none.textContent=t('ws.norepos');box.querySelector('.dirlist').appendChild(none);}
+  if(shown&&none)none.remove();
+}
+// gh must exist and be signed in on this machine for every GitHub feature
+function ghStatusHint(gh){
+  if(!gh)return '';
+  if(!gh.installed)return `<span class="ng">${t('ws.ghmissing')}</span> <a href="https://cli.github.com/" target="_blank" rel="noopener noreferrer">cli.github.com ↗</a>`;
+  if(!gh.logged_in)return `<span class="ng">${t('ws.ghlogin')}</span> <button class="btn text" type="button" onclick="showTab('auth')">${t('ws.gotoauth')}</button>`;
+  return '';
+}
+function closeRepos(card){const box=card.querySelector('.repobrowser');if(box){box.hidden=true;box.innerHTML='';}}
+function askCreateRepo(card,repo){
+  const info=card.querySelector('.wsinfo');
+  const ask=document.createElement('span');ask.className='repoask';
+  ask.innerHTML=`<span>${esc(t('ws.createq',{r:repo}))}</span>
+    <button class="btn solid" type="button" data-action="create-repo-yes" data-repo="${esc(repo)}">${t('ws.createbtn')}</button>
+    <button class="btn text" type="button" data-action="create-repo-no">${t('btn.cancel')}</button>`;
+  info.replaceChildren(ask);
+}
+async function createRepo(n,card,repo){
+  const info=card.querySelector('.wsinfo');info.textContent=t('ws.loading');
+  let r;try{r=await j('/api/github/repos',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({repo:repo})});}catch(e){r={ok:false,error:'fetch failed'};}
+  if(r.ok){toast(t('ws.created',{r:r.repo}));checkWorkspace(n,card);}
+  else{info.innerHTML=`<span class="ng">✕ ${esc(r.error||t('toast.fail'))}</span>`;}
+}
+function workspaceBody(card,dryRun){
+  return JSON.stringify({workspace:card.querySelector('.ws-input').value,
+    github_repo:card.querySelector('.repo-input').value,dry_run:!!dryRun});
+}
+let WS_FOCUS=false;
+function openWorkspaceSettings(){WS_FOCUS=true;showTab('cfg');}
+function workspaceVerdict(r){
+  if(!r||!r.ok)return ['off',t('ws.missing')];
+  if(!r.git)return ['warn',t('ws.nogitshort')];
+  if(r.github_repo&&r.gh&&!r.gh.installed)return ['warn',t('ws.ghmissingshort')];
+  if(r.github_repo&&r.gh&&!r.gh.logged_in)return ['warn',t('ws.ghloginshort')];
+  if(r.mismatch)return ['warn',t('ws.mismatchshort')];
+  if(r.repo_reachable===false)return ['warn',t('ws.badreposhort')];
+  return ['idle',t('ws.ok')];
+}
+// every card's workspace is checked on load; a broken one on a live agent
+// opens its editor, so "GitHub disabled" never hides behind a quiet row
+async function checkAllWorkspaces(agents){
+  const cards=[...document.querySelectorAll('#agents .card')];
+  const results=await Promise.all(cards.map(async card=>{
+    const a=(agents||[]).find(x=>x.name===card.dataset.agent)||{};
+    if(!a.workspace)return [card,a,null];
+    try{return [card,a,await j('/api/agents/'+encodeURIComponent(a.name)+'/workspace',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:workspaceBody(card,true)})];}
+    catch(e){return [card,a,null];}
+  }));
+  let focus=null;
+  for(const [card,a,r] of results){
+    const badge=card.querySelector('.ws-state');
+    if(!r){if(a.workspace&&badge){badge.className='state ws-state off';badge.textContent=t('ws.missing');}
+      if(!focus&&a.bot_set&&a.app_set)focus=card;continue;}
+    const [cls,label]=workspaceVerdict(r);
+    if(badge){badge.className='state ws-state '+cls;badge.textContent=label;}
+    if(cls!=='idle'){renderWorkspaceFacts(card,r);
+      if(a.bot_set&&a.app_set){const e=card.querySelector('.wsedit');e.hidden=false;if(!focus)focus=card;}}
+  }
+  if(WS_FOCUS){WS_FOCUS=false;const card=focus||cards[0];
+    if(card){const e=card.querySelector('.wsedit');e.hidden=false;e.classList.add('open');
+      card.scrollIntoView({block:'start',behavior:reducedMotion()?'auto':'smooth'});
+      card.querySelector('.ws-input').focus({preventScroll:true});}}
+}
+function renderWorkspaceFacts(card,r){
+  const info=card.querySelector('.wsinfo');
+  if(!r.ok){info.innerHTML=`<span class="ng">✕ ${esc(r.error||t('savefail'))}</span>`;return;}
+  const parts=[`<span class="ok">✓ ${esc(r.path)}</span>`];
+  if(!r.git)parts.push(`<span class="warn">${t('ws.nogit')}</span>`);
+  else{
+    if(r.branch)parts.push(`${t('ws.branch')} ${esc(r.branch)}`);
+    if(r.origin_repo)parts.push(`origin ${esc(r.origin_repo)}`);
+  }
+  const ghHint=ghStatusHint(r.gh);
+  if(r.github_repo&&ghHint)parts.push(ghHint);
+  else if(r.gh&&r.gh.login)parts.push(`gh @${esc(r.gh.login)}`);
+  if(r.repo_reachable===false&&r.github_repo){
+    parts.push(`<span class="ng">${t('ws.badrepo',{r:esc(r.github_repo)})}</span>`);
+    parts.push(`<button class="btn text" data-action="create-repo-ask" data-repo="${esc(r.github_repo)}">${t('ws.create',{r:esc(r.github_repo)})}</button>`);
+  }
+  if(r.mismatch){
+    parts.push(`<span class="warn">${t('ws.mismatch')}</span>`);
+    parts.push(`<button class="btn text" data-action="use-origin" data-repo="${esc(r.origin_repo)}">${t('ws.useorigin',{r:esc(r.origin_repo)})}</button>`);
+  }
+  info.innerHTML=parts.join(' · ');
+}
+async function checkWorkspace(n,card){
+  const info=card.querySelector('.wsinfo');info.textContent=t('ws.checking');
+  const r=await j('/api/agents/'+encodeURIComponent(n)+'/workspace',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:workspaceBody(card,true)});
+  renderWorkspaceFacts(card,r);
+}
+async function saveWorkspace(n,card){const m=card.querySelector('.ws-msg');m.textContent='…';m.className='msg ws-msg';
+  const r=await j('/api/agents/'+encodeURIComponent(n)+'/workspace',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:workspaceBody(card,false)});
+  renderWorkspaceFacts(card,r);
+  const badge=card.querySelector('.ws-state');
+  if(badge&&r.ok){const [cls,label]=workspaceVerdict(r);badge.className='state ws-state '+cls;badge.textContent=label;}
+  if(r.ok){m.className='msg '+(savedLiveOk(r,n)?'ok':'ng');m.textContent=savedMsg(r,n);
+    WS_EDITING.delete(n);
+    setTimeout(()=>{if($('#panel-mon').classList.contains('on'))loadLive();else loadCfg();},1200);}
+  else{m.className='msg ng';m.textContent='✕ '+(r.error||t('savefail'));}}
 function savedMsg(r,n){const rl=r.reload||{};
   const ar=((rl.agents||{})[n]||{});
   if(rl.ok&&(ar.failed||[]).length)return t('cfg.failed')+': '+ar.failed.join(', ');
@@ -3939,7 +4793,13 @@ async function saveP(n,card){const m=card.querySelector('.persona-msg');m.textCo
   if(r.ok){m.className='msg '+(savedLiveOk(r,n)?'ok':'ng');m.textContent=savedMsg(r,n);loadCfg();}
   else{m.className='msg ng';m.textContent='✕ '+(r.error||t('savefail'));}}
 async function toggle(n,card){const el=card.querySelector('.wiz');el.classList.toggle('on');
-  if(el.classList.contains('on'))card.querySelector('.manifest').textContent=await apiFetch('/api/manifest/'+encodeURIComponent(n)).then(r=>r.text());}
+  if(!el.classList.contains('on'))return;
+  card.querySelector('.manifest').textContent=await apiFetch('/api/manifest/'+encodeURIComponent(n)).then(r=>r.text());
+  // Slack opens "create from manifest" already filled in with this agent's manifest
+  try{const m=await j('/api/manifest/'+encodeURIComponent(n)+'?format=json');
+    if(m&&m.manifest)card.querySelector('.create-app').href='https://api.slack.com/apps?new_app=1&manifest_json='
+      +encodeURIComponent(JSON.stringify(m.manifest));}catch(e){}
+}
 function copyMf(card){navigator.clipboard.writeText(card.querySelector('.manifest').textContent);toast(t('tok.copied'));}
 async function saveTokens(n,card){const m=card.querySelector('.token-msg');m.textContent='…';m.className='msg token-msg';
   const r=await j('/api/tokens',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -3958,10 +4818,29 @@ document.addEventListener('click',event=>{
   const n=root.dataset.agent, action=control.dataset.action;
   if(action==='runtime')askRuntime(n,control.dataset.value,root.dataset.runtime,root);
   else if(action==='restart')askRestart(n,root);
+  else if(action==='stop')askStop(n,Number(control.dataset.busy)||0,root);
+  else if(action==='resume')resumeAgent(n);
+  else if(action==='sync-slack')syncSlack(n);
   else if(action==='model-apply')applyModel(n);
   else if(action==='model-cancel')cancelModel(n,root);
   else if(action==='setup')toggle(n,root);
   else if(action==='edit-persona')editP(root);
+  else if(action==='edit-workspace')editWorkspace(root);
+  else if(action==='pick-dir')pickDir(n,root);
+  else if(action==='browse-dir')browseDirs(root,root.querySelector('.ws-input').value||'~');
+  else if(action==='dir-open'){if(control.dataset.path)browseDirs(root,control.dataset.path);}
+  else if(action==='dir-choose'){root.querySelector('.ws-input').value=control.dataset.path||'';closeDirs(root);checkWorkspace(n,root);}
+  else if(action==='dir-close')closeDirs(root);
+  else if(action==='pick-repo')browseRepos(root,'');
+  else if(action==='repo-choose'){root.querySelector('.repo-input').value=control.dataset.repo||'';closeRepos(root);checkWorkspace(n,root);}
+  else if(action==='repo-inherit'){root.querySelector('.repo-input').value='';closeRepos(root);checkWorkspace(n,root);}
+  else if(action==='repo-close')closeRepos(root);
+  else if(action==='create-repo-ask')askCreateRepo(root,control.dataset.repo||'');
+  else if(action==='create-repo-yes')createRepo(n,root,control.dataset.repo||'');
+  else if(action==='create-repo-no')checkWorkspace(n,root);
+  else if(action==='check-workspace')checkWorkspace(n,root);
+  else if(action==='save-workspace')saveWorkspace(n,root);
+  else if(action==='use-origin'){root.querySelector('.repo-input').value=control.dataset.repo||'';checkWorkspace(n,root);}
   else if(action==='save-persona')saveP(n,root);
   else if(action==='copy-manifest')copyMf(root);
   else if(action==='save-tokens')saveTokens(n,root);
@@ -3975,6 +4854,7 @@ document.addEventListener('change',event=>{
   else if(action==='model-custom')stageCustomModel(n,control,root);
   else if(action==='effort')setEffort(n,control.value);
   else if(action==='reply-language')setReplyLang(n,control.value);
+  else if(action==='repo-owner')browseRepos(root,control.value);
 });
 document.addEventListener('keydown',event=>{
   if(event.key!=='Enter')return;
@@ -3986,6 +4866,7 @@ document.addEventListener('keydown',event=>{
 });
 document.addEventListener('input',event=>{
   const control=event.target;
+  if(control.matches&&control.matches('.repo-search')){filterRepos(control.closest('.repobrowser'),control.value);return;}
   if(!control.matches||!control.matches('[data-action="card-watch"]'))return;
   const root=control.closest('[data-agent]');
   if(root)watchCard(control,root.querySelector('.cardlong'));
@@ -4200,7 +5081,7 @@ async function ghImport(){
 
 (async()=>{applyI18n();let seen=false;try{seen=localStorage.getItem(GUIDE_SEEN_KEY)==='1'}catch(e){}
   showTab(seen?'mon':'guide');
-  setInterval(()=>{if($('#auto').checked&&$('#panel-mon').classList.contains('on')&&!Object.keys(PENDING).length)loadLive();},5000);})();
+  setInterval(()=>{if($('#auto').checked&&$('#panel-mon').classList.contains('on')&&!Object.keys(PENDING).length&&!WS_EDITING.size)loadLive();},5000);})();
 </script></body></html>
 """
 
@@ -4253,6 +5134,12 @@ async def security_headers(
     return harden(response)
 
 
+# Endpoints that act as this machine rather than as one agent: its AI and gh
+# logins, its filesystem, its gh account's repositories. Only an admin, or the
+# owner of every local agent, may use them.
+_NODE_LEVEL_PREFIXES = ("/api/auth/", "/api/fs/", "/api/github/")
+
+
 def _principal_controls_node(
     request: web.Request, raw: dict[str, Any]
 ) -> bool:
@@ -4271,6 +5158,8 @@ def make_app(
     *,
     authenticator: ControlAuthenticator | None = None,
 ) -> web.Application:
+    if ensure_agents_config(AGENTS_YAML):
+        logger.info("created %s from agents.example.yaml", AGENTS_YAML)
     if authenticator is None:
         env = read_env_file()
         env.update(os.environ)
@@ -4297,7 +5186,7 @@ def make_app(
             )
         request[_CONTROL_PRINCIPAL_KEY] = actor
         if (
-            request.path.startswith("/api/auth/")
+            request.path.startswith(_NODE_LEVEL_PREFIXES)
             and not _principal_controls_node(request, read_yaml())
         ):
             raise web.HTTPForbidden(text="forbidden")
@@ -4325,6 +5214,12 @@ def make_app(
     app.router.add_post("/api/tokens", h_save_tokens)
     app.router.add_post("/api/agents", h_save_agent)
     app.router.add_post("/api/agents/{name}/persona", h_update_persona)
+    app.router.add_post("/api/agents/{name}/workspace", h_update_workspace)
+    app.router.add_post("/api/fs/pick-dir", h_pick_dir)
+    app.router.add_get("/api/fs/dirs", h_list_dirs)
+    app.router.add_get("/api/github/status", h_github_status)
+    app.router.add_get("/api/github/repos", h_github_repos)
+    app.router.add_post("/api/github/repos", h_github_create_repo)
     app.router.add_get("/api/issues", h_issues)
     app.router.add_get("/api/channel-rules", h_channel_rules)
     app.router.add_get("/api/live/state", h_live_state)
@@ -4336,6 +5231,9 @@ def make_app(
     app.router.add_post("/api/live/{name}/model", h_live_set_model)
     app.router.add_post("/api/live/{name}/runtime", h_live_set_runtime)
     app.router.add_post("/api/live/{name}/restart", h_live_restart)
+    app.router.add_post("/api/live/{name}/stop", h_live_stop)
+    app.router.add_post("/api/live/{name}/resume", h_live_resume)
+    app.router.add_post("/api/live/{name}/slack-identity", h_live_slack_identity)
     app.router.add_post("/api/live/{name}/reply_language", h_live_set_reply_language)
     app.router.add_post("/api/live/{name}/effort", h_live_set_effort)
     app.router.add_get("/api/auth/state", h_auth_state)

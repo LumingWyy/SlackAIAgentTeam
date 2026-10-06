@@ -5,7 +5,7 @@ VENV := .venv/bin/python
 NODE ?= alice
 COMPOSE_NODE := $(COMPOSE) --profile $(NODE)
 
-.PHONY: help build up down restart logs ps shell test test-docker run webui clean
+.PHONY: help build up down restart logs ps shell test test-docker run webui stop stop-run stop-webui clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "} {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -47,6 +47,16 @@ run: ## Start locally (development)
 
 webui: ## Start console (monitor + config) at http://127.0.0.1:8765
 	$(VENV) webui.py
+
+# Only processes started from this checkout are stopped (another clone's
+# agents keep running). Docker nodes are not affected: use make down.
+stop: stop-run stop-webui ## Stop the local multi_app and console (foreground or background)
+
+stop-run: ## Stop the local multi_app (running turns are cancelled and their children reaped)
+	@sh scripts/stop-local.sh run
+
+stop-webui: ## Stop the local console
+	@sh scripts/stop-local.sh webui
 
 admin-check: ## Hit the running process admin API for status
 	@curl -s http://127.0.0.1:8766/state | python3 -m json.tool || echo "multi_app not running, or admin API unreachable"
