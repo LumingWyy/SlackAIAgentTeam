@@ -113,6 +113,17 @@ def validate_team(team: dict[str, Any]) -> None:
         nodes.add(node)
         if not str(person.get("workspace") or "").strip():
             raise TeamError(f"{key}: workspace (their local clone of the repo) is required")
+    admins = team.get("admins")
+    if admins is not None and (
+        not isinstance(admins, list)
+        or not all(_HUMAN_RE.fullmatch(str(item)) for item in admins)
+    ):
+        raise TeamError("admins must be a list of Slack user ids")
+    daily = team.get("daily_total_tokens")
+    if daily:
+        reservation = team.get("reservation_tokens")
+        if reservation and int(reservation) > int(daily):
+            raise TeamError("reservation_tokens cannot exceed daily_total_tokens")
     shared = team.get("team_agents") or []
     if not isinstance(shared, list):
         raise TeamError("team_agents must be a list")
@@ -215,7 +226,9 @@ _TEAM_CARDS = {
 def build_roster(team: dict[str, Any]) -> dict[str, Any]:
     people = team["people"]
     members = [str(person["slack_user_id"]) for person in people]
-    admins = [str(item) for item in (team.get("admins") or members)]
+    # An explicit empty list means no team-wide admins (owners still control
+    # their own agents); only a missing key falls back to every member.
+    admins = [str(item) for item in (team["admins"] if "admins" in team else members)]
     names = [agent["name"] for person in people for agent in hosted(team, person)]
     roster: dict[str, Any] = {
         "version": 1,
@@ -235,7 +248,7 @@ def build_roster(team: dict[str, Any]) -> dict[str, Any]:
     if daily:
         # multi_app reserves this much per turn before it knows the real usage;
         # a daily limit is not accepted without it.
-        reservation = int(team.get("reservation_tokens") or 20000)
+        reservation = int(team.get("reservation_tokens") or min(20000, int(daily)))
         roster["quotas"] = {
             "daily_total_tokens": {member: int(daily) for member in members},
             "reservation_tokens": {member: reservation for member in members},

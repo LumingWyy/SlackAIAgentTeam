@@ -222,3 +222,30 @@ def test_team_skills_reach_every_agent_and_load(tmp_path, monkeypatch):
     assert {c.name: c.skills for c in configs} == {
         name: ["answer-me-with-html"] for name in ("bob_dev", "bob_rev", "bob_qa", "dx")
     }
+
+
+def test_explicitly_empty_admins_stay_empty(tmp_path):
+    team = _team(tmp_path)
+    team["admins"] = []
+    roster = team_init.build_roster(team)
+    assert roster["access"]["admins"] == [] and roster["projects"][0]["admins"] == []
+    del team["admins"]
+    assert team_init.build_roster(team)["access"]["admins"] == ["U0AAAAAAA", "U0BBBBBBB"]
+
+
+def test_a_small_daily_quota_still_produces_a_loadable_roster(tmp_path, monkeypatch):
+    from multi_app import load_agents_config
+
+    team = _team(tmp_path)
+    team["daily_total_tokens"] = 10000
+    roster = team_init.build_roster(team)
+    assert roster["quotas"]["reservation_tokens"]["U0AAAAAAA"] == 10000  # not the 20000 default
+    team_init.build(team, tmp_path / "out")
+    for name in ("ALICE_DEV", "ALICE_REV", "ALICE_QA", "PM"):
+        monkeypatch.setenv(f"{name}_SLACK_BOT_TOKEN", "xoxb-x")
+        monkeypatch.setenv(f"{name}_SLACK_APP_TOKEN", "xapp-x")
+    _configs, gcfg = load_agents_config(str(tmp_path / "out" / "alice" / "agents.yaml"))
+    assert gcfg.owner_daily_total_token_limits["U0AAAAAAA"] == 10000
+    team["reservation_tokens"] = 20000
+    with pytest.raises(TeamError, match="cannot exceed"):
+        team_init.validate_team(team)
