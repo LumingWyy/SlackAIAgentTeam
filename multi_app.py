@@ -7839,7 +7839,8 @@ class SlackAgent:
             await self._set_reaction(
                 client, channel, ts, add="black_square_for_stop"
             )
-            self._mark_thread_stopped(f"{channel}:{thread_ts}")
+            if not self._mark_thread_stopped(f"{channel}:{thread_ts}"):
+                persisted = False  # the stop holds, its thread note would not
             if (channel, thread_ts) in told:
                 continue
             told.add((channel, thread_ts))
@@ -7872,17 +7873,20 @@ class SlackAgent:
         task = asyncio.current_task()
         return task is not None and task in self._operator_cancelled
 
-    def _mark_thread_stopped(self, thread_key: str) -> None:
+    def _mark_thread_stopped(self, thread_key: str) -> bool:
+        """Note it; return whether the note was also saved for the next start."""
         self._stopped_threads.add(thread_key)
-        if self._store is not None and not self._store.mark_thread_stopped(
+        saved = self._store is not None and self._store.mark_thread_stopped(
             self.name, thread_key
-        ):
+        )
+        if self._store is not None and not saved:
             logger.warning(
                 "agent %s could not save the stop note for %s; "
                 "a restart would drop it",
                 self.name,
                 thread_key,
             )
+        return saved
 
     def _clear_thread_stopped(self, thread_key: str) -> None:
         if thread_key not in self._stopped_threads:

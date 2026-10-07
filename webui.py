@@ -5135,9 +5135,10 @@ async def security_headers(
 
 
 # Endpoints that act as this machine rather than as one agent: its AI and gh
-# logins, its filesystem, its gh account's repositories. Only an admin, or the
-# owner of every local agent, may use them.
-_NODE_LEVEL_PREFIXES = ("/api/auth/", "/api/fs/", "/api/github/")
+# logins, its filesystem, its gh account's repositories and issues. Only an
+# admin, or the owner of every local agent, may use them. (/api/issues reads
+# with the node's gh; an owner can point their agent's github_repo anywhere.)
+_NODE_LEVEL_PREFIXES = ("/api/auth/", "/api/fs/", "/api/github/", "/api/issues")
 
 
 def _principal_controls_node(

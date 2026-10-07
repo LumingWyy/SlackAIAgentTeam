@@ -1724,6 +1724,7 @@ def test_machine_level_endpoints_need_control_of_the_whole_node(tmp_path, monkey
         ("get", "/api/github/status"),
         ("get", "/api/github/repos"),
         ("post", "/api/github/repos"),
+        ("get", "/api/issues?refresh=1"),  # also reads with the node's gh
     )
 
     async def scenario():

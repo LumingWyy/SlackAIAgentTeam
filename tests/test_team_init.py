@@ -278,9 +278,11 @@ def test_env_example_lists_the_openai_key_for_openai_roles(tmp_path):
     team = _team(tmp_path)
     alice = team["people"][0]
     assert "OPENAI_API_KEY=" not in team_init.env_example(team, alice)
-    alice["runtime"] = {"rev": "openai"}
+    alice["runtime"] = {"rev": " OpenAI "}  # multi_app reads it as openai too
     text = team_init.env_example(team, alice)
     assert "OPENAI_API_KEY=\n" in text and "alice_rev" in text
+    config = team_init.build_person_config(team, alice, team_init._template_agents())
+    assert {a["name"]: a["runtime"] for a in config["agents"]}["alice_rev"] == "openai"
 
 
 def test_ids_refuses_a_user_token_in_the_bot_variable(tmp_path):

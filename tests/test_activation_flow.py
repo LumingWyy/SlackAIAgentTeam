@@ -1242,3 +1242,30 @@ def test_a_stop_that_cannot_be_saved_says_so(tmp_path, monkeypatch, caplog):
     assert "could not save the stop note" in caplog.text
     assert "could not clear the saved stop note" in caplog.text
     agent._store.close()
+
+
+def test_stop_is_not_reported_saved_when_a_thread_note_is_not(tmp_path, monkeypatch):
+    from state_store import StateStore
+
+    agent = _build_agent(tmp_path, monkeypatch)
+    agent._store = StateStore(str(tmp_path / "state.db"))
+    _wire(agent, ["unused"])
+    monkeypatch.setattr(agent._store, "mark_thread_stopped", lambda *_a, **_k: False)
+    started = asyncio.Event()
+
+    async def scenario():
+        async def endless(*_a, **_k):
+            started.set()
+            await asyncio.sleep(3600)
+
+        agent._run_turn = endless
+        event = _event(ts="101.0")
+        task = asyncio.create_task(agent._activate_inner(event, object(), _say))
+        agent._tasks.add(task)
+        agent._task_triggers[task] = (event, object(), _say)
+        await started.wait()
+        return await agent.stop()
+
+    result = asyncio.run(scenario())
+    assert result["persisted"] is False  # the pause saved, the thread note did not
+    agent._store.close()

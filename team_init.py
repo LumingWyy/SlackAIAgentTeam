@@ -149,13 +149,18 @@ def team_agents(team: dict[str, Any]) -> list[dict[str, Any]]:
     return [dict(entry) for entry in team.get("team_agents") or []]
 
 
+def _runtime(source: dict[str, Any], key: str, default: str) -> str:
+    """A runtime as multi_app reads it (strip / lower), so checks here agree."""
+    return str(source.get(key) or default).strip().lower()
+
+
 def hosted(team: dict[str, Any], person: dict[str, Any]) -> list[dict[str, Any]]:
     """Every agent that runs on this person's machine, in a stable order."""
     agents = [
         {
             "name": agent_name(person["key"], role),
             "persona": persona,
-            "runtime": str((person.get("runtime") or {}).get(role) or runtime),
+            "runtime": _runtime(person.get("runtime") or {}, role, runtime),
             "ids": (person.get("ids") or {}).get(role) or {},
             "card": _card(person, role),
         }
@@ -169,7 +174,7 @@ def hosted(team: dict[str, Any], person: dict[str, Any]) -> list[dict[str, Any]]
             {
                 "name": entry["role"],
                 "persona": persona,
-                "runtime": str(entry.get("runtime") or runtime),
+                "runtime": _runtime(entry, "runtime", runtime),
                 "ids": entry.get("ids") or {},
                 "card": _TEAM_CARDS[entry["role"]],
             }
